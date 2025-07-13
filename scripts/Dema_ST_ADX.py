@@ -1,15 +1,21 @@
 import os
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from pydantic import Field, field_validator
 
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.core.clock import Clock
-from hummingbot.core.data_type.common import MarketDict, PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import MarketDict, PositionMode, PositionSide, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesConfig
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
-from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
+from hummingbot.strategy_v2.executors.position_executor import ExistingPositionExecutor
+from hummingbot.strategy_v2.executors.position_executor.data_types import (
+    ExistingPositionExecutorConfig,
+    PositionExecutorConfig,
+    TripleBarrierConfig,
+)
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 
@@ -120,13 +126,17 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         self.adx_slope = {}
         self.market_condition = {}  # "CHOPPY", "WEAK_TREND", "STRONG_TREND", "EXTREME_TREND"
         self.prev_market_condition = {}
+        # Existing positions tracking
+        self._existing_positions_checked: bool = False
+        self._managed_existing_positions: Set[str] = set()
 
-    def start(self, clock: Clock, timestamp: float) -> None:  # clock is required by base class
+    def start(self, clock: Clock, timestamp: float) -> None:
         """
         Start the strategy.
         :param clock: Clock to use.
         :param timestamp: Current time.
         """
+        _ = clock  # clock is required by base class
         self._last_timestamp = timestamp
         self.apply_initial_setting()
         # Initialize startup flag for each trading pair
@@ -135,6 +145,12 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
 
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         create_actions = []
+
+        # Check for existing positions on startup
+        if not self._existing_positions_checked:
+            existing_position_actions = self._check_and_create_existing_position_executors()
+            create_actions.extend(existing_position_actions)
+            self._existing_positions_checked = True
 
         # Check signals for each trading pair
         for i, trading_pair in enumerate(self.config.trading_pairs):
@@ -255,8 +271,11 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             executors=self.get_all_executors(),
             filter_func=lambda e: e.connector_name == connector_name and e.trading_pair == trading_pair and e.is_active
         )
-        active_longs = [e for e in active_executors_by_trading_pair if e.side == TradeType.BUY]
-        active_shorts = [e for e in active_executors_by_trading_pair if e.side == TradeType.SELL]
+        # Exclude existing position executors when checking for active positions to avoid duplicates
+        active_longs = [e for e in active_executors_by_trading_pair
+                        if e.side == TradeType.BUY and not isinstance(e.executor, ExistingPositionExecutor)]
+        active_shorts = [e for e in active_executors_by_trading_pair
+                         if e.side == TradeType.SELL and not isinstance(e.executor, ExistingPositionExecutor)]
         return active_longs, active_shorts
 
     def get_signal(self, connector_name: str, trading_pair: str) -> Optional[float]:
@@ -535,3 +554,85 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             lines.extend(["", "  No active position executors."])
 
         return "\n".join(lines)
+
+    def _get_position_key(self, trading_pair: str, side: TradeType) -> str:
+        """Create consistent keys for tracking managed positions."""
+        return f"{trading_pair}:{side.name}"
+
+    def _check_and_create_existing_position_executors(self) -> List[CreateExecutorAction]:
+        """Check for existing positions and create executors to manage them."""
+        create_actions = []
+
+        # Get the connector
+        connector = self.connectors.get(self.config.exchange)
+        if not connector:
+            self.logger().warning(f"Connector {self.config.exchange} not found")
+            return create_actions
+
+        # Check if connector has account_positions property
+        if not isinstance(connector, PerpetualDerivativePyBase):
+            self.logger().info(f"Connector {self.config.exchange} does not support position tracking")
+            return create_actions
+
+        # Get current positions
+        account_positions = connector.account_positions
+        if not account_positions:
+            self.logger().info("No existing positions found")
+            return create_actions
+
+        self.logger().info(f"Found {len(account_positions)} positions to check")
+
+        # Check each position
+        for position_key, position in account_positions.items():
+            # Skip if position amount is zero
+            if position.amount == Decimal("0"):
+                continue
+
+            # Check if the trading pair is in our configured pairs
+            if position.trading_pair not in self.config.trading_pairs:
+                self.logger().info(f"Skipping position for {position.trading_pair} - not in configured pairs")
+                continue
+
+            # Convert PositionSide to TradeType
+            if position.position_side == PositionSide.LONG:
+                side = TradeType.BUY
+            elif position.position_side == PositionSide.SHORT:
+                side = TradeType.SELL
+            else:
+                self.logger().warning(f"Unsupported position side: {position.position_side}")
+                continue
+
+            # Check if position is already being managed
+            position_key = self._get_position_key(position.trading_pair, side)
+            if position_key in self._managed_existing_positions:
+                continue
+
+            # Create ExistingPositionExecutorConfig
+            config = ExistingPositionExecutorConfig(
+                timestamp=self.current_timestamp,
+                connector_name=self.config.exchange,
+                trading_pair=position.trading_pair,
+                side=side,
+                amount=abs(position.amount),  # Ensure positive amount
+                existing_position_amount=abs(position.amount),
+                existing_entry_price=position.entry_price,
+                existing_leverage=position.leverage,
+                existing_unrealized_pnl=position.unrealized_pnl,
+                triple_barrier_config=TripleBarrierConfig(),  # Default barriers
+                leverage=position.leverage,
+            )
+
+            # Create action to spawn executor
+            create_actions.append(CreateExecutorAction(
+                controller_id="main",
+                executor_config=config,
+            ))
+
+            # Mark position as managed
+            self._managed_existing_positions.add(position_key)
+
+            self.logger().info(f"Created ExistingPositionExecutor for {position.trading_pair} "
+                               f"{side.name} position: amount={position.amount}, "
+                               f"entry_price={position.entry_price}, leverage={position.leverage}x")
+
+        return create_actions

@@ -57,3 +57,13 @@ class PositionExecutorConfig(ExecutorConfigBase):
     activation_bounds: Optional[List[Decimal]] = None
     level_id: Optional[str] = None
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+class ExistingPositionExecutorConfig(PositionExecutorConfig):
+    type: Literal["existing_position_executor"] = "existing_position_executor"
+    is_existing_position: bool = True
+    existing_position_amount: Decimal
+    existing_entry_price: Decimal
+    existing_leverage: int
+    existing_unrealized_pnl: Decimal = Decimal("0")
+    model_config = ConfigDict(arbitrary_types_allowed=True)
