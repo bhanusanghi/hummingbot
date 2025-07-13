@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -56,4 +56,5 @@ class PositionExecutorConfig(ExecutorConfigBase):
     leverage: int = 1
     activation_bounds: Optional[List[Decimal]] = None
     level_id: Optional[str] = None
+    open_indicators: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(arbitrary_types_allowed=True)

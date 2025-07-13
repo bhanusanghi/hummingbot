@@ -3,7 +3,7 @@ import threading
 import time
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -46,11 +46,21 @@ class HistoryCommand:
                 int(start_time * 1e3),
                 session=session,
                 config_file_path=self.strategy_file_name)
-            if not trades:
+
+            # Get executor data for enhanced display
+            executors_data = []
+            if self.markets_recorder:
+                all_executors = self.markets_recorder.get_all_executors()
+                # Filter for closed executors within the time range
+                for executor in all_executors:
+                    if executor.timestamp >= start_time and executor.is_done:
+                        executors_data.append(executor)
+
+            if not trades and not executors_data:
                 self.notify("\n  No past trades to report.")
                 return
             if verbose:
-                self.list_trades(start_time)
+                self.list_trades(start_time, executors_data)
             safe_ensure_future(self.history_report(start_time, trades, precision))
 
     def get_history_trades_json(self,  # type: HummingbotApplication
@@ -217,9 +227,10 @@ class HistoryCommand:
         return avg_return
 
     def list_trades(self,  # type: HummingbotApplication
-                    start_time: float):
+                    start_time: float,
+                    executors_data: Optional[List[Any]] = None):
         if threading.current_thread() != threading.main_thread():
-            self.ev_loop.call_soon_threadsafe(self.list_trades, start_time)
+            self.ev_loop.call_soon_threadsafe(self.list_trades, start_time, executors_data)
             return
 
         lines = []
@@ -238,9 +249,101 @@ class HistoryCommand:
                 df = df[:MAXIMUM_TRADE_FILLS_DISPLAY_OUTPUT]
                 self.notify(
                     f"\n  Showing last {MAXIMUM_TRADE_FILLS_DISPLAY_OUTPUT} trades in the current session.")
+
+            # Enhance trade data with executor information if available
+            if executors_data:
+                # Create a mapping of approximate timestamps to executor data
+                executor_map = {}
+                for executor in executors_data:
+                    # Use a time window to match trades with executors (within 5 seconds)
+                    time_key = int(executor.timestamp / 5) * 5
+                    if time_key not in executor_map:
+                        executor_map[time_key] = []
+                    executor_map[time_key].append(executor)
+
+                # Add market condition columns to the dataframe
+                open_mc_list = []
+                open_adx_list = []
+                close_mc_list = []
+                close_adx_list = []
+
+                for _, trade_row in df.iterrows():
+                    # Convert timestamp to seconds if it's in milliseconds
+                    trade_time = trade_row['timestamp'] / 1000 if trade_row['timestamp'] > 1e10 else trade_row['timestamp']
+                    time_key = int(trade_time / 5) * 5
+
+                    # Find matching executor
+                    matching_executor = None
+                    if time_key in executor_map:
+                        # Look for executor with matching trading pair and side
+                        for executor in executor_map[time_key]:
+                            if (executor.trading_pair == trade_row['symbol'] and
+                                    executor.side.name == trade_row['trade_type']):
+                                matching_executor = executor
+                                break
+
+                    if matching_executor and matching_executor.custom_info:
+                        open_indicators = matching_executor.custom_info.get('open_indicators', {})
+                        close_indicators = matching_executor.custom_info.get('close_indicators', {})
+
+                        open_mc_list.append(open_indicators.get('mc', 'N/A'))
+                        open_adx_list.append(f"{open_indicators.get('adx', 0):.1f}" if open_indicators.get('adx') else 'N/A')
+                        close_mc_list.append(close_indicators.get('mc', 'N/A'))
+                        close_adx_list.append(f"{close_indicators.get('adx', 0):.1f}" if close_indicators.get('adx') else 'N/A')
+                    else:
+                        open_mc_list.append('N/A')
+                        open_adx_list.append('N/A')
+                        close_mc_list.append('N/A')
+                        close_adx_list.append('N/A')
+
+                # Add the new columns to the dataframe
+                df['Open_MC'] = open_mc_list
+                df['Open_ADX'] = open_adx_list
+                df['Close_MC'] = close_mc_list
+                df['Close_ADX'] = close_adx_list
+
             df_lines = format_df_for_printout(df, self.client_config_map.tables_format).split("\n")
             lines.extend(["", "  Recent trades:"] +
                          ["    " + line for line in df_lines])
         else:
             lines.extend(["\n  No past trades in this session."])
+
+        # Add executor summary if verbose and executors are available
+        if executors_data:
+            self.list_executors_with_conditions(executors_data, lines)
+
         self.notify("\n".join(lines))
+
+    def list_executors_with_conditions(self, executors_data: List[Any], lines: List[str]):
+        """
+        Display executor-specific information with market conditions.
+        """
+        if not executors_data:
+            return
+
+        lines.extend(["", "  Position Executors with Market Conditions:"])
+
+        # Create data for executor display
+        executor_data = []
+        for executor in executors_data:
+            if executor.custom_info:
+                open_indicators = executor.custom_info.get('open_indicators', {})
+                close_indicators = executor.custom_info.get('close_indicators', {})
+
+                executor_data.append({
+                    'ID': executor.id[:8] + '...' if len(executor.id) > 8 else executor.id,
+                    'Pair': executor.trading_pair,
+                    'Side': 'LONG' if executor.side.name == 'BUY' else 'SHORT',
+                    'Open Time': datetime.fromtimestamp(executor.timestamp).strftime('%m-%d %H:%M'),
+                    'Close Time': datetime.fromtimestamp(executor.close_timestamp).strftime('%m-%d %H:%M') if executor.close_timestamp else 'N/A',
+                    'Open MC': open_indicators.get('mc', 'N/A'),
+                    'Close MC': close_indicators.get('mc', 'N/A'),
+                    'Open ADX': f"{open_indicators.get('adx', 0):.1f}" if open_indicators.get('adx') else 'N/A',
+                    'Close ADX': f"{close_indicators.get('adx', 0):.1f}" if close_indicators.get('adx') else 'N/A',
+                    'P&L %': f"{executor.net_pnl_pct * 100:.2f}%" if executor.net_pnl_pct else '0.00%'
+                })
+
+        if executor_data:
+            executor_df = pd.DataFrame(executor_data)
+            df_lines = format_df_for_printout(executor_df, self.client_config_map.tables_format).split("\n")
+            lines.extend(["    " + line for line in df_lines])

@@ -693,7 +693,7 @@ class PositionExecutor(ExecutorBase):
             self.logger().error(f"Take profit order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
 
     def get_custom_info(self) -> Dict:
-        return {
+        base = {
             "level_id": self.config.level_id,
             "current_position_average_price": self.entry_price,
             "side": self.config.side,
@@ -704,6 +704,19 @@ class PositionExecutor(ExecutorBase):
             "order_ids": [order.order_id for order in [self._open_order, self._close_order, self._take_profit_limit_order] if order],
             "held_position_orders": self._held_position_orders,
         }
+
+        # Include open_indicators from config if it exists
+        if hasattr(self.config, 'open_indicators') and self.config.open_indicators:
+            base['open_indicators'] = self.config.open_indicators
+
+        # Include close_indicators from instance if it exists
+        if hasattr(self, 'close_indicators') and self.close_indicators:
+            base['close_indicators'] = self.close_indicators
+        # Also check if strategy has stored closing indicators for this executor
+        elif hasattr(self.strategy, 'executor_closing_indicators') and self.config.id in self.strategy.executor_closing_indicators:
+            base['close_indicators'] = self.strategy.executor_closing_indicators[self.config.id]
+
+        return base
 
     def to_format_status(self, scale=1.0):
         lines = []
