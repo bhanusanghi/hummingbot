@@ -61,6 +61,10 @@ class DEMASTADXTokenConfig(StrategyV2ConfigBase):
     position_size_strong_trend: Decimal = Field(default=Decimal("1.0"), gt=0)  # 100% size when ADX > 25
     position_size_extreme_trend: Decimal = Field(default=Decimal("0.7"), gt=0)  # 70% size when ADX > 45
 
+    # early exit tp/sl conditions
+    early_exit_tp_pct: Decimal = Field(default=Decimal("0.02"), gt=0)  # when adx shows choppy market, existing position is closed if uPNL > early_exit_tp_pct
+    # early_exit_sl_pct: Decimal = Field(default=Decimal("0.03"), gt=0)
+
     @field_validator('position_mode', mode="before")
     @classmethod
     def validate_position_mode(cls, v: str) -> PositionMode:
@@ -535,8 +539,8 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         lines.extend(["", "  Market Overview:"])
 
         # Header for the grid
-        header = f"  {'Symbol':<12} {'Price':<10} {'DEMA':<10} {'Trend':<8} {'ADX':<6} {'Market':<12} {'Signal':<8} {'Longs':<6} {'Shorts':<6}"
-        separator = f"  {'-' * 12} {'-' * 10} {'-' * 10} {'-' * 8} {'-' * 6} {'-' * 12} {'-' * 8} {'-' * 6} {'-' * 6}"
+        header = f"  {'Symbol':<24} {'Price':<20} {'DEMA':<20} {'Trend':<16} {'ADX':<12} {'Market':<24} {'Signal':<16} {'Exhausted':<20} {'Longs':<12} {'Shorts':<12}"
+        separator = f"  {'-' * 24} {'-' * 20} {'-' * 20} {'-' * 16} {'-' * 12} {'-' * 24} {'-' * 16} {'-' * 20} {'-' * 12} {'-' * 12}"
         lines.extend([header, separator])
 
         # Display each trading pair in compact format
@@ -552,7 +556,11 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
 
             # Get ADX values
             adx = self.current_adx.get(candles_pair, 0)
+            adx_slope = self.adx_slope.get(candles_pair, 0)
             condition = self.market_condition.get(candles_pair, "UNKNOWN")
+
+            # Check if trend is exhausted
+            trend_exhausted = "YES" if (adx > self.config.adx_threshold_extreme and adx_slope < -1) else "NO"
 
             # Get active positions for this pair
             if i < len(self.config.trading_pairs):
@@ -578,7 +586,7 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             }
             market = market_map.get(condition, condition)
 
-            row = f"  {symbol:<12} {price_str:<10} {dema_str:<10} {trend:<8} {adx_str:<6} {market:<12} {signal_text:<8} {len(active_longs):<6} {len(active_shorts):<6}"
+            row = f"  {symbol:<24} {price_str:<20} {dema_str:<20} {trend:<16} {adx_str:<12} {market:<24} {signal_text:<16} {trend_exhausted:<20} {len(active_longs):<12} {len(active_shorts):<12}"
             lines.append(row)
 
         # Add configuration info
