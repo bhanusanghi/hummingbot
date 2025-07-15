@@ -49,7 +49,6 @@ class DEMASTADXTokenConfig(StrategyV2ConfigBase):
     enable_startup_entry: bool = Field(default=False)
 
     # Triple Barrier Configuration
-    stop_loss_pct: Decimal = Field(default=Decimal("0.02"), gt=0)
     trailing_stop_loss_pct: Decimal = Field(default=Decimal("0.01"), gt=0)
 
     # ADX Configuration
@@ -179,7 +178,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                         # For long: activation price is DEMA (where we expect price to reach)
                         activation_price_pct = abs(current_dema - mid_price) / mid_price
                         trailing_delta_pct = self.config.trailing_stop_loss_pct
-                        sl_pct = self.config.stop_loss_pct
 
                         trailing_stop = TrailingStop(
                             activation_price=Decimal(str(activation_price_pct)),
@@ -187,7 +185,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                         )
 
                         triple_barrier_config = TripleBarrierConfig(
-                            stop_loss=Decimal(str(sl_pct)),
                             trailing_stop=trailing_stop
                         )
                     else:  # Conditions 1 & 2: Default config with all barriers disabled
@@ -211,7 +208,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                         # For short: activation price is DEMA (where we expect price to reach)
                         activation_price_pct = abs(mid_price - current_dema) / mid_price
                         trailing_delta_pct = self.config.trailing_stop_loss_pct
-                        sl_pct = self.config.stop_loss_pct
 
                         trailing_stop = TrailingStop(
                             activation_price=Decimal(str(activation_price_pct)),
@@ -219,7 +215,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                         )
 
                         triple_barrier_config = TripleBarrierConfig(
-                            stop_loss=Decimal(str(sl_pct)),
                             trailing_stop=trailing_stop
                         )
                     else:  # Conditions 1 & 2: Default config with all barriers disabled
