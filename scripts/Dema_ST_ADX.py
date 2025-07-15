@@ -428,7 +428,7 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         return signal, signal_source
 
     def _check_long_conditions(self, current_supertrend_direction, current_price, current_dema,
-                               adx_crossed_threshold, adx_above_threshold, prev_supertrend_direction) -> tuple[bool, bool, bool]:
+                               adx_crossed_threshold, adx_above_threshold, prev_supertrend_direction) -> tuple[bool, bool, bool, bool]:
         """Check all long entry conditions."""
         # Long Entry Conditions:
         # 1. ADX crosses threshold with established bullish trend: ST already positive + Price > DEMA + ADX crosses above threshold
@@ -455,7 +455,7 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         return long_condition_1, long_condition_2, long_condition_3, long_condition_4
 
     def _check_short_conditions(self, current_supertrend_direction, current_price, current_dema,
-                                adx_crossed_threshold, adx_above_threshold, prev_supertrend_direction) -> tuple[bool, bool, bool]:
+                                adx_crossed_threshold, adx_above_threshold, prev_supertrend_direction) -> tuple[bool, bool, bool, bool]:
         """Check all short entry conditions."""
         # Short Entry Conditions:
         # 1. ADX crosses threshold with established bearish trend: ST already negative + Price < DEMA + ADX crosses above threshold
