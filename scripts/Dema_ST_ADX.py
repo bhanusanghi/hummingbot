@@ -293,7 +293,8 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             )
 
             if candles is not None and not candles.empty:
-                if self._is_trend_exhausted_confirmed(candles, candles_pair):
+                is_exhausted, _ = self._is_trend_exhausted_confirmed(candles, candles_pair)
+                if is_exhausted:
                     all_positions = active_longs + active_shorts
                     for executor in all_positions:
                         if executor.net_pnl_pct > 0:  # Any profit
@@ -532,11 +533,15 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
 
         return signal, signal_source
 
-    def _is_trend_exhausted_confirmed(self, candles_df, trading_pair: str) -> bool:
-        """Check if trend exhaustion is confirmed for 3 consecutive candles."""
+    def _is_trend_exhausted_confirmed(self, candles_df, trading_pair: str) -> tuple[bool, int]:
+        """
+        Check if trend exhaustion is confirmed for 3 consecutive candles.
+        Returns (is_confirmed, exhaustion_count).
+        """
         if len(candles_df) < 3 + self.config.adx_slope_period:
-            return False
+            return False, 0
 
+        exhaustion_count = 0
         # Check last 3 candles (including current)
         for i in range(-3, 0):  # -3, -2, -1 (last 3 candles)
             adx_value = candles_df[f"ADX_{self.config.adx_length}"].iloc[i]
@@ -547,14 +552,13 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                 past_adx = candles_df[f"ADX_{self.config.adx_length}"].iloc[past_idx]
                 adx_slope = (adx_value - past_adx) / self.config.adx_slope_period
             else:
-                return False  # Not enough data
+                return False, 0  # Not enough data
 
             # Check if this candle shows exhaustion
-            if not (adx_value > self.config.adx_threshold_extreme and adx_slope < -1):
-                return False  # If any of the 3 candles doesn't show exhaustion, return False
+            if adx_value > self.config.adx_threshold_extreme and adx_slope < -1:
+                exhaustion_count += 1
 
-        # All 3 candles show exhaustion
-        return True
+        return exhaustion_count == 3, exhaustion_count
 
     def apply_initial_setting(self):
         if not self.account_config_set:
@@ -593,8 +597,7 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             adx = self.current_adx.get(candles_pair, 0)
             condition = self.market_condition.get(candles_pair, "UNKNOWN")
 
-            # Check if trend is exhausted
-            # Get candles data to check historical exhaustion
+            # Check if trend is exhausted using the reusable method
             candles = self.market_data_provider.get_candles_df(
                 self.config.candles_exchange,
                 candles_pair,
@@ -602,18 +605,9 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                 self.max_records
             )
 
-            if candles is not None and not candles.empty and len(candles) >= 3 + self.config.adx_slope_period:
-                # Check each of the last 3 candles
-                exhaustion_count = 0
-                for i in range(-3, 0):
-                    adx_val = candles[f"ADX_{self.config.adx_length}"].iloc[i]
-                    if len(candles) > abs(i) + self.config.adx_slope_period:
-                        past_adx = candles[f"ADX_{self.config.adx_length}"].iloc[i - self.config.adx_slope_period]
-                        slope = (adx_val - past_adx) / self.config.adx_slope_period
-                        if adx_val > self.config.adx_threshold_extreme and slope < -1:
-                            exhaustion_count += 1
-
-                if exhaustion_count == 3:
+            if candles is not None and not candles.empty:
+                is_exhausted, exhaustion_count = self._is_trend_exhausted_confirmed(candles, candles_pair)
+                if is_exhausted:
                     trend_exhausted = "YES"
                 elif exhaustion_count > 0:
                     trend_exhausted = f"PENDING({exhaustion_count}/3)"
