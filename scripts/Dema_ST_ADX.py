@@ -153,7 +153,7 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             signal_source = self.signal_source.get(candles_pair, 0)
             active_longs, active_shorts = self.get_active_executors_by_side(self.config.exchange, trading_pair)
 
-            if signal is not None and signal != 0:  # Only process non-zero signals
+            if signal != 0:  # Only process non-zero signals
                 mid_price = self.market_data_provider.get_price_by_type(self.config.exchange,
                                                                         trading_pair,
                                                                         PriceType.MidPrice)
