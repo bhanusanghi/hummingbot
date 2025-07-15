@@ -45,9 +45,6 @@ class DEMASTADXTokenConfig(StrategyV2ConfigBase):
     # Executor Timeout Configuration
     executor_timeout: int = Field(default=60, gt=0)
 
-    # Startup Entry Configuration
-    enable_startup_entry: bool = Field(default=False)
-
     # Triple Barrier Configuration
     trailing_stop_loss_pct: Decimal = Field(default=Decimal("0.01"), gt=0)
 
@@ -119,7 +116,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         self.prev_dema = {}
         self.current_signal = {}
         self.signal_source = {}  # Track which condition triggered the signal
-        self.is_startup = {}
         # ADX tracking
         self.current_adx = {}
         self.prev_adx = {}
@@ -137,9 +133,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         """
         self._last_timestamp = timestamp
         self.apply_initial_setting()
-        # Initialize startup flag for each trading pair
-        for candles_pair in self.config.candles_pairs:
-            self.is_startup[candles_pair] = True
 
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         create_actions = []
@@ -168,8 +161,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                         base_amount *= self.config.position_size_strong_trend
                     elif market_condition == "EXTREME_TREND":
                         base_amount *= self.config.position_size_extreme_trend
-                        # Log warning about extreme trend
-                        self.logger().warning(f"{trading_pair}: ADX > {self.config.adx_threshold_extreme}, reducing size to {self.config.position_size_extreme_trend}")
 
                 if signal == 1 and len(active_longs) == 0:
                     # Configure triple barrier based on signal source
@@ -178,6 +169,22 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                         # For long: activation price is DEMA (where we expect price to reach)
                         activation_price_pct = abs(current_dema - mid_price) / mid_price
                         trailing_delta_pct = self.config.trailing_stop_loss_pct
+
+                        trailing_stop = TrailingStop(
+                            activation_price=Decimal(str(activation_price_pct)),
+                            trailing_delta=Decimal(str(trailing_delta_pct))
+                        )
+
+                        triple_barrier_config = TripleBarrierConfig(
+                            trailing_stop=trailing_stop
+                        )
+                    elif signal_source == 4:  # Condition 4: Use trailing stop that activates at DEMA
+                        current_dema = self.current_dema[candles_pair]
+                        # For long: activation price is DEMA (where we expect price to reach)
+                        activation_price_pct = abs(current_dema - mid_price) / mid_price
+                        trailing_delta_pct = self.config.trailing_stop_loss_pct
+
+                        # stop_loss =
 
                         trailing_stop = TrailingStop(
                             activation_price=Decimal(str(activation_price_pct)),
@@ -418,11 +425,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         # Apply directional filter
         signal, signal_source = self._apply_directional_filter(signal, signal_source, trading_pair)
 
-        # Reset startup flag after first signal check
-        is_startup_check = self.is_startup.get(trading_pair, False)
-        if is_startup_check:
-            self.is_startup[trading_pair] = False
-
         return signal, signal_source
 
     def _check_long_conditions(self, current_supertrend_direction, current_price, current_dema,
@@ -446,7 +448,11 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                             adx_above_threshold and
                             current_price < current_dema)
 
-        return long_condition_1, long_condition_2, long_condition_3
+        long_condition_4 = (current_supertrend_direction == 1 and
+                            adx_above_threshold and
+                            current_price > current_dema)
+
+        return long_condition_1, long_condition_2, long_condition_3, long_condition_4
 
     def _check_short_conditions(self, current_supertrend_direction, current_price, current_dema,
                                 adx_crossed_threshold, adx_above_threshold, prev_supertrend_direction) -> tuple[bool, bool, bool]:
@@ -469,13 +475,17 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                              adx_above_threshold and
                              current_price > current_dema)
 
-        return short_condition_1, short_condition_2, short_condition_3
+        short_condition_4 = (current_supertrend_direction == -1 and
+                             adx_above_threshold and
+                             current_price < current_dema)
 
-    def _determine_signal(self, long_conditions: tuple[bool, bool, bool],
-                          short_conditions: tuple[bool, bool, bool]) -> tuple[int, int]:
+        return short_condition_1, short_condition_2, short_condition_3, short_condition_4
+
+    def _determine_signal(self, long_conditions: tuple[bool, bool, bool, bool],
+                          short_conditions: tuple[bool, bool, bool, bool]) -> tuple[int, int]:
         """Determine signal value and source based on conditions."""
-        long_condition_1, long_condition_2, long_condition_3 = long_conditions
-        short_condition_1, short_condition_2, short_condition_3 = short_conditions
+        long_condition_1, long_condition_2, long_condition_3, long_condition_4 = long_conditions
+        short_condition_1, short_condition_2, short_condition_3, short_condition_4 = short_conditions
 
         # Determine signal and track which condition triggered it
         if long_condition_1:
@@ -484,12 +494,16 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             return 1, 2
         elif long_condition_3:
             return 1, 3
+        elif long_condition_4:
+            return 1, 4
         elif short_condition_1:
             return -1, 1
         elif short_condition_2:
             return -1, 2
         elif short_condition_3:
             return -1, 3
+        elif short_condition_4:
+            return -1, 4
         else:
             return 0, 0
 
