@@ -270,7 +270,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
 
             # NEW: ADX-based stops
             adx_value = self.current_adx.get(candles_pair, 0)
-            adx_slope = self.adx_slope.get(candles_pair, 0)
 
             # Stop if market becomes choppy
             if adx_value < self.config.adx_threshold_choppy:
@@ -284,16 +283,28 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                         ))
                         self.logger().info(f"Closing {trading_pair} position due to choppy market (ADX={adx_value:.1f})")
 
-            # Stop on trend exhaustion (high ADX + negative slope)
-            elif adx_value > self.config.adx_threshold_extreme and adx_slope < -1:
-                all_positions = active_longs + active_shorts
-                for executor in all_positions:
-                    if executor.net_pnl_pct > 0:  # Any profit
-                        stop_actions.append(StopExecutorAction(
-                            controller_id=executor.controller_id or "main",
-                            executor_id=executor.id
-                        ))
-                        self.logger().info(f"Closing {trading_pair} position due to trend exhaustion (ADX={adx_value:.1f}, slope={adx_slope:.2f})")
+            # Stop on trend exhaustion (confirmed for 3 consecutive candles)
+            # Get candles data to check historical values
+            candles = self.market_data_provider.get_candles_df(
+                self.config.candles_exchange,
+                candles_pair,
+                self.config.candles_interval,
+                self.max_records
+            )
+
+            if candles is not None and not candles.empty:
+                if self._is_trend_exhausted_confirmed(candles, candles_pair):
+                    all_positions = active_longs + active_shorts
+                    for executor in all_positions:
+                        if executor.net_pnl_pct > 0:  # Any profit
+                            stop_actions.append(StopExecutorAction(
+                                controller_id=executor.controller_id or "main",
+                                executor_id=executor.id
+                            ))
+                            self.logger().info(
+                                f"Closing {trading_pair} position due to trend exhaustion "
+                                f"(confirmed for 3 consecutive candles)"
+                            )
 
             # Check for timeout on unfilled executors
             all_active_executors = active_longs + active_shorts
@@ -521,6 +532,30 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
 
         return signal, signal_source
 
+    def _is_trend_exhausted_confirmed(self, candles_df, trading_pair: str) -> bool:
+        """Check if trend exhaustion is confirmed for 3 consecutive candles."""
+        if len(candles_df) < 3 + self.config.adx_slope_period:
+            return False
+
+        # Check last 3 candles (including current)
+        for i in range(-3, 0):  # -3, -2, -1 (last 3 candles)
+            adx_value = candles_df[f"ADX_{self.config.adx_length}"].iloc[i]
+
+            # Calculate ADX slope for that candle
+            if len(candles_df) > abs(i) + self.config.adx_slope_period:
+                past_idx = i - self.config.adx_slope_period
+                past_adx = candles_df[f"ADX_{self.config.adx_length}"].iloc[past_idx]
+                adx_slope = (adx_value - past_adx) / self.config.adx_slope_period
+            else:
+                return False  # Not enough data
+
+            # Check if this candle shows exhaustion
+            if not (adx_value > self.config.adx_threshold_extreme and adx_slope < -1):
+                return False  # If any of the 3 candles doesn't show exhaustion, return False
+
+        # All 3 candles show exhaustion
+        return True
+
     def apply_initial_setting(self):
         if not self.account_config_set:
             for connector_name, connector in self.connectors.items():
@@ -556,11 +591,36 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
 
             # Get ADX values
             adx = self.current_adx.get(candles_pair, 0)
-            adx_slope = self.adx_slope.get(candles_pair, 0)
             condition = self.market_condition.get(candles_pair, "UNKNOWN")
 
             # Check if trend is exhausted
-            trend_exhausted = "YES" if (adx > self.config.adx_threshold_extreme and adx_slope < -1) else "NO"
+            # Get candles data to check historical exhaustion
+            candles = self.market_data_provider.get_candles_df(
+                self.config.candles_exchange,
+                candles_pair,
+                self.config.candles_interval,
+                self.max_records
+            )
+
+            if candles is not None and not candles.empty and len(candles) >= 3 + self.config.adx_slope_period:
+                # Check each of the last 3 candles
+                exhaustion_count = 0
+                for i in range(-3, 0):
+                    adx_val = candles[f"ADX_{self.config.adx_length}"].iloc[i]
+                    if len(candles) > abs(i) + self.config.adx_slope_period:
+                        past_adx = candles[f"ADX_{self.config.adx_length}"].iloc[i - self.config.adx_slope_period]
+                        slope = (adx_val - past_adx) / self.config.adx_slope_period
+                        if adx_val > self.config.adx_threshold_extreme and slope < -1:
+                            exhaustion_count += 1
+
+                if exhaustion_count == 3:
+                    trend_exhausted = "YES"
+                elif exhaustion_count > 0:
+                    trend_exhausted = f"PENDING({exhaustion_count}/3)"
+                else:
+                    trend_exhausted = "NO"
+            else:
+                trend_exhausted = "NO"
 
             # Get active positions for this pair
             if i < len(self.config.trading_pairs):
