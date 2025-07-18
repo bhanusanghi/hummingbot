@@ -50,20 +50,19 @@ class DEMASTADXTokenConfig(StrategyV2ConfigBase):
 
     # ADX Configuration
     adx_length: int = Field(default=14, gt=0)
-    adx_threshold_choppy: float = Field(default=20.0, gt=0)
-    adx_threshold_trending: float = Field(default=25.0, gt=0)
+    adx_threshold_choppy: float = Field(default=25.0, gt=0)
+    adx_threshold_trending: float = Field(default=30.0, gt=0)
     adx_threshold_extreme: float = Field(default=45.0, gt=0)
-    adx_slope_period: int = Field(default=5, gt=0)  # For trend acceleration/deceleration
-
-    # Position sizing based on ADX
-    enable_adx_position_sizing: bool = Field(default=False)
-    position_size_weak_trend: Decimal = Field(default=Decimal("0.5"), gt=0)  # 50% size when ADX 20-25
-    position_size_strong_trend: Decimal = Field(default=Decimal("1.0"), gt=0)  # 100% size when ADX > 25
-    position_size_extreme_trend: Decimal = Field(default=Decimal("0.7"), gt=0)  # 70% size when ADX > 45
+    use_adx_confirmation: bool = Field(default=False)  # Controls whether to wait for ADX confirmation on trend changes
 
     # early exit tp/sl conditions
     early_exit_tp_pct: Decimal = Field(default=Decimal("0.02"), gt=0)  # when adx shows choppy market, existing position is closed if uPNL > early_exit_tp_pct
     # early_exit_sl_pct: Decimal = Field(default=Decimal("0.03"), gt=0)
+
+    # New optional feature flags
+    use_supertrend_filter: bool = Field(default=False)  # Controls whether to filter positions against higher timeframe SuperTrend direction
+    supertrend_filter_interval: str = Field(default="1h")  # Configurable timeframe for SuperTrend filter
+    filter_candles_length: int = Field(default=12, gt=0)  # Number of filter timeframe candles to fetch for SuperTrend calculation
 
     @field_validator('position_mode', mode="before")
     @classmethod
@@ -101,6 +100,11 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: DEMASTADXTokenConfig):
         self.max_records = max(config.dema_length, config.supertrend_length, config.candles_length) + 20
+
+        # Calculate max records for filter timeframe if enabled
+        if config.use_supertrend_filter:
+            self.max_records_filter = max(config.supertrend_length, config.filter_candles_length) + 20
+
         if len(config.candles_config) == 0:
             for candles_pair in config.candles_pairs:
                 config.candles_config.append(CandlesConfig(
@@ -109,6 +113,16 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                     interval=config.candles_interval,
                     max_records=self.max_records
                 ))
+
+                # Add filter timeframe candles config if enabled
+                if config.use_supertrend_filter:
+                    config.candles_config.append(CandlesConfig(
+                        connector=config.candles_exchange,
+                        trading_pair=candles_pair,
+                        interval=config.supertrend_filter_interval,
+                        max_records=self.max_records_filter
+                    ))
+
         super().__init__(connectors, config)
         self.config = config
         # Store indicators per trading pair
@@ -125,9 +139,16 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         self.prev_adx = {}
         self.current_plus_di = {}
         self.current_minus_di = {}
-        self.adx_slope = {}
         self.market_condition = {}  # "CHOPPY", "WEAK_TREND", "STRONG_TREND", "EXTREME_TREND"
         self.prev_market_condition = {}
+
+        # New state tracking for optional features
+        self.filter_supertrend_direction = {}  # Higher timeframe SuperTrend direction
+        self.adx_confirmation_pending = {}  # Track if ADX confirmation is pending
+        self.adx_confirmation_direction = {}  # Track which direction needs confirmation
+
+        # Cached indicator values for format_status
+        self.cached_trend_momentum = {}
 
     def start(self, clock: Clock, timestamp: float) -> None:  # clock is required by base class
         """
@@ -155,23 +176,12 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                                                                         trading_pair,
                                                                         PriceType.MidPrice)
 
-                # Dynamic position sizing based on ADX
-                base_amount = self.config.order_amount_quote
-                if self.config.enable_adx_position_sizing:
-                    market_condition = self.market_condition.get(candles_pair, "CHOPPY")
-                    if market_condition == "WEAK_TREND":
-                        base_amount *= self.config.position_size_weak_trend
-                    elif market_condition == "STRONG_TREND":
-                        base_amount *= self.config.position_size_strong_trend
-                    elif market_condition == "EXTREME_TREND":
-                        base_amount *= self.config.position_size_extreme_trend
-
                 if signal == 1 and len(active_longs) == 0:
-                    # Configure triple barrier based on signal source
+                    current_dema = self.current_dema[candles_pair]
+                    # Configure triple barrier based on signal source and options
                     if signal_source == 3:  # Condition 3: Use trailing stop that activates at DEMA
-                        current_dema = self.current_dema[candles_pair]
                         # For long: activation price is DEMA (where we expect price to reach)
-                        activation_price_pct = abs(current_dema - mid_price) / mid_price
+                        activation_price_pct = abs(Decimal(str(current_dema)) - mid_price) / mid_price
                         trailing_delta_pct = self.config.trailing_stop_loss_pct
 
                         trailing_stop = TrailingStop(
@@ -182,21 +192,10 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                         triple_barrier_config = TripleBarrierConfig(
                             trailing_stop=trailing_stop
                         )
-                    elif signal_source == 4:  # Condition 4: Use trailing stop that activates at DEMA
-                        current_dema = self.current_dema[candles_pair]
-                        # For long: activation price is DEMA (where we expect price to reach)
-                        activation_price_pct = abs(current_dema - mid_price) / mid_price
-                        trailing_delta_pct = self.config.trailing_stop_loss_pct
-
-                        # stop_loss =
-
-                        trailing_stop = TrailingStop(
-                            activation_price=Decimal(str(activation_price_pct)),
-                            trailing_delta=Decimal(str(trailing_delta_pct))
-                        )
+                    elif signal_source == 4 and mid_price > current_dema:  # Condition 4: Use DEMA as stop loss for long
 
                         triple_barrier_config = TripleBarrierConfig(
-                            trailing_stop=trailing_stop
+                            stop_loss=Decimal(str(current_dema))
                         )
                     else:  # Conditions 1 & 2: Default config with all barriers disabled
                         triple_barrier_config = TripleBarrierConfig()
@@ -208,16 +207,16 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                             trading_pair=trading_pair,
                             side=TradeType.BUY,
                             entry_price=mid_price,
-                            amount=base_amount / mid_price,
+                            amount=self.config.order_amount_quote / mid_price,
                             triple_barrier_config=triple_barrier_config,
                             leverage=self.config.leverage
                         )))
                 elif signal == -1 and len(active_shorts) == 0:
-                    # Configure triple barrier based on signal source
+                    current_dema = self.current_dema[candles_pair]
+                    # Configure triple barrier based on signal source and options
                     if signal_source == 3:  # Condition 3: Use trailing stop that activates at DEMA
-                        current_dema = self.current_dema[candles_pair]
                         # For short: activation price is DEMA (where we expect price to reach)
-                        activation_price_pct = abs(mid_price - current_dema) / mid_price
+                        activation_price_pct = abs(mid_price - Decimal(str(current_dema))) / mid_price
                         trailing_delta_pct = self.config.trailing_stop_loss_pct
 
                         trailing_stop = TrailingStop(
@@ -227,6 +226,10 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
 
                         triple_barrier_config = TripleBarrierConfig(
                             trailing_stop=trailing_stop
+                        )
+                    elif signal_source == 4 and mid_price < current_dema:  # Condition 4: Use DEMA as stop loss for short
+                        triple_barrier_config = TripleBarrierConfig(
+                            stop_loss=Decimal(str(current_dema))
                         )
                     else:  # Conditions 1 & 2: Default config with all barriers disabled
                         triple_barrier_config = TripleBarrierConfig()
@@ -238,7 +241,7 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                             trading_pair=trading_pair,
                             side=TradeType.SELL,
                             entry_price=mid_price,
-                            amount=base_amount / mid_price,
+                            amount=self.config.order_amount_quote / mid_price,
                             triple_barrier_config=triple_barrier_config,
                             leverage=self.config.leverage
                         )))
@@ -251,9 +254,13 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         for i, trading_pair in enumerate(self.config.trading_pairs):
             candles_pair = self.config.candles_pairs[i]
 
+            active_longs, active_shorts = self.get_active_executors_by_side(self.config.exchange, trading_pair)
+            if len(active_longs) + len(active_shorts) == 0:
+                continue
+
+            # Stop position if trend flips
             # Get current SuperTrend direction for stop logic
             current_supertrend_direction = self.current_supertrend_direction.get(candles_pair)
-            active_longs, active_shorts = self.get_active_executors_by_side(self.config.exchange, trading_pair)
 
             if current_supertrend_direction is not None:
                 # Stop positions when SuperTrend reverses
@@ -275,49 +282,24 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             if adx_value < self.config.adx_threshold_choppy:
                 all_positions = active_longs + active_shorts
                 for executor in all_positions:
-                    # Only close profitable positions in choppy markets
-                    if executor.net_pnl_pct > 0.002:  # 0.2% profit threshold
+                    # Only close profitable positions in choppy markets or wait for ST to reverse
+                    if executor.net_pnl_pct > 0:
                         stop_actions.append(StopExecutorAction(
                             controller_id=executor.controller_id or "main",
                             executor_id=executor.id
                         ))
-                        self.logger().info(f"Closing {trading_pair} position due to choppy market (ADX={adx_value:.1f})")
-
-            # Stop on trend exhaustion (confirmed for 3 consecutive candles)
-            # Get candles data to check historical values
-            candles = self.market_data_provider.get_candles_df(
-                self.config.candles_exchange,
-                candles_pair,
-                self.config.candles_interval,
-                self.max_records
-            )
-
-            if candles is not None and not candles.empty:
-                is_exhausted, _ = self._is_trend_exhausted_confirmed(candles, candles_pair)
-                if is_exhausted:
-                    all_positions = active_longs + active_shorts
-                    for executor in all_positions:
-                        if executor.net_pnl_pct > 0:  # Any profit
-                            stop_actions.append(StopExecutorAction(
-                                controller_id=executor.controller_id or "main",
-                                executor_id=executor.id
-                            ))
-                            self.logger().info(
-                                f"Closing {trading_pair} position due to trend exhaustion "
-                                f"(confirmed for 3 consecutive candles)"
-                            )
+                        self.logger().info(f"Closing profitable {trading_pair} position as market turned choppy")
 
             # Check for timeout on unfilled executors
             all_active_executors = active_longs + active_shorts
-            for executor in all_active_executors:
-                executor_age = self.current_timestamp - executor.timestamp
-                # Stop executors that are active but not trading (unfilled) and have exceeded timeout
-                if executor.is_active and not executor.is_trading and executor_age > self.config.executor_timeout:
-                    stop_actions.append(StopExecutorAction(
-                        controller_id=executor.controller_id or "main",
-                        executor_id=executor.id
-                    ))
-
+            # find all executors that are active but not trading (unfilled) and have exceeded timeout
+            unfilled_executors = [e for e in all_active_executors if e.is_active and not e.is_trading and self.current_timestamp - e.timestamp > self.config.executor_timeout]
+            # stop all unfilled executors
+            for executor in unfilled_executors:
+                stop_actions.append(StopExecutorAction(
+                    controller_id=executor.controller_id or "main",
+                    executor_id=executor.id
+                ))
         return stop_actions
 
     def get_active_executors_by_side(self, connector_name: str, trading_pair: str):
@@ -356,34 +338,16 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         candles.ta.supertrend(length=self.config.supertrend_length, multiplier=self.config.supertrend_multiplier, append=True)
         candles.ta.adx(length=self.config.adx_length, append=True)
 
-        # Store previous ADX value before updating
-        if trading_pair in self.current_adx:
-            self.prev_adx[trading_pair] = self.current_adx[trading_pair]
+        # Store previous ADX values
+        if len(candles) > 1:
+            self.prev_adx[trading_pair] = candles[f"ADX_{self.config.adx_length}"].iloc[-2]
         else:
-            # Initialize prev_adx on first run
-            if len(candles) > 1:
-                self.prev_adx[trading_pair] = candles[f"ADX_{self.config.adx_length}"].iloc[-2]
-            else:
-                self.prev_adx[trading_pair] = candles[f"ADX_{self.config.adx_length}"].iloc[-1]
+            self.prev_adx[trading_pair] = candles[f"ADX_{self.config.adx_length}"].iloc[-1]
 
         # Get ADX values
         self.current_adx[trading_pair] = candles[f"ADX_{self.config.adx_length}"].iloc[-1]
         self.current_plus_di[trading_pair] = candles[f"DMP_{self.config.adx_length}"].iloc[-1]
         self.current_minus_di[trading_pair] = candles[f"DMN_{self.config.adx_length}"].iloc[-1]
-
-        # Calculate ADX slope for trend acceleration/deceleration
-        if len(candles) > self.config.adx_slope_period:
-            current_adx = self.current_adx[trading_pair]
-            past_adx = candles[f"ADX_{self.config.adx_length}"].iloc[-self.config.adx_slope_period - 1]
-            self.adx_slope[trading_pair] = (current_adx - past_adx) / self.config.adx_slope_period
-        else:
-            self.adx_slope[trading_pair] = 0
-
-        # Store previous market condition before updating
-        if trading_pair in self.market_condition:
-            self.prev_market_condition[trading_pair] = self.market_condition[trading_pair]
-        else:
-            self.prev_market_condition[trading_pair] = "CHOPPY"  # Default to choppy
 
         # Determine market condition
         self._update_market_condition(trading_pair)
@@ -402,6 +366,31 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             self.prev_supertrend_direction[trading_pair] = self.current_supertrend_direction[trading_pair]
             self.prev_price[trading_pair] = self.current_price[trading_pair]
             self.prev_dema[trading_pair] = self.current_dema[trading_pair]
+
+        # Calculate filter timeframe SuperTrend if enabled
+        if self.config.use_supertrend_filter:
+            filter_candles = self.market_data_provider.get_candles_df(
+                self.config.candles_exchange,
+                trading_pair,
+                self.config.supertrend_filter_interval,
+                max(self.config.filter_candles_length, self.config.supertrend_length) + 20
+            )
+
+            if filter_candles is not None and not filter_candles.empty:
+                filter_candles.ta.supertrend(
+                    length=self.config.supertrend_length,
+                    multiplier=self.config.supertrend_multiplier,
+                    append=True
+                )
+                self.filter_supertrend_direction[trading_pair] = filter_candles[f"SUPERTd_{self.config.supertrend_length}_{self.config.supertrend_multiplier}"].iloc[-1]
+            else:
+                self.filter_supertrend_direction[trading_pair] = None
+
+        # Cache trend momentum (slope of DI) for format_status
+        if self.current_plus_di[trading_pair] > self.current_minus_di[trading_pair]:
+            self.cached_trend_momentum[trading_pair] = self.current_plus_di[trading_pair]
+        else:
+            self.cached_trend_momentum[trading_pair] = -self.current_minus_di[trading_pair]
 
     def _update_market_condition(self, trading_pair: str):
         """Update market condition based on ADX value."""
@@ -426,7 +415,7 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         # Get ADX values for conditions
         current_adx_val = self.current_adx[trading_pair]
         prev_adx_val = self.prev_adx.get(trading_pair, 0)
-        adx_crossed_threshold = prev_adx_val < self.config.adx_threshold_choppy <= current_adx_val
+        adx_crossed_threshold = prev_adx_val < self.config.adx_threshold_choppy and current_adx_val >= self.config.adx_threshold_choppy
         adx_above_threshold = current_adx_val >= self.config.adx_threshold_choppy
 
         # Check entry conditions
@@ -441,15 +430,24 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
         # Apply directional filter
         signal, signal_source = self._apply_directional_filter(signal, signal_source, trading_pair)
 
+        # Apply configurable timeframe SuperTrend filter if enabled
+        if self.config.use_supertrend_filter and signal != 0:
+            signal, signal_source = self._apply_supertrend_filter(signal, signal_source, trading_pair)
+
+        # Apply ADX confirmation logic if enabled
+        if self.config.use_adx_confirmation and signal != 0:
+            signal, signal_source = self._check_adx_confirmation(signal, signal_source, trading_pair)
+
         return signal, signal_source
 
     def _check_long_conditions(self, current_supertrend_direction, current_price, current_dema,
                                adx_crossed_threshold, adx_above_threshold, prev_supertrend_direction) -> tuple[bool, bool, bool, bool]:
         """Check all long entry conditions."""
         # Long Entry Conditions:
-        # 1. ADX crosses threshold with established bullish trend: ST already positive + Price > DEMA + ADX crosses above threshold
+        # 1. ADX crosses threshold with established bullish trend: ST already positive + Price > DEMA
         # 2. ADX already established and ST flips: ADX above threshold + ST turns positive + Price > DEMA
-        # 3. NEW: ST green, ADX above threshold, price below DEMA (trailing stop activates at DEMA)
+        # 3. ST green, ADX above threshold, price below DEMA (trailing stop activates at DEMA)
+        # 4. ST green, ADX above threshold, price above DEMA (stop loss at DEMA)
 
         long_condition_1 = (current_supertrend_direction == 1 and
                             current_price > current_dema and
@@ -533,32 +531,80 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
 
         return signal, signal_source
 
-    def _is_trend_exhausted_confirmed(self, candles_df, trading_pair: str) -> tuple[bool, int]:
-        """
-        Check if trend exhaustion is confirmed for 3 consecutive candles.
-        Returns (is_confirmed, exhaustion_count).
-        """
-        if len(candles_df) < 3 + self.config.adx_slope_period:
-            return False, 0
+    def _apply_supertrend_filter(self, signal: int, signal_source: int, trading_pair: str) -> tuple[int, int]:
+        """Apply configurable timeframe SuperTrend filter to the signal."""
+        filter_direction = self.filter_supertrend_direction.get(trading_pair)
 
-        exhaustion_count = 0
-        # Check last 3 candles (including current)
-        for i in range(-3, 0):  # -3, -2, -1 (last 3 candles)
-            adx_value = candles_df[f"ADX_{self.config.adx_length}"].iloc[i]
+        if filter_direction is None:
+            # If filter data not available, allow signal to pass
+            return signal, signal_source
 
-            # Calculate ADX slope for that candle
-            if len(candles_df) > abs(i) + self.config.adx_slope_period:
-                past_idx = i - self.config.adx_slope_period
-                past_adx = candles_df[f"ADX_{self.config.adx_length}"].iloc[past_idx]
-                adx_slope = (adx_value - past_adx) / self.config.adx_slope_period
+        # Check if signal aligns with filter timeframe SuperTrend
+        if signal == 1 and filter_direction == -1:
+            # Block long signal if filter timeframe is bearish
+            return 0, 0
+        elif signal == -1 and filter_direction == 1:
+            # Block short signal if filter timeframe is bullish
+            return 0, 0
+
+        return signal, signal_source
+
+    def _check_adx_confirmation(self, signal: int, signal_source: int, trading_pair: str) -> tuple[int, int]:
+        """Implement ADX confirmation logic with state machine."""
+        current_adx = self.current_adx[trading_pair]
+        prev_adx = self.prev_adx.get(trading_pair, 0)
+
+        # Check if we're pending confirmation
+        if trading_pair in self.adx_confirmation_pending and self.adx_confirmation_pending[trading_pair]:
+            pending_direction = self.adx_confirmation_direction.get(trading_pair, 0)
+
+            # Check if ADX has increased (confirmation)
+            if current_adx > prev_adx and pending_direction == signal:
+                # Confirmation received
+                self.adx_confirmation_pending[trading_pair] = False
+                self.adx_confirmation_direction[trading_pair] = 0
+                self.logger().info(f"ADX confirmation received for {trading_pair}, executing {('long' if signal == 1 else 'short')} signal")
+                return signal, signal_source
             else:
-                return False, 0  # Not enough data
+                # Still waiting for confirmation or direction changed
+                if pending_direction != signal:
+                    # Direction changed, update pending direction
+                    self.adx_confirmation_direction[trading_pair] = signal
+                self.logger().info(f"Waiting for ADX confirmation for {trading_pair} (ADX: {current_adx:.1f})")
+                return 0, 0
 
-            # Check if this candle shows exhaustion
-            if adx_value > self.config.adx_threshold_extreme and adx_slope < -1:
-                exhaustion_count += 1
+        # No pending confirmation, check if we need to start waiting
+        # Only require confirmation for ADX threshold crossing signals (source 1)
+        if signal_source == 1:
+            self.adx_confirmation_pending[trading_pair] = True
+            self.adx_confirmation_direction[trading_pair] = signal
+            self.logger().info(f"ADX threshold crossed for {trading_pair}, waiting for confirmation on next candle")
+            return 0, 0
 
-        return exhaustion_count == 3, exhaustion_count
+        # For other signal sources, execute immediately
+        return signal, signal_source
+
+    def _calculate_dema_stop_loss(self, side: TradeType, entry_price: Decimal,
+                                  current_dema: float, current_price: float) -> Optional[Decimal]:
+        """Calculate stop loss percentage based on DEMA levels."""
+        if side == TradeType.BUY:
+            # For long positions: stop loss at DEMA if DEMA < current price
+            if current_dema < current_price:
+                stop_loss_pct = (entry_price - Decimal(str(current_dema))) / entry_price
+                return stop_loss_pct if stop_loss_pct > 0 else None
+        else:  # TradeType.SELL
+            # For short positions: stop loss at DEMA if DEMA > current price
+            if current_dema > current_price:
+                stop_loss_pct = (Decimal(str(current_dema)) - entry_price) / entry_price
+                return stop_loss_pct if stop_loss_pct > 0 else None
+
+        return None
+
+    def _update_adx_confirmation_state(self, trading_pair: str):
+        """Update ADX confirmation state tracking."""
+        # This method is called from _calculate_indicators if needed
+        # Currently the state is managed in _check_adx_confirmation
+        pass
 
     def apply_initial_setting(self):
         if not self.account_config_set:
@@ -574,17 +620,39 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             return "Market connectors are not ready."
         lines = []
 
+        # Show enabled features
+        enabled_features = []
+        if self.config.use_supertrend_filter:
+            enabled_features.append(f"ST Filter ({self.config.supertrend_filter_interval})")
+        if self.config.use_adx_confirmation:
+            enabled_features.append("ADX Confirmation")
+
+        if enabled_features:
+            lines.extend(["", f"  Enabled Features: {', '.join(enabled_features)}"])
+
         # Create compact trading pairs overview
         lines.extend(["", "  Market Overview:"])
 
         # Header for the grid
-        header = f"  {'Symbol':<24} {'Price':<20} {'DEMA':<20} {'Trend':<16} {'ADX':<12} {'Market':<24} {'Signal':<16} {'Exhausted':<20} {'Longs':<12} {'Shorts':<12}"
-        separator = f"  {'-' * 24} {'-' * 20} {'-' * 20} {'-' * 16} {'-' * 12} {'-' * 24} {'-' * 16} {'-' * 20} {'-' * 12} {'-' * 12}"
+        header = f"  {'Symbol':<24} {'Price':<20} {'DEMA':<20} {'Trend':<16} {'ADX':<12} {'Market':<24} {'Signal':<16}"
+        if self.config.use_supertrend_filter:
+            header += f" {'Filter ST':<12}"
+        if self.config.use_adx_confirmation:
+            header += f" {'ADX Confirm':<16}"
+        header += f" {'Momentum':<12} {'Longs':<12} {'Shorts':<12}"
+
+        separator = f"  {'-' * 24} {'-' * 20} {'-' * 20} {'-' * 16} {'-' * 12} {'-' * 24} {'-' * 16}"
+        if self.config.use_supertrend_filter:
+            separator += f" {'-' * 12}"
+        if self.config.use_adx_confirmation:
+            separator += f" {'-' * 16}"
+        separator += f" {'-' * 12} {'-' * 12} {'-' * 12}"
+
         lines.extend([header, separator])
 
         # Display each trading pair in compact format
         for i, candles_pair in enumerate(self.config.candles_pairs):
-            # Get indicator values for this pair
+            # Get indicator values for this pair (using cached values)
             price = self.current_price.get(candles_pair, 0)
             dema = self.current_dema.get(candles_pair, 0)
             st_dir = self.current_supertrend_direction.get(candles_pair, 0)
@@ -593,28 +661,9 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             # Format signal and direction display
             signal_text = "LONG" if signal == 1 else "SHORT" if signal == -1 else "NONE"
 
-            # Get ADX values
+            # Get ADX values (using cached values)
             adx = self.current_adx.get(candles_pair, 0)
             condition = self.market_condition.get(candles_pair, "UNKNOWN")
-
-            # Check if trend is exhausted using the reusable method
-            candles = self.market_data_provider.get_candles_df(
-                self.config.candles_exchange,
-                candles_pair,
-                self.config.candles_interval,
-                self.max_records
-            )
-
-            if candles is not None and not candles.empty:
-                is_exhausted, exhaustion_count = self._is_trend_exhausted_confirmed(candles, candles_pair)
-                if is_exhausted:
-                    trend_exhausted = "YES"
-                elif exhaustion_count > 0:
-                    trend_exhausted = f"PENDING({exhaustion_count}/3)"
-                else:
-                    trend_exhausted = "NO"
-            else:
-                trend_exhausted = "NO"
 
             # Get active positions for this pair
             if i < len(self.config.trading_pairs):
@@ -640,14 +689,34 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
             }
             market = market_map.get(condition, condition)
 
-            row = f"  {symbol:<24} {price_str:<20} {dema_str:<20} {trend:<16} {adx_str:<12} {market:<24} {signal_text:<16} {trend_exhausted:<20} {len(active_longs):<12} {len(active_shorts):<12}"
+            row = f"  {symbol:<24} {price_str:<20} {dema_str:<20} {trend:<16} {adx_str:<12} {market:<24} {signal_text:<16}"
+
+            # Add filter ST column if enabled
+            if self.config.use_supertrend_filter:
+                filter_st = self.filter_supertrend_direction.get(candles_pair, 0)
+                filter_st_text = "BULL" if filter_st == 1 else "BEAR" if filter_st == -1 else "N/A"
+                row += f" {filter_st_text:<12}"
+
+            # Add ADX confirmation status if enabled
+            if self.config.use_adx_confirmation:
+                if self.adx_confirmation_pending.get(candles_pair, False):
+                    confirm_text = "PENDING"
+                else:
+                    confirm_text = "READY"
+                row += f" {confirm_text:<16}"
+
+            # Add trend momentum (using cached value)
+            momentum = self.cached_trend_momentum.get(candles_pair, 0)
+            momentum_str = f"{momentum:+.1f}"
+            row += f" {momentum_str:<12}"
+
+            row += f" {len(active_longs):<12} {len(active_shorts):<12}"
             lines.append(row)
 
         # Add configuration info
-        lines.extend([
-            "",
-            f"  Config: DEMA({self.config.dema_length}) | SuperTrend({self.config.supertrend_length}, {self.config.supertrend_multiplier})"
-        ])
+        config_info = f"  Config: DEMA({self.config.dema_length}) | SuperTrend({self.config.supertrend_length}, {self.config.supertrend_multiplier})"
+        config_info += f" | ADX({self.config.adx_length})"
+        lines.extend(["", config_info])
 
         try:
             orders_df = self.active_orders_df()
@@ -680,7 +749,6 @@ class DEMASTADXTokenStrategy(StrategyV2Base):
                 fees = f"{executor_info.cum_fees_quote:.2f}"
                 status = "ACTIVE" if executor_info.is_trading else "PENDING"
 
-                # Color coding for P&L (you can add ANSI colors if supported)
                 row = f"  {symbol:<12} {side:<5} {pnl_usd:<12} {pnl_pct:<8} {size:<10} {fees:<8} {status:<10}"
                 lines.append(row)
         else:
