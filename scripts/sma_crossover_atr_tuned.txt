@@ -1,0 +1,212 @@
+//@version=6
+strategy("SMA Crossover with ATR", overlay=true, initial_capital=200, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// Input parameters for SMA periods
+shortPeriod = input.int(7, title="Short SMA Period", minval=1)
+longPeriod = input.int(25, title="Long SMA Period", minval=1)
+
+// ATR parameters
+atrPeriod = input.int(14, title="ATR Period", minval=1)
+atrMultiplier = input.float(1.0, title="ATR Multiplier", minval=0.1, step=0.1)
+
+// ATR Percentile parameters
+useATRPercentile = input.bool(true, title="Use ATR Percentile Filter")
+atrPercentileLookback = input.int(100, title="ATR Percentile Lookback", minval=20, maxval=500)
+atrDormantThreshold = input.float(20.0, title="Dormant Market Threshold (%)", minval=0, maxval=100, step=5)
+atrVolatileThreshold = input.float(80.0, title="Volatile Market Threshold (%)", minval=0, maxval=100, step=5)
+filterDormantMarkets = input.bool(true, title="Filter Trades in Dormant Markets")
+filterVolatileMarkets = input.bool(false, title="Filter Trades in Volatile Markets")
+
+// Volatility visualization inputs
+showVolatilityPane = input.bool(false, title="Show Volatility in Separate Pane", group="Volatility Display")
+
+// Risk management inputs
+stopLossPercent = input.float(1.0, title="Stop Loss %", minval=0.1, step=0.1)
+takeProfitPercent = input.float(10.0, title="Take Profit %", minval=0.1, step=0.1)
+useTrailingStop = input.bool(true, title="Use Trailing Stop")
+trailStartPercent = input.float(2.0, title="Start Trailing at %", minval=0.1, step=0.1)
+trailOffsetPercent = input.float(0.5, title="Trail Offset %", minval=0.1, step=0.1)
+
+
+// Calculate SMAs
+shortSMA = ta.sma(close, shortPeriod)
+longSMA = ta.sma(close, longPeriod)
+
+// Calculate ATR
+atrValue = ta.atr(atrPeriod)
+
+// Calculate ATR Percentile
+calculateATRPercentile(atrVal, lookback) =>
+    count = 0
+    for i = 1 to lookback
+        if atrVal > atrVal[i]
+            count := count + 1
+    percentile = (count / lookback) * 100
+    percentile
+
+atrPercentile = useATRPercentile ? calculateATRPercentile(atrValue, atrPercentileLookback) : 50
+
+// Determine market volatility state
+volatilityState = atrPercentile < atrDormantThreshold ? "DORMANT" :
+                  atrPercentile > atrVolatileThreshold ? "VOLATILE" : "NORMAL"
+
+// Determine if trading is allowed based on volatility
+allowTrading = true
+if useATRPercentile
+    if volatilityState == "DORMANT" and filterDormantMarkets
+        allowTrading := false
+    else if volatilityState == "VOLATILE" and filterVolatileMarkets
+        allowTrading := false
+
+// Plot SMAs on chart
+plot(shortSMA, color=color.blue, title="Short SMA", linewidth=2)
+plot(longSMA, color=color.red, title="Long SMA", linewidth=2)
+
+// Define crossover conditions
+smaCrossoverLong = ta.crossover(shortSMA, longSMA)
+smaCrossunderShort = ta.crossunder(shortSMA, longSMA)
+
+longCondition = smaCrossoverLong and allowTrading
+shortCondition = smaCrossunderShort and allowTrading
+
+// Strategy execution
+if (longCondition)
+    // Close any existing short position first
+    if strategy.position_size < 0
+        strategy.close("Short")
+    // Open long position
+    strategy.entry("Long", strategy.long)
+
+if (shortCondition)
+    // Close any existing long position first
+    if strategy.position_size > 0
+        strategy.close("Long")
+    // Open short position
+    strategy.entry("Short", strategy.short)
+
+// Calculate stop loss and take profit levels
+calculateStopLoss(entryPrice, isLong) =>
+   isLong ? entryPrice * (1 - stopLossPercent / 100) : entryPrice * (1 + stopLossPercent / 100)
+
+// Set exit conditions after position is opened
+if strategy.position_size > 0  // Long position
+    entryPrice = strategy.position_avg_price
+    longStopPrice = calculateStopLoss(entryPrice, true)
+    longTakeProfitPrice = entryPrice * (1 + takeProfitPercent / 100)
+
+    if useTrailingStop
+        // Convert percentages to ticks for proper trailing stop implementation
+        trailStartTicks = math.round(entryPrice * (trailStartPercent / 100) / syminfo.mintick)
+        trailOffsetTicks = math.round(entryPrice * (trailOffsetPercent / 100) / syminfo.mintick)
+
+        strategy.exit("Long Exit", "Long",
+                     stop=longStopPrice,
+                     limit=longTakeProfitPrice,
+                     trail_points=trailStartTicks,
+                     trail_offset=trailOffsetTicks)
+    else
+        strategy.exit("Long Exit", "Long", stop=longStopPrice, limit=longTakeProfitPrice)
+
+if strategy.position_size < 0  // Short position
+    entryPrice = strategy.position_avg_price
+    shortStopPrice = calculateStopLoss(entryPrice, false)
+    shortTakeProfitPrice = entryPrice * (1 - takeProfitPercent / 100)
+
+    if useTrailingStop
+        // Convert percentages to ticks for proper trailing stop implementation
+        trailStartTicks = math.round(entryPrice * (trailStartPercent / 100) / syminfo.mintick)
+        trailOffsetTicks = math.round(entryPrice * (trailOffsetPercent / 100) / syminfo.mintick)
+
+        strategy.exit("Short Exit", "Short",
+                     stop=shortStopPrice,
+                     limit=shortTakeProfitPrice,
+                     trail_points=trailStartTicks,
+                     trail_offset=trailOffsetTicks)
+    else
+        strategy.exit("Short Exit", "Short", stop=shortStopPrice, limit=shortTakeProfitPrice)
+
+// Calculate exact crossover price point (average of two SMAs at crossover)
+crossoverPrice = smaCrossoverLong or smaCrossunderShort ? (shortSMA + longSMA) / 2 : na
+
+// Plot cross marks for bullish crossovers
+plotchar(longCondition ? crossoverPrice : na, title="Bullish Cross - Trade Executed", char="✖", location=location.absolute, color=color.yellow, size=size.small)
+
+plotchar(useATRPercentile and smaCrossoverLong and not allowTrading ? crossoverPrice : na, title="Bullish Cross - Blocked by Volatility", char="✖", location=location.absolute, color=color.red, size=size.small)
+
+// Plot cross marks for bearish crossovers
+plotchar(shortCondition ? crossoverPrice : na, title="Bearish Cross - Trade Executed", char="✖", location=location.absolute, color=color.yellow, size=size.small)
+
+plotchar(useATRPercentile and smaCrossunderShort and not allowTrading ? crossoverPrice : na, title="Bearish Cross - Blocked by Volatility", char="✖", location=location.absolute, color=color.red, size=size.small)
+
+// Display current position info
+positionText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+positionColor = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+
+var label posLabel = na
+label.delete(posLabel)
+atrStatus = "ATR: " + str.tostring(atrValue, "#.####")
+volatilityStatus = useATRPercentile ? "Vol: " + volatilityState + " (" + str.tostring(atrPercentile, "#.#") + "%)" : "Vol: OFF"
+labelText = positionText + "\n" + atrStatus + "\n" + volatilityStatus
+posLabel := label.new(bar_index, high, text=labelText, style=label.style_label_down, color=positionColor, textcolor=color.white, size=size.small)
+
+// Plot entry, stop loss, and take profit levels when in position
+avgPrice = strategy.position_avg_price
+inLongPosition = strategy.position_size > 0
+inShortPosition = strategy.position_size < 0
+
+// Long position levels
+// longStop = inLongPosition ? calculateStopLoss(avgPrice, true) : na
+// longTarget = inLongPosition ? avgPrice * (1 + takeProfitPercent / 100) : na
+// longTrailStart = inLongPosition and useTrailingStop ? avgPrice * (1 + trailStartPercent / 100) : na
+
+// Short position levels
+// shortStop = inShortPosition ? calculateStopLoss(avgPrice, false) : na
+// shortTarget = inShortPosition ? avgPrice * (1 - takeProfitPercent / 100) : na
+// shortTrailStart = inShortPosition and useTrailingStop ? avgPrice * (1 - trailStartPercent / 100) : na
+
+// Plot position levels
+// plot(avgPrice, color=color.white, style=plot.style_linebr, linewidth=2, title="Entry Price")
+// plot(longStop, color=color.red, style=plot.style_linebr, linewidth=1, title="Long Stop Loss")
+// plot(longTarget, color=color.green, style=plot.style_linebr, linewidth=1, title="Long Take Profit")
+// plot(longTrailStart, color=color.orange, style=plot.style_linebr, linewidth=1, title="Long Trail Activation")
+// plot(shortStop, color=color.red, style=plot.style_linebr, linewidth=1, title="Short Stop Loss")
+// plot(shortTarget, color=color.green, style=plot.style_linebr, linewidth=1, title="Short Take Profit")
+// plot(shortTrailStart, color=color.orange, style=plot.style_linebr, linewidth=1, title="Short Trail Activation")
+
+// Add volatility-based background coloring (per-candle)
+// This colors the background of each candle based on its volatility state
+volatilityBgColor = useATRPercentile ? volatilityState == "DORMANT" ? color.new(color.blue, 85) : volatilityState == "NORMAL" ? color.new(color.gray, 92) : volatilityState == "VOLATILE" ? color.new(color.red, 85) : na : na
+
+bgcolor(volatilityBgColor, title="Volatility State Background")
+
+// Create separate pane indicator for ATR percentile if requested
+// Note: Since this is a strategy with overlay=true, we'll plot the volatility indicator
+// with a fixed scale to simulate a separate pane at the bottom of the chart
+
+// Create a normalized ATR percentile that fits in a specific range
+// We'll use a range from 0-10 at the bottom of the chart
+volatilityPlotBase = 0.0
+volatilityPlotHeight = 10.0
+normalizedATRPercentile = showVolatilityPane ? volatilityPlotBase + (atrPercentile / 100) * volatilityPlotHeight : na
+
+// Plot ATR percentile as line
+plot(normalizedATRPercentile, title="ATR Percentile", color=volatilityState == "DORMANT" ? color.blue : volatilityState == "NORMAL" ? color.gray : color.red, linewidth=2)
+
+// Plot threshold lines
+normalizedDormantThreshold = showVolatilityPane ? volatilityPlotBase + (atrDormantThreshold / 100) * volatilityPlotHeight : na
+normalizedVolatileThreshold = showVolatilityPane ? volatilityPlotBase + (atrVolatileThreshold / 100) * volatilityPlotHeight : na
+normalizedMedian = showVolatilityPane ? volatilityPlotBase + (50 / 100) * volatilityPlotHeight : na
+
+plot(normalizedDormantThreshold, title="Dormant Threshold", color=color.blue, style=plot.style_line, linewidth=1)
+plot(normalizedVolatileThreshold, title="Volatile Threshold", color=color.red, style=plot.style_line, linewidth=1)
+plot(normalizedMedian, title="Median", color=color.gray, style=plot.style_line, linewidth=1)
+
+// Fill between the line and base
+p1 = plot(showVolatilityPane ? normalizedATRPercentile : na, display=display.none)
+p2 = plot(showVolatilityPane ? volatilityPlotBase : na, display=display.none)
+fillColor = showVolatilityPane ? (volatilityState == "DORMANT" ? color.new(color.blue, 80) : volatilityState == "NORMAL" ? color.new(color.gray, 80) : color.new(color.red, 80)) : na
+fill(p1, p2, color=fillColor, title="ATR Percentile Fill")
+
+
+// Doing good in
+// xrp, hype, ETH

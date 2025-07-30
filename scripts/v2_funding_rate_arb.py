@@ -82,7 +82,8 @@ class FundingRateArbitrage(StrategyV2Base):
     }
     funding_payment_interval_map = {
         "binance_perpetual": 60 * 60 * 8,
-        "hyperliquid_perpetual": 60 * 60 * 1
+        "hyperliquid_perpetual": 60 * 60 * 1,
+        "derive_perpetual": 60 * 60 * 24 * 365
     }
     funding_profitability_interval = 60 * 60 * 24
 

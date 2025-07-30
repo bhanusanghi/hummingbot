@@ -1,0 +1,32 @@
+services:
+  hummingbot-bot1:
+    container_name: hummingbot-bot1
+    build:  # Build from local source
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Instance 1 volumes - separate directories for isolation
+      - ./instance1/conf:/home/hummingbot/conf
+      - ./instance1/conf/connectors:/home/hummingbot/conf/connectors
+      - ./instance1/conf/strategies:/home/hummingbot/conf/strategies
+      - ./instance1/conf/controllers:/home/hummingbot/conf/controllers
+      - ./instance1/conf/scripts:/home/hummingbot/conf/scripts
+      - ./instance1/logs:/home/hummingbot/logs
+      - ./instance1/data:/home/hummingbot/data
+      - ./certs:/home/hummingbot/certs  # Shared certs
+      - ./scripts:/home/hummingbot/scripts  # Shared scripts
+      - ./controllers:/home/hummingbot/controllers  # Shared controllers
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    tty: true
+    stdin_open: true
+    network_mode: host  # Required for proper TTY handling
+    environment:
+      - INSTANCE_ID=bot1
+      # Uncomment and configure as needed:
+      # - CONFIG_PASSWORD=your_password
+      # - CONFIG_FILE_NAME=your_config.py
+      # - SCRIPT_CONFIG=your_script_config.yml
