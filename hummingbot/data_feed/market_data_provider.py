@@ -53,10 +53,10 @@ class MarketDataProvider:
             self._rates_update_task.cancel()
             self._rates_update_task = None
         self.candles_feeds.clear()
+        self._rates_required.clear()
 
     @property
     def ready(self) -> bool:
-        # TODO: unify the ready property for connectors and feeds
         all_connectors_running = all(connector.ready for connector in self.connectors.values())
         all_candles_feeds_running = all(feed.ready for feed in self.candles_feeds.values())
         return all_connectors_running and all_candles_feeds_running
@@ -67,7 +67,7 @@ class MarketDataProvider:
     def initialize_rate_sources(self, connector_pairs: List[ConnectorPair]):
         """
         Initializes a rate source based on the given connector pair.
-        :param connector_pair: ConnectorPair
+        :param connector_pairs: List[ConnectorPair]
         """
         for connector_pair in connector_pairs:
             connector_name, _ = connector_pair
@@ -78,37 +78,83 @@ class MarketDataProvider:
         if not self._rates_update_task:
             self._rates_update_task = safe_ensure_future(self.update_rates_task())
 
+    def remove_rate_sources(self, connector_pairs: List[ConnectorPair]):
+        """
+        Removes rate sources for the given connector pairs.
+        :param connector_pairs: List[ConnectorPair]
+        """
+        for connector_pair in connector_pairs:
+            connector_name, _ = connector_pair
+            if connector_pair.is_amm_connector():
+                self._rates_required.remove("gateway", connector_pair)
+                continue
+            self._rates_required.remove(connector_name, connector_pair)
+
+        # Stop the rates update task if no more rates are required
+        if len(self._rates_required) == 0 and self._rates_update_task:
+            self._rates_update_task.cancel()
+            self._rates_update_task = None
+
     async def update_rates_task(self):
         """
         Updates the rates for all rate sources.
         """
-        while True:
-            rate_oracle = RateOracle.get_instance()
-            for connector, connector_pairs in self._rates_required.items():
-                if connector == "gateway":
-                    tasks = []
-                    gateway_client = GatewayHttpClient.get_instance()
-                    for connector_pair in connector_pairs:
-                        connector, chain, network = connector_pair.connector_name.split("_")
-                        base, quote = connector_pair.trading_pair.split("-")
-                        tasks.append(
-                            gateway_client.get_price(
-                                chain=chain, network=network, connector=connector,
-                                base_asset=base, quote_asset=quote, amount=Decimal("1"),
-                                side=TradeType.BUY))
-                    try:
-                        results = await asyncio.gather(*tasks)
-                        for connector_pair, rate in zip(connector_pairs, results):
-                            rate_oracle.set_price(connector_pair.trading_pair, Decimal(rate["price"]))
-                    except Exception as e:
-                        self.logger().error(f"Error fetching prices from {connector_pairs}: {e}", exc_info=True)
-                else:
-                    connector = self._rate_sources[connector]
-                    prices = await self._safe_get_last_traded_prices(connector,
-                                                                     [pair.trading_pair for pair in connector_pairs])
-                    for pair, rate in prices.items():
-                        rate_oracle.set_price(pair, rate)
-            await asyncio.sleep(self._rates_update_interval)
+        try:
+            while True:
+                # Exit if no more rates to update
+                if len(self._rates_required) == 0:
+                    break
+
+                rate_oracle = RateOracle.get_instance()
+                for connector, connector_pairs in self._rates_required.items():
+                    if connector == "gateway":
+                        tasks = []
+                        gateway_client = GatewayHttpClient.get_instance()
+                        for connector_pair in connector_pairs:
+                            # Handle new connector format like "jupiter/router"
+                            connector_name = connector_pair.connector_name
+                            base, quote = connector_pair.trading_pair.split("-")
+
+                            # Parse connector to get chain and connector name
+                            # First try to get chain and network from gateway
+                            try:
+                                chain, network, error = await gateway_client.get_connector_chain_network(
+                                    connector_name
+                                )
+                                if error:
+                                    self.logger().warning(f"Could not get chain/network for {connector_name}: {error}")
+                                    continue
+
+                                tasks.append(
+                                    gateway_client.get_price(
+                                        chain=chain, network=network, connector=connector_name,
+                                        base_asset=base, quote_asset=quote, amount=Decimal("1"),
+                                        side=TradeType.BUY))
+                            except Exception as e:
+                                self.logger().warning(f"Error getting chain info for {connector_name}: {e}")
+                                continue
+                        try:
+                            if tasks:
+                                results = await asyncio.gather(*tasks, return_exceptions=True)
+                                for connector_pair, rate in zip(connector_pairs, results):
+                                    if isinstance(rate, Exception):
+                                        self.logger().error(f"Error fetching price for {connector_pair.trading_pair}: {rate}")
+                                    elif rate and "price" in rate:
+                                        rate_oracle.set_price(connector_pair.trading_pair, Decimal(rate["price"]))
+                        except Exception as e:
+                            self.logger().error(f"Error fetching prices from {connector_pairs}: {e}", exc_info=True)
+                    else:
+                        connector_instance = self._rate_sources[connector]
+                        prices = await self._safe_get_last_traded_prices(connector_instance,
+                                                                         [pair.trading_pair for pair in connector_pairs])
+                        for pair, rate in prices.items():
+                            rate_oracle.set_price(pair, rate)
+
+                await asyncio.sleep(self._rates_update_interval)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._rates_update_task = None
 
     def initialize_candles_feed(self, config: CandlesConfig):
         """
@@ -139,7 +185,11 @@ class MarketDataProvider:
             # Existing feed is sufficient, return it
             return existing_feed
         else:
-            # Create a new feed or restart the existing one with updated max_records
+            # Stop the existing feed if it exists before creating a new one
+            if existing_feed and hasattr(existing_feed, 'stop'):
+                existing_feed.stop()
+
+            # Create a new feed with updated max_records
             candle_feed = CandlesFactory.get_candle(config)
             self.candles_feeds[key] = candle_feed
             if hasattr(candle_feed, 'start'):
@@ -375,9 +425,17 @@ class MarketDataProvider:
 
     async def _safe_get_last_traded_prices(self, connector, trading_pairs, timeout=5):
         try:
-            last_traded = await connector.get_last_traded_prices(trading_pairs=trading_pairs)
-            return {pair: Decimal(rate) for pair, rate in last_traded.items()}
+            tasks = [self._safe_get_last_traded_price(connector, trading_pair) for trading_pair in trading_pairs]
+            prices = await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
+            return {pair: Decimal(rate) for pair, rate in zip(trading_pairs, prices)}
         except Exception as e:
-            logging.error(
-                f"Error getting last traded prices in connector {connector} for trading pairs {trading_pairs}: {e}")
+            logging.error(f"Error getting last traded prices in connector {connector} for trading pairs {trading_pairs}: {e}")
             return {}
+
+    async def _safe_get_last_traded_price(self, connector, trading_pair):
+        try:
+            last_traded = await connector._get_last_traded_price(trading_pair=trading_pair)
+            return Decimal(last_traded)
+        except Exception as e:
+            logging.error(f"Error getting last traded price in connector {connector} for trading pair {trading_pair}: {e}")
+            return Decimal(0)
