@@ -80,8 +80,6 @@ class MACDBBRSIStrategy(StrategyV2Base):
     It combines multiple technical indicators for more robust signal generation.
     """
 
-    account_config_set = False
-
     @classmethod
     def init_markets(cls, config: MACDBBRSIConfig):
         cls.markets = {config.exchange: {config.trading_pair}}
@@ -169,47 +167,54 @@ class MACDBBRSIStrategy(StrategyV2Base):
         return active_longs, active_shorts
 
     def get_signal(self, connector_name: str, trading_pair: str) -> Optional[float]:
-        candles = self.market_data_provider.get_candles_df(connector_name,
-                                                           trading_pair,
-                                                           self.config.candles_interval,
-                                                           self.max_records)
+        try:
+            candles = self.market_data_provider.get_candles_df(connector_name,
+                                                               trading_pair,
+                                                               self.config.candles_interval,
+                                                               self.max_records)
 
-        # Calculate indicators
-        candles.ta.rsi(length=self.config.rsi_length, append=True)
-        candles.ta.bbands(length=self.config.bb_length, std=self.config.bb_std, append=True)
-        candles.ta.macd(fast=self.config.macd_fast, slow=self.config.macd_slow, signal=self.config.macd_signal, append=True)
+            # Check if candles DataFrame is None or empty
+            if candles is None or candles.empty:
+                return None
 
-        # Get current indicator values
-        self.current_rsi = candles.iloc[-1][f"RSI_{self.config.rsi_length}"]
-        self.current_bbp = candles.iloc[-1][f"BBP_{self.config.bb_length}_{self.config.bb_std}"]
-        self.current_macd = candles.iloc[-1][f"MACD_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
-        self.current_macd_histogram = candles.iloc[-1][f"MACDh_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
+            # Calculate indicators
+            candles.ta.rsi(length=self.config.rsi_length, append=True)
+            candles.ta.bbands(length=self.config.bb_length, std=self.config.bb_std, append=True)
+            candles.ta.macd(fast=self.config.macd_fast, slow=self.config.macd_slow, signal=self.config.macd_signal, append=True)
 
-        # Define combined signal conditions
-        rsi_condition = candles[f"RSI_{self.config.rsi_length}"]
-        bbp_condition = candles[f"BBP_{self.config.bb_length}_{self.config.bb_std}"]
-        macd_condition = candles[f"MACD_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
-        macdh_condition = candles[f"MACDh_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
+            # Get current indicator values
+            self.current_rsi = candles.iloc[-1][f"RSI_{self.config.rsi_length}"]
+            self.current_bbp = candles.iloc[-1][f"BBP_{self.config.bb_length}_{self.config.bb_std}"]
+            self.current_macd = candles.iloc[-1][f"MACD_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
+            self.current_macd_histogram = candles.iloc[-1][f"MACDh_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
 
-        # Generate combined signals
-        long_condition = (rsi_condition < self.config.rsi_low) & (bbp_condition < self.config.bb_long_threshold) & (macdh_condition > 0) & (macd_condition < 0)
-        short_condition = (rsi_condition > self.config.rsi_high) & (bbp_condition > self.config.bb_short_threshold) & (macdh_condition < 0) & (macd_condition > 0)
+            # Define combined signal conditions
+            rsi_condition = candles[f"RSI_{self.config.rsi_length}"]
+            bbp_condition = candles[f"BBP_{self.config.bb_length}_{self.config.bb_std}"]
+            macd_condition = candles[f"MACD_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
+            macdh_condition = candles[f"MACDh_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
 
-        candles["signal"] = 0
-        candles.loc[long_condition, "signal"] = 1
-        candles.loc[short_condition, "signal"] = -1
+            # Generate combined signals
+            long_condition = (rsi_condition < self.config.rsi_low) & (bbp_condition < self.config.bb_long_threshold) & (macdh_condition > 0) & (macd_condition < 0)
+            short_condition = (rsi_condition > self.config.rsi_high) & (bbp_condition > self.config.bb_short_threshold) & (macdh_condition < 0) & (macd_condition > 0)
 
-        self.current_signal = candles.iloc[-1]["signal"] if not candles.empty else None
-        return self.current_signal
+            candles["signal"] = 0
+            candles.loc[long_condition, "signal"] = 1
+            candles.loc[short_condition, "signal"] = -1
+
+            self.current_signal = candles.iloc[-1]["signal"] if not candles.empty else None
+            return self.current_signal
+
+        except Exception as e:
+            self.logger().error(f"Error in get_signal for {connector_name} {trading_pair}: {str(e)}")
+            return None
 
     def apply_initial_setting(self):
-        if not self.account_config_set:
-            for connector_name, connector in self.connectors.items():
-                if self.is_perpetual(connector_name):
-                    connector.set_position_mode(self.config.position_mode)
-                    for trading_pair in self.market_data_provider.get_trading_pairs(connector_name):
-                        connector.set_leverage(trading_pair, self.config.leverage)
-            self.account_config_set = True
+        for connector_name, connector in self.connectors.items():
+            if self.is_perpetual(connector_name):
+                connector.set_position_mode(self.config.position_mode)
+                for trading_pair in self.market_data_provider.get_trading_pairs(connector_name):
+                    connector.set_leverage(trading_pair, self.config.leverage)
 
     def format_status(self) -> str:
         if not self.ready_to_trade:
