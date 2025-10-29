@@ -1,0 +1,20 @@
+# Orderly Network Test Configuration
+# Copy this file to test_config.yml and fill in your credentials
+
+orderly:
+  # Orderly Network credentials
+  account_id: "YOUR_ACCOUNT_ID"  # e.g., "0x1234567890abcdef..."
+  api_key: "YOUR_API_KEY"  # e.g., "ed25519:ABC123..."
+  api_secret: "YOUR_API_SECRET"  # e.g., "ed25519:XYZ789..."
+
+  # Test configuration
+  domain: "orderly_perpetual"  # Use "orderly_perpetual_testnet" for testnet
+  trading_pair: "BTC-USDC"
+  leverage: 10
+
+  # WebSocket test duration (seconds)
+  websocket_test_duration: 60
+
+  # Order test configuration
+  order_offset_percentage: 0.05  # Place orders 5% away from market price
+  min_order_size: 0.001  # Minimum BTC order size (adjust based on exchange requirements)
