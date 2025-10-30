@@ -197,27 +197,60 @@ class OrderlyPerpetualAuth(AuthBase):
 
         This method is called by Hummingbot's web assistant before sending the request.
 
+        IMPORTANT: For POST/PUT requests, we must use the exact JSON string from request.data
+        for signature calculation. Parsing and re-encoding would create a different JSON string
+        (different spacing, key ordering) causing signature mismatch.
+
         Args:
             request: REST request to authenticate
 
         Returns:
             Authenticated REST request
         """
-        # Extract method, path, and params
+        # Extract method and path
         method = request.method.name  # Convert RESTMethod enum to string
         path = urlparse(str(request.url)).path
 
-        # Get params based on method
-        if method in ["GET", "DELETE"]:
-            params = request.params
-        elif method in ["POST", "PUT"]:
-            # Parse JSON data if present
-            params = json.loads(request.data) if request.data else None
-        else:
-            params = None
+        # Generate timestamp
+        timestamp = self._get_timestamp()
 
-        # Generate authentication headers
-        auth_headers = self.get_headers(method, path, params)
+        # Build the message to sign based on method
+        if method in ["GET", "DELETE"]:
+            # For GET/DELETE, use query params
+            if request.params:
+                from urllib.parse import urlencode
+                query_string = urlencode(sorted(request.params.items()))
+                message_to_sign = f"{timestamp}{method}{path}?{query_string}"
+                # DEBUG: Log signature details
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f"[SIGNATURE DEBUG] Method: {method}")
+                logger.info(f"[SIGNATURE DEBUG] Path: {path}")
+                logger.info(f"[SIGNATURE DEBUG] Params: {request.params}")
+                logger.info(f"[SIGNATURE DEBUG] Sorted params: {sorted(request.params.items())}")
+                logger.info(f"[SIGNATURE DEBUG] Query string: {query_string}")
+                logger.info(f"[SIGNATURE DEBUG] Message to sign: {message_to_sign}")
+            else:
+                message_to_sign = f"{timestamp}{method}{path}"
+        elif method in ["POST", "PUT"]:
+            # For POST/PUT, use the exact JSON string from request.data
+            # DO NOT parse and re-encode - it will create a different JSON string!
+            body_string = request.data if request.data else ""
+            message_to_sign = f"{timestamp}{method}{path}{body_string}"
+        else:
+            message_to_sign = f"{timestamp}{method}{path}"
+
+        # Sign the message
+        signature_bytes = self._private_key.sign(message_to_sign.encode("utf-8"))
+        signature = base64.b64encode(signature_bytes).decode("utf-8")
+
+        # Create authentication headers
+        auth_headers = {
+            "orderly-account-id": self._account_id,
+            "orderly-key": self._orderly_key,
+            "orderly-signature": signature,
+            "orderly-timestamp": str(timestamp),
+        }
 
         # Add headers to request
         if request.headers is None:
@@ -258,12 +291,12 @@ class OrderlyPerpetualAuth(AuthBase):
             "event": "auth",
             "params": {
                 "orderly_key": "ed25519:BASE58_PUBLIC_KEY",
-                "sign": "BASE58_SIGNATURE",
+                "sign": "BASE64_SIGNATURE",
                 "timestamp": 1683270060000
             }
         }
 
-        The signature is: sign(str(timestamp)) using ed25519 private key, BASE58 encoded.
+        The signature is: sign(str(timestamp)) using ed25519 private key, BASE64 encoded.
 
         Used by the user stream data source to authenticate private channels.
 
@@ -276,8 +309,8 @@ class OrderlyPerpetualAuth(AuthBase):
         message = str(timestamp)
         signature_bytes = self._private_key.sign(message.encode("utf-8"))
 
-        # Orderly expects BASE58 encoded signature (not BASE64)
-        signature = base58.b58encode(signature_bytes).decode("utf-8")
+        # Orderly expects BASE64 encoded signature for WebSocket auth
+        signature = base64.b64encode(signature_bytes).decode("utf-8")
 
         return {
             "id": "auth",

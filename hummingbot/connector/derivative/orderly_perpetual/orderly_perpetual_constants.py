@@ -34,22 +34,23 @@ FUNDING_RATE_UPDATE_INTERVAL_SECOND = 60
 CURRENCY = "USDC"
 
 # REST API Endpoints
-# Public Endpoints
+# Public Endpoints (no authentication required)
 EXCHANGE_INFO_URL = "/v1/public/futures"  # Market info (prices, funding)
 TRADING_RULES_URL = "/v1/public/info"  # All trading rules
 TRADING_RULE_URL = "/v1/public/info/{symbol}"  # Single symbol trading rules
 SYMBOL_INFO_URL = "/v1/public/futures/{symbol}"
-ORDERBOOK_SNAPSHOT_URL = "/v1/orderbook/{symbol}"
 TICKER_PRICE_URL = "/v1/public/futures"
 MARKET_TRADES_URL = "/v1/public/market_trades"
-KLINE_URL = "/v1/kline"
 FUNDING_RATES_URL = "/v1/public/funding_rates"
 FUNDING_RATE_URL = "/v1/public/funding_rate/{symbol}"
 FUNDING_RATE_HISTORY_URL = "/v1/public/funding_rate_history"
 SYSTEM_INFO_URL = "/v1/public/system_info"  # System health check
 PING_URL = "/v1/public/system_info"  # Using system info for health check
 
-# Private Endpoints
+# Private Endpoints (require authentication)
+# Market Data (authenticated)
+ORDERBOOK_SNAPSHOT_URL = "/v1/orderbook/{symbol}"  # Requires auth per official SDK (_market.py:228)
+KLINE_URL = "/v1/kline"  # Requires auth per official SDK (_market.py:251) - NOT YET IMPLEMENTED
 # Orders
 CREATE_ORDER_URL = "/v1/order"
 BATCH_CREATE_ORDER_URL = "/v1/batch-order"
@@ -290,6 +291,21 @@ RATE_LIMITS = [
             LinkedLimitWeightPair(PUBLIC_LIMIT_ID),
             LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
         ]
+    ),
+    RateLimit(
+        limit_id=FUNDING_RATE_URL,
+        limit=PUBLIC_ENDPOINTS_LIMIT,
+        time_interval=1,
+    ),
+    RateLimit(
+        limit_id=FUNDING_RATE_HISTORY_URL,
+        limit=PUBLIC_ENDPOINTS_LIMIT,
+        time_interval=1,
+    ),
+    RateLimit(
+        limit_id=SYMBOL_INFO_URL,
+        limit=PUBLIC_ENDPOINTS_LIMIT,
+        time_interval=1,
     ),
     RateLimit(
         limit_id=SYSTEM_INFO_URL,

@@ -113,11 +113,11 @@ def wss_url(endpoint_type: str = "public", domain: str = CONSTANTS.DOMAIN, accou
         Full WebSocket URL
 
     Raises:
-        ValueError: If account_id is not provided for private endpoint
+        ValueError: If account_id is not provided for public or private endpoint
 
     Example:
         >>> wss_url("public", "orderly_perpetual")
-        'wss://ws-evm.orderly.org/ws/stream'
+        'wss://ws-evm.orderly.org/ws/stream/0x1234...'
         >>> wss_url("private", "orderly_perpetual", "0x1234...")
         'wss://ws-private-evm.orderly.org/v2/ws/private/stream/0x1234...'
     """
@@ -127,7 +127,10 @@ def wss_url(endpoint_type: str = "public", domain: str = CONSTANTS.DOMAIN, accou
             if domain == CONSTANTS.DOMAIN
             else CONSTANTS.TESTNET_WS_PUBLIC_URL
         )
-        return base_ws_url
+        if account_id is None:
+            raise ValueError("account_id is required for public WebSocket URL")
+        return f"{base_ws_url}/{account_id}"
+
     elif endpoint_type == "private":
         if account_id is None:
             raise ValueError("account_id is required for private WebSocket URL")

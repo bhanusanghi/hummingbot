@@ -15,6 +15,7 @@ https://orderly.network/docs/build-on-omnichain/evm-api/introduction
 """
 
 import asyncio
+import json
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -32,6 +33,7 @@ from hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_user_st
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair, get_new_client_order_id
+from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -41,7 +43,6 @@ from hummingbot.core.utils.async_utils import safe_gather
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
-from hummingbot.core.api_throttler.data_types import RateLimit
 
 
 class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
@@ -97,13 +98,32 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
     @property
     def authenticator(self) -> Optional[OrderlyPerpetualAuth]:
-        """Return authenticator if trading is required"""
-        if self._trading_required:
+        """Return authenticator if API keys are provided (needed for balance queries even if trading not required)"""
+        # Check if API keys are provided - balance queries require authentication
+        has_api_keys = (
+            self._orderly_perpetual_api_key and
+            self._orderly_perpetual_api_secret and
+            self._orderly_perpetual_account_id
+        )
+        
+        if has_api_keys:
+            self.logger().info(
+                f"[AUTH DEBUG] Creating authenticator - "
+                f"account_id={self._orderly_perpetual_account_id}, "
+                f"api_key={self._orderly_perpetual_api_key[:20] if self._orderly_perpetual_api_key else None}..., "
+                f"api_secret={'SET' if self._orderly_perpetual_api_secret else 'None'}, "
+                f"trading_required={self._trading_required}"
+            )
             return OrderlyPerpetualAuth(
                 account_id=self._orderly_perpetual_account_id,
                 orderly_key=self._orderly_perpetual_api_key,
                 orderly_secret=self._orderly_perpetual_api_secret,
             )
+        self.logger().info(
+            f"[AUTH DEBUG] No API keys provided - account_id={self._orderly_perpetual_account_id}, "
+            f"api_key={'SET' if self._orderly_perpetual_api_key else 'None'}, "
+            f"api_secret={'SET' if self._orderly_perpetual_api_secret else 'None'}"
+        )
         return None
 
     @property
@@ -164,8 +184,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     # ============================================================
     # Abstract Methods Implementation
     # ============================================================
-    
-    
+
     def supported_order_types(self) -> List[OrderType]:
         """
         :return a list of OrderType supported by this connector
@@ -190,9 +209,18 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         """Create web assistants factory"""
+        self.logger().info(
+            f"[AUTH DEBUG] Creating web assistants factory - "
+            f"auth={self._auth}, "
+            f"auth type={type(self._auth).__name__ if self._auth else 'None'}"
+        )
+        if self._auth:
+            self.logger().info(
+                f"[AUTH DEBUG] Auth object account_id={getattr(self._auth, '_account_id', 'MISSING')}"
+            )
         return web_utils.build_api_factory(
             throttler=self._throttler,
-            auth=self.authenticator,
+            auth=self._auth,
         )
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
@@ -207,7 +235,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         """Create user stream data source"""
         return OrderlyPerpetualUserStreamDataSource(
-            auth=self.authenticator,
+            auth=self._auth,
             trading_pairs=self._trading_pairs,
             connector=self,
             api_factory=self._web_assistants_factory,
@@ -217,6 +245,19 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     # ============================================================
     # Symbol Mapping
     # ============================================================
+
+    async def _initialize_trading_pair_symbol_map(self):
+        """
+        Initialize trading pair symbol map by fetching trading rules.
+        
+        This method is called by the base class when exchange_symbol_associated_to_pair()
+        is called before trading rules have been fetched.
+        """
+        try:
+            exchange_info = await self._make_trading_rules_request()
+            self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
+        except Exception:
+            self.logger().exception("There was an error requesting exchange info for symbol map initialization.")
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         """
@@ -229,27 +270,89 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             exchange_info: Exchange information dictionary
         """
         mapping = bidict()
+        symbols_processed = 0
+        symbols_skipped = 0
 
         for symbol_data in exchange_info:
             try:
                 exchange_symbol = symbol_data.get("symbol")
                 if not exchange_symbol or not exchange_symbol.startswith("PERP_"):
+                    symbols_skipped += 1
                     continue
 
                 # Convert to Hummingbot format
                 trading_pair = web_utils.format_trading_pair(exchange_symbol)
 
+                # Log conversion result
+                self.logger().debug(
+                    f"[SYMBOL CONVERSION] Exchange symbol: {exchange_symbol} -> "
+                    f"Hummingbot trading pair: {trading_pair}"
+                )
+
                 # Orderly uses unique symbols (PERP_BTC_USDC), no duplicates expected
                 if trading_pair not in mapping.inverse:
                     mapping[exchange_symbol] = trading_pair
+                    symbols_processed += 1
                 else:
                     # Log warning if duplicate found (should not happen with Orderly)
-                    self.logger().warning(f"Duplicate trading pair found: {trading_pair} for {exchange_symbol}")
+                    self.logger().warning(
+                        f"[SYMBOL CONVERSION] Duplicate trading pair found: {trading_pair} "
+                        f"for {exchange_symbol} (existing: {mapping.inverse[trading_pair]})"
+                    )
 
             except Exception:
-                self.logger().exception(f"Error parsing symbol: {symbol_data}")
+                self.logger().exception(f"[SYMBOL CONVERSION] Error parsing symbol: {symbol_data}")
 
         self._set_trading_pair_symbol_map(mapping)
+        
+        # Log summary
+        self.logger().info(
+            f"[SYMBOL CONVERSION] Initialized symbol map: {symbols_processed} symbols processed, "
+            f"{symbols_skipped} skipped, total mappings: {len(mapping)}"
+        )
+        
+        # Log some example mappings
+        if mapping:
+            sample_mappings = list(mapping.items())[:5]
+            self.logger().info(
+                f"[SYMBOL CONVERSION] Sample mappings: {sample_mappings}"
+            )
+
+    async def exchange_symbol_associated_to_pair(self, trading_pair: str) -> str:
+        """
+        Override to add logging for symbol conversion.
+        
+        Args:
+            trading_pair: Trading pair in Hummingbot format (e.g., "ETH-USDC")
+            
+        Returns:
+            Symbol in Orderly format (e.g., "PERP_ETH_USDC")
+        """
+        try:
+            symbol_map = await self.trading_pair_symbol_map()
+            
+            if trading_pair not in symbol_map.inverse:
+                self.logger().error(
+                    f"[SYMBOL CONVERSION] Trading pair '{trading_pair}' not found in symbol map. "
+                    f"Available pairs: {list(symbol_map.inverse.keys())[:10]}"
+                )
+                raise KeyError(f"Trading pair '{trading_pair}' not found in symbol map")
+            
+            orderly_symbol = symbol_map.inverse[trading_pair]
+            self.logger().debug(
+                f"[SYMBOL CONVERSION] Map lookup: Hummingbot '{trading_pair}' -> "
+                f"Orderly '{orderly_symbol}'"
+            )
+            return orderly_symbol
+        except KeyError:
+            # Re-raise KeyError with more context
+            raise
+        except Exception as e:
+            self.logger().error(
+                f"[SYMBOL CONVERSION] Error converting trading pair '{trading_pair}': {e}",
+                exc_info=True
+            )
+            raise
 
     # ============================================================
     # Trading Rules
@@ -259,11 +362,58 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         """
         Fetch trading rules from exchange.
 
+        According to Orderly API docs:
+        GET /v1/public/info - Returns all available symbols with trading rules
+        
+        Response structure:
+        {
+            "success": true,
+            "data": {
+                "rows": [
+                    {
+                        "symbol": "PERP_BTC_USDC",
+                        "base_min": 1.0E-5,
+                        "base_max": 20,
+                        "base_tick": 1.0E-5,
+                        "quote_min": 0,
+                        "quote_max": 100000,
+                        "quote_tick": 0.1,
+                        "min_notional": 1,
+                        ...
+                    }
+                ]
+            }
+        }
+
         Returns:
-            Raw trading rules response
+            List of trading rule dictionaries (rows from response)
         """
-        # Use order book data source to fetch trading rules
-        return await self._order_book_tracker.data_source._request_complete_trading_rules()
+        url = web_utils.public_rest_url(
+            CONSTANTS.TRADING_RULES_URL,
+            domain=self._domain
+        )
+
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        response = await rest_assistant.execute_request(
+            url=url,
+            throttler_limit_id=CONSTANTS.TRADING_RULES_URL,
+            method=RESTMethod.GET,
+        )
+
+        if not response.get("success", False):
+            self.logger().error(f"[TRADING RULES] Failed to fetch trading rules: {response}")
+            raise IOError(f"Failed to fetch trading rules: {response}")
+
+        # Return the rows array which contains all trading rules
+        data = response.get("data", {})
+        rows = data.get("rows", [])
+        
+        # Log fetched trading rules
+        self.logger().info(f"[TRADING RULES] Fetched {len(rows)} trading rules from exchange")
+        if rows:
+            self.logger().debug(f"[TRADING RULES] Sample symbols from exchange: {[r.get('symbol') for r in rows[:5]]}")
+        
+        return rows
 
     async def _make_trading_pairs_request(self) -> Any:
         """
@@ -307,7 +457,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     continue
 
                 orderly_symbol = rule_data["symbol"]
-                trading_pair = await self.trading_pair_associated_to_exchange_symbol(orderly_symbol)
+                # Format trading pair directly from symbol (don't use mapping since it's not initialized yet)
+                trading_pair = web_utils.format_trading_pair(orderly_symbol)
 
                 trading_rule = TradingRule(
                     trading_pair=trading_pair,
@@ -384,20 +535,40 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         Returns:
             API response
         """
+        self.logger().info(
+            f"[AUTH DEBUG] _api_request called - "
+            f"path={path}, method={method.name}, "
+            f"is_auth_required={is_auth_required}, "
+            f"self._auth={self._auth}, "
+            f"factory auth={getattr(self._web_assistants_factory, '_auth', 'MISSING')}"
+        )
         url = web_utils.private_rest_url(path, self._domain) if is_auth_required else web_utils.public_rest_url(path, self._domain)
 
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+
+        # JSON encode data if it's a dict and method is POST/PUT
+        # The auth module expects request.data to be a JSON string for POST/PUT requests
+        encoded_data = None
+        if data is not None:
+            if method in (RESTMethod.POST, RESTMethod.PUT):
+                # If data is already a string, use it as-is; otherwise JSON encode
+                if isinstance(data, str):
+                    encoded_data = data
+                else:
+                    encoded_data = json.dumps(data)
+            else:
+                encoded_data = data
 
         request = RESTRequest(
             method=method,
             url=url,
             params=params,
-            data=data,
+            data=encoded_data,
             is_auth_required=is_auth_required,
         )
 
         response = await rest_assistant.call(request=request)
-        return response
+        return await response.json()
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         """
@@ -410,7 +581,10 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             Last traded price
         """
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-
+        self.logger().info(
+            f"[SYMBOL CONVERSION] Converting trading pair: Hummingbot '{trading_pair}' -> "
+            f"Orderly symbol '{symbol}'"
+        )
         url = web_utils.public_rest_url(
             CONSTANTS.SYMBOL_INFO_URL.format(symbol=symbol),
             domain=self._domain
@@ -460,20 +634,31 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             Tuple of (exchange_order_id, timestamp)
         """
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        self.logger().debug(
+            f"[SYMBOL CONVERSION] Order placement: Hummingbot '{trading_pair}' -> "
+            f"Orderly symbol '{symbol}'"
+        )
 
-        # Build order parameters
+        # Build order parameters according to Orderly API spec
+        # Map Hummingbot order types to Orderly order types
+        orderly_order_type = "MARKET"
+        if order_type == OrderType.LIMIT:
+            orderly_order_type = "LIMIT"
+        elif order_type == OrderType.LIMIT_MAKER:
+            orderly_order_type = "POST_ONLY"
+
         order_params = {
             "symbol": symbol,
             "client_order_id": order_id,
             "side": "BUY" if trade_type == TradeType.BUY else "SELL",
-            "type": "LIMIT" if order_type == OrderType.LIMIT else "MARKET",
-            "quantity": float(self.quantize_order_amount(trading_pair, amount)),
+            "order_type": orderly_order_type,
+            "order_quantity": float(self.quantize_order_amount(trading_pair, amount)),
             "reduce_only": position_action == PositionAction.CLOSE,
         }
 
-        # Add price for LIMIT orders
+        # Add price for non-MARKET orders
         if order_type != OrderType.MARKET:
-            order_params["price"] = float(self.quantize_order_price(trading_pair, price))
+            order_params["order_price"] = float(self.quantize_order_price(trading_pair, price))
 
         # Make API call
         response = await self._api_request(
@@ -501,9 +686,12 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         """
         symbol = await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
 
+        # IMPORTANT: Parameter order must match SDK: order_id, symbol
+        # (Our auth uses sorted() but dict maintains insertion order)
+        order_id_to_cancel = tracked_order.exchange_order_id or order_id
         params = {
+            "order_id": str(order_id_to_cancel),
             "symbol": symbol,
-            "order_id": tracked_order.exchange_order_id or order_id,
         }
 
         response = await self._api_request(
@@ -578,8 +766,9 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             exchange_order_id = await order.get_exchange_order_id()
 
             # Fetch all trades for this order
+            # Path parameters are sent as strings in URLs
             response = await self._api_request(
-                path=CONSTANTS.GET_ORDER_TRADES_URL.format(order_id=exchange_order_id),
+                path=CONSTANTS.GET_ORDER_TRADES_URL.format(order_id=str(exchange_order_id)),
                 method=RESTMethod.GET,
                 is_auth_required=True,
             )
@@ -696,6 +885,10 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         """
         try:
             symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+            self.logger().debug(
+                f"[SYMBOL CONVERSION] Setting leverage: Hummingbot '{trading_pair}' -> "
+                f"Orderly symbol '{symbol}'"
+            )
 
             data = {
                 "symbol": symbol,
@@ -750,19 +943,26 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _update_balances(self):
         """Fetch and update account balances"""
+        self.logger().info(
+            f"[AUTH DEBUG] _update_balances called - "
+            f"self._auth={self._auth}, "
+            f"auth account_id={getattr(self._auth, '_account_id', 'MISSING') if self._auth else 'NO_AUTH'}"
+        )
         response = await self._api_request(
             path=CONSTANTS.ACCOUNT_HOLDING_URL,
             method=RESTMethod.GET,
             is_auth_required=True,
         )
-
+        self.logger().info(f"response: {response}")
         if not response.get("success", False):
             self.logger().error(f"Failed to fetch balances: {response}")
             return
 
         data = response.get("data", {})
+        self.logger().info(f"data: {data}")
         holdings = data.get("holding", [])
-
+        self.logger().info(f"holdings: {holdings}")
+        
         self._account_balances.clear()
         self._account_available_balances.clear()
 
@@ -791,11 +991,16 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         """
         try:
             symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+            self.logger().debug(
+                f"[SYMBOL CONVERSION] Fetching funding payment: Hummingbot '{trading_pair}' -> "
+                f"Orderly symbol '{symbol}'"
+            )
 
+            # Orderly API requires size parameter as a string
             response = await self._api_request(
                 path=CONSTANTS.FUNDING_FEE_HISTORY_URL,
                 method=RESTMethod.GET,
-                params={"symbol": symbol, "size": 1},
+                params={"symbol": symbol, "size": "1"},
                 is_auth_required=True,
             )
 

@@ -26,7 +26,7 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.funding_info import FundingInfo, FundingInfoUpdate
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.perpetual_api_order_book_data_source import PerpetualAPIOrderBookDataSource
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSJSONRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
@@ -117,16 +117,16 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         orderly_symbol = await self._connector.exchange_symbol_associated_to_pair(
             trading_pair=trading_pair
         )
+        
+        self.logger().debug(
+            f"[SYMBOL CONVERSION] get_funding_info: Hummingbot '{trading_pair}' -> "
+            f"Orderly symbol '{orderly_symbol}'"
+        )
 
         # Fetch funding rate
         funding_url = web_utils.public_rest_url(
             CONSTANTS.FUNDING_RATE_URL.format(symbol=orderly_symbol),
             domain=self._domain
-        )
-
-        funding_request = RESTRequest(
-            method=RESTMethod.GET,
-            url=funding_url,
         )
 
         # Fetch market info for index and mark prices
@@ -135,21 +135,18 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             domain=self._domain
         )
 
-        market_info_request = RESTRequest(
-            method=RESTMethod.GET,
-            url=market_info_url,
-        )
-
         # Execute both requests in parallel
         rest_assistant = await self._api_factory.get_rest_assistant()
 
         funding_response, market_response = await asyncio.gather(
             rest_assistant.execute_request(
-                request=funding_request,
+                url=funding_url,
+                method=RESTMethod.GET,
                 throttler_limit_id=CONSTANTS.FUNDING_RATE_URL,
             ),
             rest_assistant.execute_request(
-                request=market_info_request,
+                url=market_info_url,
+                method=RESTMethod.GET,
                 throttler_limit_id=CONSTANTS.SYMBOL_INFO_URL,
             ),
         )
@@ -233,14 +230,10 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             domain=self._domain
         )
 
-        symbols_request = RESTRequest(
-            method=RESTMethod.GET,
-            url=symbols_url,
-        )
-
         rest_assistant = await self._api_factory.get_rest_assistant()
         symbols_response = await rest_assistant.execute_request(
-            request=symbols_request,
+            url=symbols_url,
+            method=RESTMethod.GET,
             throttler_limit_id=CONSTANTS.EXCHANGE_INFO_URL,
         )
 
@@ -259,13 +252,9 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             domain=self._domain
         )
 
-        rules_request = RESTRequest(
-            method=RESTMethod.GET,
-            url=trading_rules_url,
-        )
-
         rules_response = await rest_assistant.execute_request(
-            request=rules_request,
+            url=trading_rules_url,
+            method=RESTMethod.GET,
             throttler_limit_id=CONSTANTS.TRADING_RULES_URL,
         )
 
@@ -288,14 +277,10 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                     domain=self._domain
                 )
 
-                request = RESTRequest(
-                    method=RESTMethod.GET,
-                    url=url,
-                )
-
                 tasks.append(
                     rest_assistant.execute_request(
-                        request=request,
+                        url=url,
+                        method=RESTMethod.GET,
                         throttler_limit_id=CONSTANTS.TRADING_RULE_URL,
                     )
                 )
@@ -369,6 +354,9 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         """
         Request order book snapshot via REST API.
 
+        NOTE: This is a PRIVATE endpoint that requires authentication.
+        According to official Orderly SDK (_market.py:228), /v1/orderbook/{symbol} uses _sign_request().
+
         Args:
             trading_pair: Trading pair in Hummingbot format
 
@@ -379,21 +367,30 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             trading_pair=trading_pair
         )
 
-        url = web_utils.public_rest_url(
+        self.logger().debug(
+            f"[SYMBOL CONVERSION] _request_order_book_snapshot: Hummingbot '{trading_pair}' -> "
+            f"Orderly symbol '{orderly_symbol}'"
+        )
+
+        # Use private_rest_url since this endpoint requires authentication
+        url = web_utils.private_rest_url(
             CONSTANTS.ORDERBOOK_SNAPSHOT_URL.format(symbol=orderly_symbol),
             domain=self._domain
         )
 
+        rest_assistant = await self._api_factory.get_rest_assistant()
+
+        # Create authenticated request
+        from hummingbot.core.web_assistant.connections.data_types import RESTRequest, RESTMethod
         request = RESTRequest(
             method=RESTMethod.GET,
             url=url,
-        )
-
-        rest_assistant = await self._api_factory.get_rest_assistant()
-        response = await rest_assistant.execute_request(
-            request=request,
+            is_auth_required=True,  # This endpoint requires authentication
             throttler_limit_id=CONSTANTS.ORDERBOOK_SNAPSHOT_URL,
         )
+
+        response = await rest_assistant.call(request=request)
+        response_json = await response.json()
 
         # Expected response:
         # {
@@ -406,10 +403,10 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         #   }
         # }
 
-        if not response.get("success", False):
-            raise IOError(f"Failed to fetch order book snapshot for {trading_pair}: {response}")
+        if not response_json.get("success", False):
+            raise IOError(f"Failed to fetch order book snapshot for {trading_pair}: {response_json}")
 
-        return response.get("data", {})
+        return response_json.get("data", {})
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         """
@@ -428,13 +425,22 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         # Convert timestamp from milliseconds to seconds
         timestamp_seconds = timestamp / 1000 if timestamp > 1e10 else timestamp
 
+        # Transform REST API orderbook format to array format
+        # REST API returns: [{"price": 10669.4, "quantity": 1.56}, ...]
+        # Hummingbot expects: [[10669.4, 1.56], ...]
+        raw_bids = snapshot_data.get("bids", [])
+        raw_asks = snapshot_data.get("asks", [])
+
+        bids = [[float(bid["price"]), float(bid["quantity"])] for bid in raw_bids]
+        asks = [[float(ask["price"]), float(ask["quantity"])] for ask in raw_asks]
+
         snapshot_msg = OrderBookMessage(
             OrderBookMessageType.SNAPSHOT,
             {
                 "trading_pair": trading_pair,
                 "update_id": timestamp,
-                "bids": snapshot_data.get("bids", []),
-                "asks": snapshot_data.get("asks", []),
+                "bids": bids,
+                "asks": asks,
             },
             timestamp=timestamp_seconds
         )
@@ -448,13 +454,28 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         Returns:
             Connected WSAssistant instance
         """
-        ws_url = web_utils.wss_url("public", self._domain)
-        ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(
-            ws_url=ws_url,
-            ping_timeout=CONSTANTS.HEARTBEAT_TIME_INTERVAL
-        )
-        return ws
+        ws_url = web_utils.wss_url("public", self._domain, self._connector.authenticator.account_id) # account_id is a mandatory parameter for public WebSocket URL
+        self.logger().info(f"[WEBSOCKET] Attempting to connect to public WebSocket: {ws_url}")
+        
+        try:
+            ws: WSAssistant = await self._api_factory.get_ws_assistant()
+            self.logger().debug(f"[WEBSOCKET] WSAssistant created, connecting to: {ws_url}")
+            
+            await ws.connect(
+                ws_url=ws_url,
+                ping_timeout=CONSTANTS.HEARTBEAT_TIME_INTERVAL
+            )
+            
+            self.logger().info(f"[WEBSOCKET] Successfully connected to public WebSocket: {ws_url}")
+            return ws
+            
+        except Exception as e:
+            self.logger().error(
+                f"[WEBSOCKET] Failed to connect to public WebSocket: {ws_url}. "
+                f"Error type: {type(e).__name__}, Error: {str(e)}",
+                exc_info=True
+            )
+            raise
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
@@ -475,6 +496,11 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 orderly_symbol = await self._connector.exchange_symbol_associated_to_pair(
                     trading_pair=trading_pair
                 )
+                
+                self.logger().debug(
+                    f"[WEBSOCKET SUBSCRIBE] Subscribing to channels for trading pair: "
+                    f"'{trading_pair}' (Orderly symbol: '{orderly_symbol}')"
+                )
 
                 # Subscribe to orderbook channel
                 # Orderly format: {symbol}@orderbook (e.g., "PERP_BTC_USDC@orderbook")
@@ -494,18 +520,26 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 }
                 subscribe_trade_request = WSJSONRequest(payload=trades_payload)
 
+                self.logger().debug(
+                    f"[WEBSOCKET SUBSCRIBE] Sending orderbook subscription: {orderbook_payload}"
+                )
                 await ws.send(subscribe_orderbook_request)
+                
+                self.logger().debug(
+                    f"[WEBSOCKET SUBSCRIBE] Sending trades subscription: {trades_payload}"
+                )
                 await ws.send(subscribe_trade_request)
 
                 self.logger().info(
-                    f"Subscribed to public order book and trade channels for {trading_pair}"
+                    f"[WEBSOCKET SUBSCRIBE] Subscribed to public order book and trade channels for {trading_pair}"
                 )
 
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
             self.logger().error(
-                "Unexpected error occurred subscribing to order book data streams.",
+                f"[WEBSOCKET SUBSCRIBE] Unexpected error occurred subscribing to order book data streams. "
+                f"Error type: {type(e).__name__}, Error: {str(e)}",
                 exc_info=True
             )
             raise
@@ -766,14 +800,10 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 domain=self._domain
             )
 
-            request = RESTRequest(
-                method=RESTMethod.GET,
-                url=url,
-            )
-
             rest_assistant = await self._api_factory.get_rest_assistant()
             response = await rest_assistant.execute_request(
-                request=request,
+                url=url,
+                method=RESTMethod.GET,
                 throttler_limit_id=CONSTANTS.SYSTEM_INFO_URL,
             )
 
