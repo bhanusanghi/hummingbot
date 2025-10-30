@@ -30,6 +30,7 @@ from hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_auth im
 from hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_user_stream_data_source import (
     OrderlyPerpetualUserStreamDataSource,
 )
+from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair, get_new_client_order_id
@@ -850,6 +851,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 unrealized_pnl = Decimal(str(position_data.get("unrealized_pnl", "0")))
                 entry_price = Decimal(str(position_data.get("average_open_price", "0")))
                 leverage = Decimal(str(position_data.get("leverage", "1")))
+                pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side)
 
                 position = self._perpetual_trading.get_position(trading_pair, position_side)
                 if position is not None:
@@ -860,13 +862,17 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                         amount=abs(position_qty),
                     )
                 else:
-                    await self._perpetual_trading.set_position(
+                    _position = Position(
                         trading_pair=trading_pair,
                         position_side=position_side,
                         unrealized_pnl=unrealized_pnl,
                         entry_price=entry_price,
                         amount=abs(position_qty),
-                        leverage=leverage,
+                        leverage=leverage
+                    )
+                    self._perpetual_trading.set_position(
+                        pos_key,
+                        _position
                     )
 
             except Exception:
