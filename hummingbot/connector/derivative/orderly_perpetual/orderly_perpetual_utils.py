@@ -52,7 +52,7 @@ class OrderlyPerpetualConfigMap(BaseConnectorConfigMap):
 
     connector: str = "orderly_perpetual"
 
-    orderly_account_id: SecretStr = Field(
+    orderly_perpetual_account_id: SecretStr = Field(
         default=...,
         json_schema_extra={
             "prompt": "Enter your Orderly Network account ID (e.g., 0x1234...)",
@@ -62,7 +62,7 @@ class OrderlyPerpetualConfigMap(BaseConnectorConfigMap):
         },
     )
 
-    orderly_key: SecretStr = Field(
+    orderly_perpetual_api_key: SecretStr = Field(
         default=...,
         json_schema_extra={
             "prompt": "Enter your Orderly Network API key (e.g., ed25519:ABC...)",
@@ -72,7 +72,7 @@ class OrderlyPerpetualConfigMap(BaseConnectorConfigMap):
         },
     )
 
-    orderly_secret: SecretStr = Field(
+    orderly_perpetual_api_secret: SecretStr = Field(
         default=...,
         json_schema_extra={
             "prompt": "Enter your Orderly Network API secret (e.g., ed25519:123...)",
@@ -101,7 +101,7 @@ class OrderlyPerpetualTestnetConfigMap(BaseConnectorConfigMap):
 
     connector: str = "orderly_perpetual_testnet"
 
-    orderly_testnet_account_id: SecretStr = Field(
+    orderly_perpetual_testnet_account_id: SecretStr = Field(
         default=...,
         json_schema_extra={
             "prompt": "Enter your Orderly Network testnet account ID (e.g., 0x1234...)",
@@ -111,7 +111,7 @@ class OrderlyPerpetualTestnetConfigMap(BaseConnectorConfigMap):
         },
     )
 
-    orderly_testnet_key: SecretStr = Field(
+    orderly_perpetual_testnet_api_key: SecretStr = Field(
         default=...,
         json_schema_extra={
             "prompt": "Enter your Orderly Network testnet API key (e.g., ed25519:ABC...)",
@@ -121,7 +121,7 @@ class OrderlyPerpetualTestnetConfigMap(BaseConnectorConfigMap):
         },
     )
 
-    orderly_testnet_secret: SecretStr = Field(
+    orderly_perpetual_testnet_api_secret: SecretStr = Field(
         default=...,
         json_schema_extra={
             "prompt": "Enter your Orderly Network testnet API secret (e.g., ed25519:123...)",

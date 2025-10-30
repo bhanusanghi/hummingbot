@@ -41,6 +41,7 @@ from hummingbot.core.utils.async_utils import safe_gather
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.core.api_throttler.data_types import RateLimit
 
 
 class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
@@ -54,10 +55,11 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
     def __init__(
         self,
-        client_config_map: "ClientConfigAdapter",  # noqa: F821
-        orderly_perpetual_api_key: str,
-        orderly_perpetual_api_secret: str,
-        orderly_perpetual_account_id: str,
+        balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+        rate_limits_share_pct: Decimal = Decimal("100"),
+        orderly_perpetual_api_key: str = None,
+        orderly_perpetual_api_secret: str = None,
+        orderly_perpetual_account_id: str = None,
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
         domain: str = CONSTANTS.DOMAIN,
@@ -66,7 +68,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         Initialize Orderly Perpetual connector.
 
         Args:
-            client_config_map: Client configuration
+            balance_asset_limit: Optional balance limits per asset
+            rate_limits_share_pct: Percentage of rate limits to use
             orderly_perpetual_api_key: Orderly API key (public key)
             orderly_perpetual_api_secret: Orderly API secret (private key)
             orderly_perpetual_account_id: Orderly account ID
@@ -80,8 +83,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs or []
         self._domain = domain
-
-        super().__init__(client_config_map)
+        self._position_mode = None
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # ============================================================
     # Properties
@@ -104,7 +107,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         return None
 
     @property
-    def rate_limits_rules(self):
+    def rate_limits_rules(self) -> List[RateLimit]:
         """Rate limits from constants"""
         return CONSTANTS.RATE_LIMITS
 
@@ -161,6 +164,13 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     # ============================================================
     # Abstract Methods Implementation
     # ============================================================
+    
+    
+    def supported_order_types(self) -> List[OrderType]:
+        """
+        :return a list of OrderType supported by this connector
+        """
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
     def supported_position_modes(self) -> List[PositionMode]:
         """
@@ -229,10 +239,12 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 # Convert to Hummingbot format
                 trading_pair = web_utils.format_trading_pair(exchange_symbol)
 
-                if trading_pair in mapping.inverse:
-                    self._resolve_trading_pair_symbols_duplicate(mapping, exchange_symbol, None, None)
-                else:
+                # Orderly uses unique symbols (PERP_BTC_USDC), no duplicates expected
+                if trading_pair not in mapping.inverse:
                     mapping[exchange_symbol] = trading_pair
+                else:
+                    # Log warning if duplicate found (should not happen with Orderly)
+                    self.logger().warning(f"Duplicate trading pair found: {trading_pair} for {exchange_symbol}")
 
             except Exception:
                 self.logger().exception(f"Error parsing symbol: {symbol_data}")
@@ -538,7 +550,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         return OrderUpdate(
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=data.get("updated_time", self.current_timestamp) / 1000,
+            update_timestamp=data.get("updated_time", self.current_timestamp) * 1e-3,
             new_state=order_state,
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=exchange_order_id,
@@ -547,6 +559,75 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     async def _update_order_status(self):
         """Update status of all active orders"""
         await super()._update_order_status()
+
+    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        """
+        Fetches all trade updates for a specific order from Orderly.
+
+        Uses the GET /v1/order/{order_id}/trades endpoint to fetch all fills for an order.
+
+        Args:
+            order: The InFlightOrder to fetch trades for
+
+        Returns:
+            List of TradeUpdate objects representing all fills for this order
+        """
+        trade_updates = []
+
+        try:
+            exchange_order_id = await order.get_exchange_order_id()
+
+            # Fetch all trades for this order
+            response = await self._api_request(
+                path=CONSTANTS.GET_ORDER_TRADES_URL.format(order_id=exchange_order_id),
+                method=RESTMethod.GET,
+                is_auth_required=True,
+            )
+
+            if not response.get("success", False):
+                self.logger().warning(f"Failed to fetch trades for order {order.client_order_id}: {response}")
+                return trade_updates
+
+            data = response.get("data", {})
+            rows = data.get("rows", [])
+
+            for trade in rows:
+                # Determine position action (OPEN or CLOSE)
+                # Orderly returns side as "BUY" or "SELL" for the trade
+                position_action = PositionAction.OPEN  # Default
+
+                # Parse fee information
+                fee_asset = trade.get("fee_asset", order.quote_asset)
+                fee_amount = Decimal(str(trade.get("fee", "0")))
+
+                fee = TradeFeeBase.new_perpetual_fee(
+                    fee_schema=self.trade_fee_schema(),
+                    position_action=position_action,
+                    percent_token=fee_asset,
+                    flat_fees=[TokenAmount(amount=fee_amount, token=fee_asset)] if fee_amount > 0 else []
+                )
+
+                # Create TradeUpdate
+                trade_update = TradeUpdate(
+                    trade_id=str(trade.get("id")),
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=str(trade.get("order_id")),
+                    trading_pair=order.trading_pair,
+                    fill_timestamp=int(trade.get("executed_timestamp", 0) * 1e-3),
+                    fill_price=Decimal(str(trade.get("executed_price", "0"))),
+                    fill_base_amount=Decimal(str(trade.get("executed_quantity", "0"))),
+                    fill_quote_amount=Decimal(str(trade.get("executed_price", "0"))) * Decimal(str(trade.get("executed_quantity", "0"))),
+                    fee=fee,
+                )
+
+                trade_updates.append(trade_update)
+
+        except asyncio.TimeoutError:
+            raise IOError(f"Skipped order trade updates for {order.client_order_id} - waiting for exchange order id.")
+        except Exception as e:
+            self.logger().warning(f"Failed to fetch trade updates for order {order.client_order_id}: {e}")
+
+        return trade_updates
 
     # ============================================================
     # Position Management
@@ -637,6 +718,17 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         except Exception as e:
             return False, f"Error setting leverage: {str(e)}"
 
+    async def _get_position_mode(self) -> Optional[PositionMode]:
+        """
+        Get current position mode.
+
+        Orderly only supports ONEWAY position mode (single position per symbol).
+
+        Returns:
+            PositionMode.ONEWAY - Orderly only supports one-way mode
+        """
+        return PositionMode.ONEWAY
+
     async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
         """
         Set position mode (Orderly only supports ONEWAY).
@@ -687,7 +779,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     # Funding
     # ============================================================
 
-    async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[float, Decimal, Decimal]:
+    async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
         """
         Fetch last funding payment.
 
@@ -717,7 +809,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 return 0, Decimal("-1"), Decimal("-1")
 
             last_payment = rows[0]
-            timestamp = last_payment.get("timestamp", 0) / 1000
+            timestamp = int(last_payment.get("timestamp", 0) * 1e-3)
             funding_rate = Decimal(str(last_payment.get("funding_rate", "0")))
             payment = Decimal(str(last_payment.get("funding_fee", "0")))
 
@@ -731,12 +823,23 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     # Fees
     # ============================================================
 
+    async def _update_trading_fees(self):
+        """
+        Update fees information from the exchange.
+
+        Note: Orderly provides fee information in the account info endpoint,
+        but fees are already handled per-trade. This method is stubbed as
+        fees are retrieved with each trade/order response.
+        """
+        pass
+
     def _get_fee(
         self,
         base_currency: str,
         quote_currency: str,
         order_type: OrderType,
         order_side: TradeType,
+        position_action: PositionAction,
         amount: Decimal,
         price: Decimal = Decimal("NaN"),
         is_maker: Optional[bool] = None,
@@ -756,7 +859,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         Returns:
             TradeFeeBase object
         """
-        is_maker = is_maker or (order_type == OrderType.LIMIT_MAKER)
+        is_maker = is_maker or False
         return build_trade_fee(
             exchange=self.name,
             is_maker=is_maker,
@@ -810,7 +913,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         order_update = OrderUpdate(
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=data.get("timestamp", self.current_timestamp) / 1000,
+            update_timestamp=data.get("timestamp", self.current_timestamp) * 1e-3,
             new_state=new_state,
             client_order_id=client_order_id,
             exchange_order_id=str(data.get("order_id", "")),

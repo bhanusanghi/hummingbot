@@ -33,7 +33,9 @@ from hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_api_ord
     OrderlyPerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_auth import OrderlyPerpetualAuth
-from hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_derivative import OrderlyPerpetualDerivative
+from hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_derivative import (
+    OrderlyPerpetualDerivative,
+)
 from hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_user_stream_data_source import (
     OrderlyPerpetualUserStreamDataSource,
 )
