@@ -225,10 +225,10 @@ class OrderlyPerpetualAuth(AuthBase):
                 url_path_with_query = f"{path}?{query_string}"
             else:
                 url_path_with_query = path
-            
+
             # SDK format: {timestamp}{method}{url_path_with_query}
             message_to_sign = f"{timestamp}{method}{url_path_with_query}"
-            
+
         elif method in ["POST", "PUT"]:
             # For POST/PUT, use the exact JSON string from request.data
             # DO NOT parse and re-encode - it will create a different JSON string!

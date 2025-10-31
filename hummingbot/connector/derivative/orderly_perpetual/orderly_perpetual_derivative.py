@@ -106,7 +106,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             self._orderly_perpetual_api_secret and
             self._orderly_perpetual_account_id
         )
-        
+
         if has_api_keys:
             self.logger().info(
                 f"[AUTH DEBUG] Creating authenticator - "
@@ -250,7 +250,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     async def _initialize_trading_pair_symbol_map(self):
         """
         Initialize trading pair symbol map by fetching trading rules.
-        
+
         This method is called by the base class when exchange_symbol_associated_to_pair()
         is called before trading rules have been fetched.
         """
@@ -305,13 +305,13 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 self.logger().exception(f"[SYMBOL CONVERSION] Error parsing symbol: {symbol_data}")
 
         self._set_trading_pair_symbol_map(mapping)
-        
+
         # Log summary
         self.logger().info(
             f"[SYMBOL CONVERSION] Initialized symbol map: {symbols_processed} symbols processed, "
             f"{symbols_skipped} skipped, total mappings: {len(mapping)}"
         )
-        
+
         # Log some example mappings
         if mapping:
             sample_mappings = list(mapping.items())[:5]
@@ -322,23 +322,23 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     async def exchange_symbol_associated_to_pair(self, trading_pair: str) -> str:
         """
         Override to add logging for symbol conversion.
-        
+
         Args:
             trading_pair: Trading pair in Hummingbot format (e.g., "ETH-USDC")
-            
+
         Returns:
             Symbol in Orderly format (e.g., "PERP_ETH_USDC")
         """
         try:
             symbol_map = await self.trading_pair_symbol_map()
-            
+
             if trading_pair not in symbol_map.inverse:
                 self.logger().error(
                     f"[SYMBOL CONVERSION] Trading pair '{trading_pair}' not found in symbol map. "
                     f"Available pairs: {list(symbol_map.inverse.keys())[:10]}"
                 )
                 raise KeyError(f"Trading pair '{trading_pair}' not found in symbol map")
-            
+
             orderly_symbol = symbol_map.inverse[trading_pair]
             self.logger().debug(
                 f"[SYMBOL CONVERSION] Map lookup: Hummingbot '{trading_pair}' -> "
@@ -365,7 +365,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         According to Orderly API docs:
         GET /v1/public/info - Returns all available symbols with trading rules
-        
+
         Response structure:
         {
             "success": true,
@@ -408,12 +408,12 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         # Return the rows array which contains all trading rules
         data = response.get("data", {})
         rows = data.get("rows", [])
-        
+
         # Log fetched trading rules
         self.logger().info(f"[TRADING RULES] Fetched {len(rows)} trading rules from exchange")
         if rows:
             self.logger().debug(f"[TRADING RULES] Sample symbols from exchange: {[r.get('symbol') for r in rows[:5]]}")
-        
+
         return rows
 
     async def _make_trading_pairs_request(self) -> Any:
@@ -979,7 +979,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         self.logger().info(f"data: {data}")
         holdings = data.get("holding", [])
         self.logger().info(f"holdings: {holdings}")
-        
+
         self._account_balances.clear()
         self._account_available_balances.clear()
 
