@@ -26,7 +26,7 @@ import base64
 import json
 import time
 from typing import Any, Dict, Optional
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 import base58
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -131,7 +131,8 @@ class OrderlyPerpetualAuth(AuthBase):
         if params:
             if method in ["GET", "DELETE"]:
                 # Query string format: key1=value1&key2=value2
-                query_string = urlencode(sorted(params.items()))
+                # Match SDK: use insertion order, not sorted
+                query_string = "&".join([f"{k}={v}" for k, v in params.items()])
                 if query_string:
                     normalized += f"?{query_string}"
             elif method in ["POST", "PUT"]:
@@ -197,9 +198,9 @@ class OrderlyPerpetualAuth(AuthBase):
 
         This method is called by Hummingbot's web assistant before sending the request.
 
-        IMPORTANT: For POST/PUT requests, we must use the exact JSON string from request.data
-        for signature calculation. Parsing and re-encoding would create a different JSON string
-        (different spacing, key ordering) causing signature mismatch.
+        IMPORTANT: Matches SDK behavior exactly:
+        - For GET/DELETE: params are appended to url_path as query string BEFORE signing
+        - For POST/PUT: JSON body is used as-is for signing (exact string from request.data)
 
         Args:
             request: REST request to authenticate
@@ -214,24 +215,20 @@ class OrderlyPerpetualAuth(AuthBase):
         # Generate timestamp
         timestamp = self._get_timestamp()
 
-        # Build the message to sign based on method
+        # Build the message to sign based on method - MATCH SDK EXACTLY
         if method in ["GET", "DELETE"]:
-            # For GET/DELETE, use query params
+            # For GET/DELETE, append query params to path (like SDK does)
+            # SDK uses: "&".join([f"{k}={v}" for k, v in _payload.items()])
+            # NO SORTING - use insertion order (Python 3.7+ preserves dict order)
             if request.params:
-                from urllib.parse import urlencode
-                query_string = urlencode(sorted(request.params.items()))
-                message_to_sign = f"{timestamp}{method}{path}?{query_string}"
-                # DEBUG: Log signature details
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.info(f"[SIGNATURE DEBUG] Method: {method}")
-                logger.info(f"[SIGNATURE DEBUG] Path: {path}")
-                logger.info(f"[SIGNATURE DEBUG] Params: {request.params}")
-                logger.info(f"[SIGNATURE DEBUG] Sorted params: {sorted(request.params.items())}")
-                logger.info(f"[SIGNATURE DEBUG] Query string: {query_string}")
-                logger.info(f"[SIGNATURE DEBUG] Message to sign: {message_to_sign}")
+                query_string = "&".join([f"{k}={v}" for k, v in request.params.items()])
+                url_path_with_query = f"{path}?{query_string}"
             else:
-                message_to_sign = f"{timestamp}{method}{path}"
+                url_path_with_query = path
+            
+            # SDK format: {timestamp}{method}{url_path_with_query}
+            message_to_sign = f"{timestamp}{method}{url_path_with_query}"
+            
         elif method in ["POST", "PUT"]:
             # For POST/PUT, use the exact JSON string from request.data
             # DO NOT parse and re-encode - it will create a different JSON string!

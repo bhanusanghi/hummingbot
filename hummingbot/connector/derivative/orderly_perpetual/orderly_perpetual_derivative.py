@@ -549,6 +549,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         # JSON encode data if it's a dict and method is POST/PUT
         # The auth module expects request.data to be a JSON string for POST/PUT requests
+        # For DELETE/GET requests, don't pass data at all to avoid Content-Type header issues
         encoded_data = None
         if data is not None:
             if method in (RESTMethod.POST, RESTMethod.PUT):
@@ -557,16 +558,24 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     encoded_data = data
                 else:
                     encoded_data = json.dumps(data)
-            else:
-                encoded_data = data
+            # For DELETE/GET, explicitly set data to None (don't pass it)
 
-        request = RESTRequest(
-            method=method,
-            url=url,
-            params=params,
-            data=encoded_data,
-            is_auth_required=is_auth_required,
-        )
+        # For DELETE/GET requests, don't pass data parameter to avoid aiohttp adding Content-Type
+        if method in (RESTMethod.DELETE, RESTMethod.GET):
+            request = RESTRequest(
+                method=method,
+                url=url,
+                params=params,
+                is_auth_required=is_auth_required,
+            )
+        else:
+            request = RESTRequest(
+                method=method,
+                url=url,
+                params=params,
+                data=encoded_data,
+                is_auth_required=is_auth_required,
+            )
 
         response = await rest_assistant.call(request=request)
         return await response.json()
@@ -688,7 +697,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         symbol = await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
 
         # IMPORTANT: Parameter order must match SDK: order_id, symbol
-        # (Our auth uses sorted() but dict maintains insertion order)
+        # Dict insertion order is preserved (Python 3.7+), which matches SDK behavior
         order_id_to_cancel = tracked_order.exchange_order_id or order_id
         params = {
             "order_id": str(order_id_to_cancel),
@@ -844,14 +853,18 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
                 position_qty = Decimal(str(position_data.get("position_qty", "0")))
 
+                # Determine position side before checking for zero (needed for pos_key)
+                position_side = PositionSide.LONG if position_qty > 0 else PositionSide.SHORT
+                pos_key = self._perpetual_trading.position_key(trading_pair, position_side)
+
                 if position_qty == 0:
+                    # Remove position if it exists
+                    self._perpetual_trading.remove_position(pos_key)
                     continue
 
-                position_side = PositionSide.LONG if position_qty > 0 else PositionSide.SHORT
                 unrealized_pnl = Decimal(str(position_data.get("unrealized_pnl", "0")))
                 entry_price = Decimal(str(position_data.get("average_open_price", "0")))
                 leverage = Decimal(str(position_data.get("leverage", "1")))
-                pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side)
 
                 position = self._perpetual_trading.get_position(trading_pair, position_side)
                 if position is not None:
@@ -868,12 +881,10 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                         unrealized_pnl=unrealized_pnl,
                         entry_price=entry_price,
                         amount=abs(position_qty),
-                        leverage=leverage
+                        leverage=leverage,
                     )
-                    self._perpetual_trading.set_position(
-                        pos_key,
-                        _position
-                    )
+                    self._perpetual_trading.set_leverage(trading_pair, int(leverage))
+                    self._perpetual_trading.set_position(pos_key, _position)
 
             except Exception:
                 self.logger().exception(f"Error updating position: {position_data}")

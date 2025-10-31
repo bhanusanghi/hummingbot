@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 import hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_constants as CONSTANTS
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.web_assistant.auth import AuthBase
-from hummingbot.core.web_assistant.connections.data_types import RESTRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTRequest, RESTMethod
 from hummingbot.core.web_assistant.rest_pre_processors import RESTPreProcessorBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -39,8 +39,14 @@ class OrderlyPerpetualRESTPreProcessor(RESTPreProcessorBase):
         if request.headers is None:
             request.headers = {}
 
-        # Add Content-Type header for all requests
-        request.headers["Content-Type"] = "application/json"
+        # Handle Content-Type header based on HTTP method
+        # Match official SDK behavior: POST/PUT use application/json, DELETE/GET use application/x-www-form-urlencoded
+        # Official SDK sets Content-Type for all requests (see orderly_evm_connector/api.py:162-175)
+        if request.method in (RESTMethod.POST, RESTMethod.PUT):
+            request.headers["Content-Type"] = "application/json"
+        elif request.method in (RESTMethod.DELETE, RESTMethod.GET):
+            # Official SDK uses application/x-www-form-urlencoded for DELETE/GET requests
+            request.headers["Content-Type"] = "application/x-www-form-urlencoded"
 
         # Add User-Agent if not present
         if "User-Agent" not in request.headers:
