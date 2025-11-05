@@ -332,3 +332,4 @@ ORDER_NOT_FOUND_ERROR_CODE = 1006  # Orderly error code for order not found
 ORDER_NOT_EXIST_MESSAGE = "Order not found"
 ORDER_ALREADY_CANCELLED_MESSAGE = "Order already cancelled"
 ORDER_ALREADY_FILLED_MESSAGE = "Order already filled"
+CANCELLING_COMPLETED_ORDER_MESSAGE = "The order is completed"

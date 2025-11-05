@@ -504,10 +504,13 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         """Check if error is due to order not found during cancel"""
+        error_str = str(cancelation_exception)
         return (
-            CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(cancelation_exception)
-            or CONSTANTS.ORDER_ALREADY_CANCELLED_MESSAGE in str(cancelation_exception)
-            or CONSTANTS.ORDER_ALREADY_FILLED_MESSAGE in str(cancelation_exception)
+            CONSTANTS.ORDER_NOT_EXIST_MESSAGE in error_str
+            or CONSTANTS.ORDER_ALREADY_CANCELLED_MESSAGE in error_str
+            or CONSTANTS.ORDER_ALREADY_FILLED_MESSAGE in error_str
+            or CONSTANTS.CANCELLING_COMPLETED_ORDER_MESSAGE in error_str  # Add this
+            or f"'code': {CONSTANTS.ORDER_NOT_FOUND_ERROR_CODE}" in error_str  # Also check code -1006
         )
 
     # ============================================================
