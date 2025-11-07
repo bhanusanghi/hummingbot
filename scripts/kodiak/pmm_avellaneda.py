@@ -32,7 +32,8 @@ class PMMAvellanedaConfig(BaseClientModel):
     risk_aversion_gamma: Decimal = Field(6.0)
     volatility_sigma: Decimal = Field(0.50)
     risk_horizon_tau_hours: Decimal = Field(2.0)
-    spread_levels: List[Decimal] = Field(default=[Decimal("0.0005"), Decimal("0.001"), Decimal("0.0015")])
+    bid_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
+    ask_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
     order_refresh_time: int = Field(10)
     max_inventory: Decimal = Field(0.01) # 1k usd
     leverage: int = Field(10)
@@ -141,9 +142,10 @@ class PMMAvellaneda(ScriptStrategyBase):
         self._cached_reservation_price = reservation_price
         
         orders = []
-        for idx, spread in enumerate(self.config.spread_levels):
-            bid_price = reservation_price * (Decimal("1") - spread / Decimal("2"))
-            ask_price = reservation_price * (Decimal("1") + spread / Decimal("2"))
+        for idx, bid_spread in enumerate(self.config.bid_spread_levels):
+            ask_spread = self.config.ask_spread_levels[idx]
+            bid_price = reservation_price * (Decimal("1") - bid_spread)
+            ask_price = reservation_price * (Decimal("1") + ask_spread)
 
             # Convert quote amount to base amount for both buy and sell orders
             # For perpetual orders, amount must be in base currency (BTC), not quote (USDC)
