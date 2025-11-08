@@ -86,9 +86,6 @@ class PMMAvellaneda(ScriptStrategyBase):
             "Timestamp", "Order ID", "Side", "Amount", "Price", "Inventory"
         ])
         
-        # Note: ScriptStrategyBase automatically calls built-in event handler methods
-        # No manual event registration needed
-
     def _get_in_flight_order(self, order_id: str) -> Optional[InFlightOrder]:
         """Get InFlightOrder from connector's order tracker"""
         connector = self.connectors[self.config.exchange]
@@ -413,7 +410,8 @@ class PMMAvellaneda(ScriptStrategyBase):
         lines.append(f"    Price Adjustment: {reservation_price - mid_price:.8f}")
         lines.append(f"    Current Inventory: {inventory:.8f}")
         lines.append(f"    Max Inventory: {self.config.max_inventory:.8f}")
-        lines.append(f"    Spread Levels: {[f'{s*100:.4f}%' for s in self.config.spread_levels]}")
+        lines.append(f"    Spread Levels: {[f'{s*100:.4f}%' for s in self.config.ask_spread_levels]}")
+        lines.append(f"    Bid Spread Levels: {[f'{s*100:.4f}%' for s in self.config.bid_spread_levels]}")
         lines.append(f"    Tracked Orders: {len(self._tracked_orders)}")
         
         # Show order states
