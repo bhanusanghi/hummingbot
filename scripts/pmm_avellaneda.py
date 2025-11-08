@@ -37,6 +37,7 @@ class PMMAvellanedaConfig(BaseClientModel):
     order_refresh_time: int = Field(10)
     max_inventory: Decimal = Field(0.01) # 1k usd
     leverage: int = Field(10)
+    
     # target_inventory: Decimal = Field(0.0)
     
     # for getting candles data for annualized volatility
@@ -45,6 +46,7 @@ class PMMAvellanedaConfig(BaseClientModel):
     # candles_interval: str = Field(default="1d")
     # candles_length: int = Field(default=365, gt=0)
 
+# Add Mark price as reference
 
 class PMMAvellaneda(ScriptStrategyBase):
     """
@@ -152,7 +154,7 @@ class PMMAvellaneda(ScriptStrategyBase):
             bid_order = PerpetualOrderCandidate(
                 trading_pair=self.config.trading_pair,
                 is_maker=True,
-                order_type=OrderType.LIMIT,
+                order_type=OrderType.LIMIT_MAKER,
                 order_side=TradeType.BUY,
                 amount=bid_amount,
                 price=bid_price,
@@ -253,7 +255,7 @@ class PMMAvellaneda(ScriptStrategyBase):
         for limit_order in active_orders:
             # Get InFlightOrder to check actual state
             in_flight_order = self._get_in_flight_order(limit_order.client_order_id)
-            
+            # add filtering for current trading pair only
             # Only cancel if order is actually still open
             if in_flight_order and in_flight_order.is_open:
                 try:

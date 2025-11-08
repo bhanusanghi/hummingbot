@@ -31,7 +31,7 @@ CENTRALIZED = True
 
 EXAMPLE_PAIR = "BTC-USDC"
 
-BROKER_ID = "hummingbot"
+BROKER_ID = "hummingbot" # check and update whre is this used
 
 
 class OrderlyPerpetualConfigMap(BaseConnectorConfigMap):
