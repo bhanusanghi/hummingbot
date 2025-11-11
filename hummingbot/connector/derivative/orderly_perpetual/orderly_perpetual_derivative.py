@@ -495,6 +495,259 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         return 0.0
 
     # ============================================================
+    # Order Placement & Management - Helper Methods
+    # ============================================================
+
+    async def _start_tracking_and_validate_order(
+        self,
+        trade_type: TradeType,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        order_type: OrderType,
+        price: Optional[Decimal] = None,
+        position_action: PositionAction = PositionAction.NIL,
+        **kwargs
+    ) -> Optional[InFlightOrder]:
+        """
+        Start tracking an order and validate it before placing.
+
+        This method:
+        1. Calculates/quantizes price and amount
+        2. Starts tracking the order
+        3. Validates order parameters (type, min size, min notional)
+        4. Returns the tracked order object or None on failure
+
+        Args:
+            trade_type: BUY or SELL
+            order_id: Client order ID
+            trading_pair: Trading pair
+            amount: Order amount
+            order_type: Order type (LIMIT, LIMIT_MAKER, MARKET)
+            price: Order price (optional for MARKET orders)
+            position_action: Position action (OPEN/CLOSE)
+            **kwargs: Additional parameters
+
+        Returns:
+            InFlightOrder object if valid, None if validation fails
+        """
+        try:
+            # Calculate price for market orders
+            if price is None or price.is_nan():
+                price = self.get_price_for_volume(
+                    trading_pair,
+                    True if trade_type == TradeType.BUY else False,
+                    amount
+                ).result_price
+
+            # Quantize price and amount
+            price = self.quantize_order_price(trading_pair, price)
+            amount = self.quantize_order_amount(trading_pair, amount)
+
+            # Start tracking the order
+            self.start_tracking_order(
+                order_id=order_id,
+                exchange_order_id=None,  # Will be set after API call
+                trading_pair=trading_pair,
+                trade_type=trade_type,
+                price=price,
+                amount=amount,
+                order_type=order_type,
+                position_action=position_action,
+            )
+
+            # Get the tracked order
+            tracked_order = self._order_tracker.all_updatable_orders.get(order_id)
+            if not tracked_order:
+                self.logger().error(f"Failed to start tracking order {order_id}")
+                return None
+
+            # Validate order type support
+            if order_type not in self.supported_order_types():
+                self._update_order_after_creation_failure(
+                    order_id=order_id,
+                    trading_pair=trading_pair,
+                    amount=amount,
+                    trade_type=trade_type,
+                    order_type=order_type,
+                    price=price,
+                    exception=ValueError(f"Order type {order_type} is not supported"),
+                )
+                return None
+
+            # Get trading rules
+            trading_rule = self._trading_rules.get(trading_pair)
+            if not trading_rule:
+                self._update_order_after_creation_failure(
+                    order_id=order_id,
+                    trading_pair=trading_pair,
+                    amount=amount,
+                    trade_type=trade_type,
+                    order_type=order_type,
+                    price=price,
+                    exception=ValueError(f"Trading rule not found for {trading_pair}"),
+                )
+                return None
+
+            # Validate min order size
+            if amount < trading_rule.min_order_size:
+                self._update_order_after_creation_failure(
+                    order_id=order_id,
+                    trading_pair=trading_pair,
+                    amount=amount,
+                    trade_type=trade_type,
+                    order_type=order_type,
+                    price=price,
+                    exception=ValueError(
+                        f"Order amount {amount} is below minimum order size {trading_rule.min_order_size}"
+                    ),
+                )
+                return None
+
+            # Validate min notional size
+            notional_size = amount * price
+            if notional_size < trading_rule.min_notional_size:
+                self._update_order_after_creation_failure(
+                    order_id=order_id,
+                    trading_pair=trading_pair,
+                    amount=amount,
+                    trade_type=trade_type,
+                    order_type=order_type,
+                    price=price,
+                    exception=ValueError(
+                        f"Order notional size {notional_size} is below minimum {trading_rule.min_notional_size}"
+                    ),
+                )
+                return None
+
+            return tracked_order
+
+        except Exception as e:
+            self.logger().error(
+                f"Error in _start_tracking_and_validate_order for {order_id}: {e}",
+                exc_info=True
+            )
+            self._update_order_after_creation_failure(
+                order_id=order_id,
+                trading_pair=trading_pair,
+                amount=amount,
+                trade_type=trade_type,
+                order_type=order_type,
+                price=price if price else Decimal("0"),
+                exception=e,
+            )
+            return None
+
+    def _update_order_after_creation_success(
+        self,
+        exchange_order_id: Optional[str],
+        order: InFlightOrder,
+        update_timestamp: float,
+        misc_updates: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Update order after successful creation on the exchange.
+
+        Creates an OrderUpdate with the exchange_order_id and processes it
+        through the order tracker. This triggers the appropriate order
+        creation events.
+
+        Args:
+            exchange_order_id: Exchange-assigned order ID
+            order: InFlightOrder object
+            update_timestamp: Timestamp of the update
+            misc_updates: Optional additional updates dictionary
+        """
+        order_update: OrderUpdate = OrderUpdate(
+            client_order_id=order.client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=order.trading_pair,
+            update_timestamp=update_timestamp,
+            new_state=order.current_state,  # Keep current state (typically PENDING_CREATE)
+            misc_updates=misc_updates,
+        )
+        self._order_tracker.process_order_update(order_update)
+
+    def _on_order_creation_failure(
+        self,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        order_type: OrderType,
+        price: Decimal,
+        exception: Exception,
+        position_action: PositionAction = PositionAction.NIL,
+    ):
+        """
+        Handle order creation failure that occurred during API call.
+
+        Creates an OrderUpdate with FAILED state and processes it through
+        the order tracker. This triggers the OrderFailure event.
+
+        Args:
+            order_id: Client order ID
+            trading_pair: Trading pair
+            amount: Order amount
+            trade_type: BUY or SELL
+            order_type: Order type
+            price: Order price
+            exception: Exception that caused the failure
+            position_action: Position action (OPEN/CLOSE)
+        """
+        self.logger().error(
+            f"Order creation failed for {order_id}: {exception}",
+            exc_info=True
+        )
+
+        order_update: OrderUpdate = OrderUpdate(
+            client_order_id=order_id,
+            trading_pair=trading_pair,
+            update_timestamp=self.current_timestamp,
+            new_state=OrderState.FAILED,
+        )
+        self._order_tracker.process_order_update(order_update)
+
+    def _update_order_after_creation_failure(
+        self,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        order_type: OrderType,
+        price: Decimal,
+        exception: Exception,
+        position_action: PositionAction = PositionAction.NIL,
+    ):
+        """
+        Handle order creation failure during validation (before API call).
+
+        Similar to _on_order_creation_failure but used for validation failures
+        that occur before the API call is made.
+
+        Args:
+            order_id: Client order ID
+            trading_pair: Trading pair
+            amount: Order amount
+            trade_type: BUY or SELL
+            order_type: Order type
+            price: Order price
+            exception: Exception that caused the failure
+            position_action: Position action (OPEN/CLOSE)
+        """
+        self.logger().warning(
+            f"Order validation failed for {order_id}: {exception}"
+        )
+
+        order_update: OrderUpdate = OrderUpdate(
+            client_order_id=order_id,
+            trading_pair=trading_pair,
+            update_timestamp=self.current_timestamp,
+            new_state=OrderState.FAILED,
+        )
+        self._order_tracker.process_order_update(order_update)
+
+    # ============================================================
     # Order Placement & Management
     # ============================================================
 
@@ -624,14 +877,18 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         orders_to_create: List[Dict[str, Any]]
     ) -> List[Tuple[str, float]]:
         """
-        Place multiple orders in a single batch request.
+        Place multiple orders in a single batch request using modular pattern.
 
-        This method follows the fully async pattern (matching _place_order style).
-        The caller must await this method to get results.
+        This method:
+        1. Generates client_order_ids for each order
+        2. Tracks and validates each order using _start_tracking_and_validate_order()
+        3. Makes batch API call with valid orders
+        4. Processes results through order tracker (_update_order_after_creation_success
+           or _on_order_creation_failure)
 
         Args:
             orders_to_create: List of order dictionaries with keys:
-                - order_id: Client order ID (string)
+                - order_id: Client order ID (string, optional - will be generated if not provided)
                 - trading_pair: Trading pair in Hummingbot format
                 - amount: Order amount (Decimal)
                 - trade_type: TradeType.BUY or TradeType.SELL
@@ -658,71 +915,111 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().warning("[BATCH ORDER] No orders to create")
             return []
 
-        # Build order parameters for batch request
-        batch_orders = []
+        # Step 1: Generate client_order_ids and track/validate orders
+        inflight_orders_to_create = []
+        order_id_map = {}  # Map index to order_id for result matching
 
-        for order_data in orders_to_create:
+        for i, order_data in enumerate(orders_to_create):
             try:
                 # Extract order parameters
-                order_id = order_data["order_id"]
+                order_id = order_data.get("order_id")
+
+                # Generate client_order_id if not provided
+                if not order_id:
+                    order_id = get_new_client_order_id(
+                        is_buy=order_data["trade_type"] == TradeType.BUY,
+                        trading_pair=order_data["trading_pair"],
+                        hbot_order_id_prefix=self.client_order_id_prefix,
+                        max_id_len=self.client_order_id_max_length,
+                    )
+                    order_data["order_id"] = order_id
+
                 trading_pair = order_data["trading_pair"]
                 amount = order_data["amount"]
                 trade_type = order_data["trade_type"]
                 order_type = order_data["order_type"]
-                price = order_data["price"]
+                price = order_data.get("price")
                 position_action = order_data.get("position_action", PositionAction.NIL)
 
-                # Get exchange symbol
-                symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+                # Track and validate order
+                valid_order = await self._start_tracking_and_validate_order(
+                    trade_type=trade_type,
+                    order_id=order_id,
+                    trading_pair=trading_pair,
+                    amount=amount,
+                    order_type=order_type,
+                    price=price,
+                    position_action=position_action,
+                )
 
-                # Map Hummingbot order types to Orderly order types
-                orderly_order_type = "MARKET"
-                if order_type == OrderType.LIMIT:
-                    orderly_order_type = "LIMIT"
-                elif order_type == OrderType.LIMIT_MAKER:
-                    orderly_order_type = "POST_ONLY"
-
-                # Build order parameters
-                order_params = {
-                    "symbol": symbol,
-                    "client_order_id": order_id,
-                    "side": "BUY" if trade_type == TradeType.BUY else "SELL",
-                    "order_type": orderly_order_type,
-                    "order_quantity": float(self.quantize_order_amount(trading_pair, amount)),
-                    "reduce_only": position_action == PositionAction.CLOSE,
-                }
-
-                # Add price for non-MARKET orders
-                if order_type != OrderType.MARKET:
-                    order_params["order_price"] = float(self.quantize_order_price(trading_pair, price))
-
-                batch_orders.append(order_params)
+                if valid_order is not None:
+                    inflight_orders_to_create.append(valid_order)
+                    order_id_map[i] = order_id
+                else:
+                    # Order failed validation, already handled by _start_tracking_and_validate_order
+                    order_id_map[i] = None
 
             except Exception as e:
                 self.logger().error(
                     f"[BATCH ORDER] Error preparing order {order_data.get('order_id', 'unknown')}: {e}",
                     exc_info=True
                 )
-                # Add placeholder to maintain order position in results
-                batch_orders.append(None)
+                order_id_map[i] = None
 
-        # Filter out None entries (failed preparations)
-        valid_orders = [order for order in batch_orders if order is not None]
-
-        if not valid_orders:
-            self.logger().error("[BATCH ORDER] No valid orders to submit after preparation")
+        # Step 2: Build batch API request for valid orders
+        if not inflight_orders_to_create:
+            self.logger().error("[BATCH ORDER] No valid orders to submit after validation")
             return [("", self.current_timestamp) for _ in orders_to_create]
 
-        # Make batch API call
+        batch_orders = []
+        for in_flight_order in inflight_orders_to_create:
+            try:
+                # Get exchange symbol
+                symbol = await self.exchange_symbol_associated_to_pair(in_flight_order.trading_pair)
+
+                # Map Hummingbot order types to Orderly order types
+                orderly_order_type = "MARKET"
+                if in_flight_order.order_type == OrderType.LIMIT:
+                    orderly_order_type = "LIMIT"
+                elif in_flight_order.order_type == OrderType.LIMIT_MAKER:
+                    orderly_order_type = "POST_ONLY"
+
+                # Build order parameters (price and amount already quantized)
+                order_params = {
+                    "symbol": symbol,
+                    "client_order_id": in_flight_order.client_order_id,
+                    "side": "BUY" if in_flight_order.trade_type == TradeType.BUY else "SELL",
+                    "order_type": orderly_order_type,
+                    "order_quantity": float(in_flight_order.amount),
+                    "reduce_only": in_flight_order.position == PositionAction.CLOSE,
+                }
+
+                # Add price for non-MARKET orders
+                if in_flight_order.order_type != OrderType.MARKET:
+                    order_params["order_price"] = float(in_flight_order.price)
+
+                batch_orders.append(order_params)
+
+            except Exception as e:
+                self.logger().error(
+                    f"[BATCH ORDER] Error building order params for {in_flight_order.client_order_id}: {e}",
+                    exc_info=True
+                )
+
+        if not batch_orders:
+            self.logger().error("[BATCH ORDER] Failed to build batch order params")
+            return [("", self.current_timestamp) for _ in orders_to_create]
+
+        # Step 3: Make batch API call
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
         url = web_utils.public_rest_url(
             CONSTANTS.BATCH_CREATE_ORDER_URL,
             domain=self._domain
         )
 
-        request_data = {"orders": valid_orders}
+        request_data = {"orders": batch_orders}
 
-        self.logger().info(f"[BATCH ORDER] Submitting batch of {len(valid_orders)} orders")
+        self.logger().info(f"[BATCH ORDER] Submitting batch of {len(batch_orders)} orders")
 
         try:
             response = await rest_assistant.execute_request(
@@ -735,30 +1032,31 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
             if not response.get("success", False):
                 self.logger().error(f"[BATCH ORDER] Batch order creation failed: {response}")
+                # Mark all orders as failed
+                for in_flight_order in inflight_orders_to_create:
+                    self._on_order_creation_failure(
+                        order_id=in_flight_order.client_order_id,
+                        trading_pair=in_flight_order.trading_pair,
+                        amount=in_flight_order.amount,
+                        trade_type=in_flight_order.trade_type,
+                        order_type=in_flight_order.order_type,
+                        price=in_flight_order.price,
+                        exception=IOError(f"Batch order creation failed: {response}"),
+                        position_action=in_flight_order.position,
+                    )
                 raise IOError(f"Batch order creation failed: {response}")
 
-            # Process response
+            # Step 4: Process results through order tracker
             data = response.get("data", {})
             rows = data.get("rows", [])
-
-            # Build results list
-            results = []
             timestamp = self.current_timestamp
 
-            # Map results back to original order sequence
+            # Map results by client_order_id
             result_map = {row.get("client_order_id"): row for row in rows}
 
-            for i, order_data in enumerate(orders_to_create):
-                order_id = order_data["order_id"]
-
-                # Check if this order was in the valid batch
-                if batch_orders[i] is None:
-                    # Order failed during preparation
-                    results.append(("", timestamp))
-                    continue
-
-                # Look up result in response
-                order_result = result_map.get(order_id)
+            # Process each in-flight order
+            for in_flight_order in inflight_orders_to_create:
+                order_result = result_map.get(in_flight_order.client_order_id)
 
                 if order_result:
                     error_message = order_result.get("error_message", "")
@@ -766,23 +1064,66 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     # Check if order succeeded
                     if not error_message or error_message.lower() in ["none", "", "null"]:
                         exchange_order_id = str(order_result.get("order_id", ""))
-                        results.append((exchange_order_id, timestamp))
+                        self._update_order_after_creation_success(
+                            exchange_order_id=exchange_order_id,
+                            order=in_flight_order,
+                            update_timestamp=timestamp,
+                        )
                         self.logger().info(
-                            f"[BATCH ORDER] Order {order_id} created successfully "
+                            f"[BATCH ORDER] Order {in_flight_order.client_order_id} created successfully "
                             f"with exchange_order_id {exchange_order_id}"
                         )
                     else:
                         # Order failed on exchange
-                        self.logger().error(
-                            f"[BATCH ORDER] Order {order_id} failed: {error_message}"
+                        self._on_order_creation_failure(
+                            order_id=in_flight_order.client_order_id,
+                            trading_pair=in_flight_order.trading_pair,
+                            amount=in_flight_order.amount,
+                            trade_type=in_flight_order.trade_type,
+                            order_type=in_flight_order.order_type,
+                            price=in_flight_order.price,
+                            exception=IOError(f"Exchange error: {error_message}"),
+                            position_action=in_flight_order.position,
                         )
-                        results.append(("", timestamp))
+                        self.logger().error(
+                            f"[BATCH ORDER] Order {in_flight_order.client_order_id} failed: {error_message}"
+                        )
                 else:
                     # Order not found in response
-                    self.logger().error(
-                        f"[BATCH ORDER] Order {order_id} not found in response"
+                    self._on_order_creation_failure(
+                        order_id=in_flight_order.client_order_id,
+                        trading_pair=in_flight_order.trading_pair,
+                        amount=in_flight_order.amount,
+                        trade_type=in_flight_order.trade_type,
+                        order_type=in_flight_order.order_type,
+                        price=in_flight_order.price,
+                        exception=IOError("Order not found in response"),
+                        position_action=in_flight_order.position,
                     )
+                    self.logger().error(
+                        f"[BATCH ORDER] Order {in_flight_order.client_order_id} not found in response"
+                    )
+
+            # Build return results (maintain order with original indices)
+            results = []
+            for i in range(len(orders_to_create)):
+                order_id = order_id_map.get(i)
+
+                if order_id is None:
+                    # Order failed validation
                     results.append(("", timestamp))
+                else:
+                    # Look up result
+                    order_result = result_map.get(order_id)
+                    if order_result:
+                        error_message = order_result.get("error_message", "")
+                        if not error_message or error_message.lower() in ["none", "", "null"]:
+                            exchange_order_id = str(order_result.get("order_id", ""))
+                            results.append((exchange_order_id, timestamp))
+                        else:
+                            results.append(("", timestamp))
+                    else:
+                        results.append(("", timestamp))
 
             success_count = sum(1 for exchange_id, _ in results if exchange_id)
             self.logger().info(
@@ -796,6 +1137,18 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             raise
         except Exception as e:
             self.logger().error(f"[BATCH ORDER] Unexpected error in batch order creation: {e}", exc_info=True)
+            # Mark all in-flight orders as failed
+            for in_flight_order in inflight_orders_to_create:
+                self._on_order_creation_failure(
+                    order_id=in_flight_order.client_order_id,
+                    trading_pair=in_flight_order.trading_pair,
+                    amount=in_flight_order.amount,
+                    trade_type=in_flight_order.trade_type,
+                    order_type=in_flight_order.order_type,
+                    price=in_flight_order.price,
+                    exception=e,
+                    position_action=in_flight_order.position,
+                )
             raise IOError(f"Batch order creation failed: {e}")
 
     async def batch_order_cancel(
@@ -803,10 +1156,12 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         orders_to_cancel: List[InFlightOrder]
     ) -> List[Dict[str, Any]]:
         """
-        Cancel multiple orders in a single batch request.
+        Cancel multiple orders in a single batch request using modular pattern.
 
-        This method follows the fully async pattern (matching _place_cancel style).
-        The caller must await this method to get results.
+        This method:
+        1. Makes batch API call to cancel orders
+        2. Processes results through order tracker (creates OrderUpdate with CANCELED state)
+        3. Triggers appropriate cancellation events
 
         Args:
             orders_to_cancel: List of InFlightOrder objects to cancel
@@ -934,6 +1289,18 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     self.logger().warning(
                         f"[BATCH CANCEL] Some orders not found (may already be cancelled/filled): {response}"
                     )
+                    # Process all orders as cancelled through order tracker
+                    timestamp = self.current_timestamp
+                    for order in orders_to_cancel:
+                        order_update = OrderUpdate(
+                            client_order_id=order.client_order_id,
+                            exchange_order_id=order.exchange_order_id,
+                            trading_pair=order.trading_pair,
+                            update_timestamp=timestamp,
+                            new_state=OrderState.CANCELED,
+                        )
+                        self._order_tracker.process_order_update(order_update)
+
                     # Return partial success results
                     return [
                         {
@@ -947,9 +1314,10 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     self.logger().error(f"[BATCH CANCEL] Batch cancellation failed: {response}")
                     raise IOError(f"Batch order cancellation failed: {response}")
 
-            # Process response
+            # Process response through order tracker
             data = response.get("data", {})
             rows = data.get("rows", [])
+            timestamp = self.current_timestamp
 
             # Build results list
             results = []
@@ -960,7 +1328,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             else:
                 result_map = {row.get("client_order_id"): row for row in rows if row.get("client_order_id")}
 
-            # Match results to original orders
+            # Match results to original orders and process through order tracker
             for order in orders_to_cancel:
                 lookup_id = str(order.exchange_order_id) if use_exchange_ids else order.client_order_id
 
@@ -969,6 +1337,16 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     error_message = order_result.get("error_message", "")
 
                     if not error_message or error_message.lower() in ["none", "", "null"]:
+                        # Cancellation succeeded - process through order tracker
+                        order_update = OrderUpdate(
+                            client_order_id=order.client_order_id,
+                            exchange_order_id=order.exchange_order_id,
+                            trading_pair=order.trading_pair,
+                            update_timestamp=timestamp,
+                            new_state=OrderState.CANCELED,
+                        )
+                        self._order_tracker.process_order_update(order_update)
+
                         results.append({
                             "client_order_id": order.client_order_id,
                             "success": True,
@@ -978,6 +1356,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                             f"[BATCH CANCEL] Order {order.client_order_id} cancelled successfully"
                         )
                     else:
+                        # Cancellation failed - log but don't update order state
                         results.append({
                             "client_order_id": order.client_order_id,
                             "success": False,
@@ -988,13 +1367,23 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                         )
                 else:
                     # Order not found in response - might already be cancelled
+                    # Process as cancelled through order tracker
+                    order_update = OrderUpdate(
+                        client_order_id=order.client_order_id,
+                        exchange_order_id=order.exchange_order_id,
+                        trading_pair=order.trading_pair,
+                        update_timestamp=timestamp,
+                        new_state=OrderState.CANCELED,
+                    )
+                    self._order_tracker.process_order_update(order_update)
+
                     results.append({
                         "client_order_id": order.client_order_id,
                         "success": True,  # Consider as success (order doesn't exist)
-                        "error_message": "Order not found in response"
+                        "error_message": "Order not found in response (already cancelled)"
                     })
                     self.logger().warning(
-                        f"[BATCH CANCEL] Order {order.client_order_id} not found in response"
+                        f"[BATCH CANCEL] Order {order.client_order_id} not found in response - marking as cancelled"
                     )
 
             success_count = sum(1 for result in results if result["success"])
