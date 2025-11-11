@@ -57,7 +57,8 @@ BATCH_CREATE_ORDER_URL = "/v1/batch-order"
 CANCEL_ORDER_URL = "/v1/order"  # DELETE method
 CANCEL_ORDER_BY_CLIENT_ID_URL = "/v1/client/order"  # DELETE method
 CANCEL_ALL_ORDERS_URL = "/v1/orders"  # DELETE method
-BATCH_CANCEL_ORDER_URL = "/v1/batch-order"  # DELETE method
+BATCH_CANCEL_ORDER_URL = "/v1/batch-order"  # DELETE method (by order_id)
+BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL = "/v1/client/batch-order"  # DELETE method (by client_order_id)
 EDIT_ORDER_URL = "/v1/order"  # PUT method
 GET_ORDER_URL = "/v1/order/{order_id}"
 GET_ORDER_BY_CLIENT_ID_URL = "/v1/client/order/{client_order_id}"
@@ -165,6 +166,25 @@ RATE_LIMITS = [
     ),
     RateLimit(
         limit_id=CANCEL_ORDER_URL,
+        limit=TRADING_ENDPOINTS_LIMIT,
+        time_interval=1,
+        linked_limits=[
+            LinkedLimitWeightPair(TRADING_LIMIT_ID),
+            LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
+        ]
+    ),
+    # Batch Cancel Order: 10 req/sec per swagger docs (both variants)
+    RateLimit(
+        limit_id=BATCH_CANCEL_ORDER_URL,
+        limit=TRADING_ENDPOINTS_LIMIT,
+        time_interval=1,
+        linked_limits=[
+            LinkedLimitWeightPair(TRADING_LIMIT_ID),
+            LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
+        ]
+    ),
+    RateLimit(
+        limit_id=BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
         limit=TRADING_ENDPOINTS_LIMIT,
         time_interval=1,
         linked_limits=[

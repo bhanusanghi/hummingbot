@@ -216,9 +216,9 @@ class PMMAvellaneda(ScriptStrategyBase):
 
     def place_order(self, connector_name: str, order: PerpetualOrderCandidate):
         """Place an order and immediately track it"""
-        order_id = None
+        client_order_id = None
         if order.order_side == TradeType.SELL:
-            order_id = self.sell(
+            client_order_id = self.sell(
                 connector_name=connector_name,
                 trading_pair=order.trading_pair,
                 amount=order.amount,
@@ -227,7 +227,7 @@ class PMMAvellaneda(ScriptStrategyBase):
                 position_action=PositionAction.OPEN
             )
         elif order.order_side == TradeType.BUY:
-            order_id = self.buy(
+            client_order_id = self.buy(
                 connector_name=connector_name,
                 trading_pair=order.trading_pair,
                 amount=order.amount,
@@ -237,12 +237,12 @@ class PMMAvellaneda(ScriptStrategyBase):
             )
         
         # Immediately track the order
-        if order_id:
-            tracked_order = TrackedOrder(order_id=order_id)
-            self._tracked_orders[order_id] = tracked_order
+        if client_order_id:
+            tracked_order = TrackedOrder(order_id=client_order_id)
+            self._tracked_orders[client_order_id] = tracked_order
             # Update immediately if available
-            self._update_tracked_order(order_id)
-            self.logger().debug(f"Tracking order {order_id} for {order.order_side.name}")
+            self._update_tracked_order(client_order_id)
+            self.logger().debug(f"Tracking order {client_order_id} for {order.order_side.name}")
 
     def cancel_all_orders(self):
         """Cancel all active orders, checking if they're actually open first."""
