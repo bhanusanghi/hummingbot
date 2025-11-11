@@ -88,11 +88,22 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     
     def on_tick(self):
         if self.create_timestamp <= self.current_timestamp:
-            self.cancel_all_orders()
-            proposal: List[PerpetualOrderCandidate] = self.create_proposal()
-            proposal_adjusted: List[PerpetualOrderCandidate] = self.adjust_proposal_to_budget(proposal)
-            self.place_orders(proposal_adjusted)
+            proposals: List[PerpetualOrderCandidate] = self.create_proposal()
+            proposal_adjusted: List[PerpetualOrderCandidate] = self.adjust_proposal_to_budget(proposals)
+            # Execute cancel then place sequentially to avoid order accumulation
+            safe_ensure_future(self._cancel_and_place_orders(proposal_adjusted))
             self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
+    
+    async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
+        """
+        Cancel all active orders and then place new orders sequentially.
+        This ensures old orders are cancelled before new ones are placed.
+        """
+        # First, cancel all active orders and wait for completion
+        await self._async_cancel_all_orders()
+        # Then place new orders
+        await self._async_place_orders(proposal)
+        
     
     def apply_initial_setting(self):
         if not self.account_config_set:
@@ -135,7 +146,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             ask_order = PerpetualOrderCandidate(
                 trading_pair=self.config.trading_pair,
                 is_maker=True,
-                order_type=OrderType.LIMIT,
+                order_type=OrderType.LIMIT_MAKER,
                 order_side=TradeType.SELL,
                 amount=ask_amount,
                 price=ask_price,
@@ -150,39 +161,15 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                 orders.extend([bid_order, ask_order])
         return orders
 
-    def adjust_proposal_to_budget(self, proposal: List[PerpetualOrderCandidate]) -> List[PerpetualOrderCandidate]:
+    def adjust_proposal_to_budget(self, proposals: List[PerpetualOrderCandidate]) -> List[PerpetualOrderCandidate]:
         connector = self.connectors[self.config.exchange]
         budget_checker = connector.budget_checker
         
-        # Debug: Check balance before adjustment
-        self.logger().info(f"Available balance (USDC): {connector.get_available_balance('USDC')}")
-        self.logger().info(f"Total balance (USDC): {connector.get_balance('USDC')}")
-        
-        # Debug: Populate collateral for first order to see what happens
-        if proposal:
-            test_order = proposal[0]
-            populated = budget_checker.populate_collateral_entries(test_order)
-            self.logger().info(f"After populate_collateral_entries:")
-            self.logger().info(f"  order_collateral: {populated.order_collateral}")
-            self.logger().info(f"  percent_fee_collateral: {populated.percent_fee_collateral}")
-            self.logger().info(f"  amount: {populated.amount}")
-            self.logger().info(f"  leverage: {populated.leverage}")
-            self.logger().info(f"  position_close: {populated.position_close}")
-        
-        proposal_adjusted = budget_checker.adjust_candidates(proposal, all_or_none=True)
-        
-        # Debug: Check what happened after adjustment
-        if proposal_adjusted:
-            first_adjusted = proposal_adjusted[0]
-            self.logger().info(f"After adjust_candidates:")
-            self.logger().info(f"  order_collateral: {first_adjusted.order_collateral}")
-            self.logger().info(f"  amount: {first_adjusted.amount}")
-            self.logger().info(f"  resized: {first_adjusted.resized}")
-        
-        return proposal_adjusted
+        proposals_adjusted = budget_checker.adjust_candidates(proposals, all_or_none=True)
+        return proposals_adjusted
 
-    def place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
-        """Place multiple orders using batch API"""
+    async def _async_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
+        """Place multiple orders using batch API and wait for completion"""
         if not proposal:
             return
         
@@ -201,48 +188,41 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             }
             orders_to_create.append(order_dict)
         
-        # Call batch_order_create asynchronously
-        self.logger().info(f"Placing batch of {len(orders_to_create)} orders")
-        safe_ensure_future(connector.batch_order_create(orders_to_create))
+        # Call batch_order_create and wait for completion
+        await connector.batch_order_create(orders_to_create)
         
-    def cancel_all_orders(self):
-        """Cancel all active orders using batch API"""
+    async def _async_cancel_all_orders(self):
+        """Cancel all active orders using batch API and wait for completion"""
         connector = self.connectors[self.config.exchange]
-        active_orders = self.get_active_orders(connector_name=self.config.exchange)
+        
+        # Get orders directly from connector's order tracker instead of strategy's order tracker
+        # This ensures we get the most up-to-date list including orders just placed
+        all_in_flight_orders = connector._order_tracker.active_orders
         
         # Collect InFlightOrder objects for orders to cancel
         orders_to_cancel = []
         orders_skipped = 0
         
-        for limit_order in active_orders:
+        for in_flight_order in all_in_flight_orders.values():
             # Filter by current trading pair only
-            if limit_order.trading_pair != self.config.trading_pair:
+            if in_flight_order.trading_pair != self.config.trading_pair:
                 continue
             
-            # Get InFlightOrder to check if it's actually still open
-            in_flight_order = self._get_in_flight_order(limit_order.client_order_id)
-            
-            if in_flight_order and in_flight_order.is_open:
+            # Check if order is actually still open
+            if in_flight_order.is_open:
                 orders_to_cancel.append(in_flight_order)
             else:
                 # Order is already done (filled/cancelled/failed), skip it
-                if in_flight_order:
-                    self.logger().debug(
-                        f"Order {limit_order.client_order_id} is {in_flight_order.current_state.name}, "
-                        f"skipping cancellation"
-                    )
+                self.logger().debug(
+                    f"Order {in_flight_order.client_order_id} is {in_flight_order.current_state.name}, "
+                    f"skipping cancellation"
+                )
                 orders_skipped += 1
         
-        # Use batch cancellation if we have orders to cancel
+        # Use batch cancellation if we have orders to cancel and wait for completion
         if orders_to_cancel:
-            self.logger().info(f"Cancelling batch of {len(orders_to_cancel)} orders")
-            safe_ensure_future(connector.batch_order_cancel(orders_to_cancel))
+            await connector.batch_order_cancel(orders_to_cancel)
         
-        if orders_to_cancel or orders_skipped > 0:
-            self.logger().info(
-                f"Cancellation: {len(orders_to_cancel)} to cancel, {orders_skipped} skipped (already done)"
-            )
-
     def did_fill_order(self, event: OrderFilledEvent):
         """
         Called automatically by framework when order is filled.
