@@ -47,11 +47,6 @@ class OrderlyPerpetualRESTPreProcessor(RESTPreProcessorBase):
         elif request.method in (RESTMethod.DELETE, RESTMethod.GET):
             # Official SDK uses application/x-www-form-urlencoded for DELETE/GET requests
             request.headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-        # Add User-Agent if not present
-        if "User-Agent" not in request.headers:
-            request.headers["User-Agent"] = "hummingbot-orderly-connector"
-
         return request
 
 

@@ -217,9 +217,6 @@ class OrderlyPerpetualAuth(AuthBase):
 
         # Build the message to sign based on method - MATCH SDK EXACTLY
         if method in ["GET", "DELETE"]:
-            # For GET/DELETE, append query params to path (like SDK does)
-            # SDK uses: "&".join([f"{k}={v}" for k, v in _payload.items()])
-            # NO SORTING - use insertion order (Python 3.7+ preserves dict order)
             if request.params:
                 query_string = "&".join([f"{k}={v}" for k, v in request.params.items()])
                 url_path_with_query = f"{path}?{query_string}"

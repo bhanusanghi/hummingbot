@@ -118,11 +118,6 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             trading_pair=trading_pair
         )
         
-        self.logger().debug(
-            f"[SYMBOL CONVERSION] get_funding_info: Hummingbot '{trading_pair}' -> "
-            f"Orderly symbol '{orderly_symbol}'"
-        )
-
         # Fetch funding rate
         funding_url = web_utils.public_rest_url(
             CONSTANTS.FUNDING_RATE_URL.format(symbol=orderly_symbol),
@@ -366,12 +361,6 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         orderly_symbol = await self._connector.exchange_symbol_associated_to_pair(
             trading_pair=trading_pair
         )
-
-        self.logger().debug(
-            f"[SYMBOL CONVERSION] _request_order_book_snapshot: Hummingbot '{trading_pair}' -> "
-            f"Orderly symbol '{orderly_symbol}'"
-        )
-
         # Use private_rest_url since this endpoint requires authentication
         url = web_utils.private_rest_url(
             CONSTANTS.ORDERBOOK_SNAPSHOT_URL.format(symbol=orderly_symbol),

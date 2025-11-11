@@ -108,23 +108,11 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         )
 
         if has_api_keys:
-            self.logger().info(
-                f"[AUTH DEBUG] Creating authenticator - "
-                f"account_id={self._orderly_perpetual_account_id}, "
-                f"api_key={self._orderly_perpetual_api_key[:20] if self._orderly_perpetual_api_key else None}..., "
-                f"api_secret={'SET' if self._orderly_perpetual_api_secret else 'None'}, "
-                f"trading_required={self._trading_required}"
-            )
             return OrderlyPerpetualAuth(
                 account_id=self._orderly_perpetual_account_id,
                 orderly_key=self._orderly_perpetual_api_key,
                 orderly_secret=self._orderly_perpetual_api_secret,
             )
-        self.logger().info(
-            f"[AUTH DEBUG] No API keys provided - account_id={self._orderly_perpetual_account_id}, "
-            f"api_key={'SET' if self._orderly_perpetual_api_key else 'None'}, "
-            f"api_secret={'SET' if self._orderly_perpetual_api_secret else 'None'}"
-        )
         return None
 
     @property
@@ -210,15 +198,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         """Create web assistants factory"""
-        self.logger().info(
-            f"[AUTH DEBUG] Creating web assistants factory - "
-            f"auth={self._auth}, "
-            f"auth type={type(self._auth).__name__ if self._auth else 'None'}"
-        )
-        if self._auth:
-            self.logger().info(
-                f"[AUTH DEBUG] Auth object account_id={getattr(self._auth, '_account_id', 'MISSING')}"
-            )
         return web_utils.build_api_factory(
             throttler=self._throttler,
             auth=self._auth,
@@ -284,40 +263,17 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 # Convert to Hummingbot format
                 trading_pair = web_utils.format_trading_pair(exchange_symbol)
 
-                # Log conversion result
-                self.logger().debug(
-                    f"[SYMBOL CONVERSION] Exchange symbol: {exchange_symbol} -> "
-                    f"Hummingbot trading pair: {trading_pair}"
-                )
-
                 # Orderly uses unique symbols (PERP_BTC_USDC), no duplicates expected
                 if trading_pair not in mapping.inverse:
                     mapping[exchange_symbol] = trading_pair
                     symbols_processed += 1
                 else:
-                    # Log warning if duplicate found (should not happen with Orderly)
-                    self.logger().warning(
-                        f"[SYMBOL CONVERSION] Duplicate trading pair found: {trading_pair} "
-                        f"for {exchange_symbol} (existing: {mapping.inverse[trading_pair]})"
-                    )
+                    self.logger().error(f"[SYMBOL CONVERSION] Duplicate symbol found: {exchange_symbol} -> {trading_pair}")
 
             except Exception:
                 self.logger().exception(f"[SYMBOL CONVERSION] Error parsing symbol: {symbol_data}")
 
         self._set_trading_pair_symbol_map(mapping)
-
-        # Log summary
-        self.logger().info(
-            f"[SYMBOL CONVERSION] Initialized symbol map: {symbols_processed} symbols processed, "
-            f"{symbols_skipped} skipped, total mappings: {len(mapping)}"
-        )
-
-        # Log some example mappings
-        if mapping:
-            sample_mappings = list(mapping.items())[:5]
-            self.logger().info(
-                f"[SYMBOL CONVERSION] Sample mappings: {sample_mappings}"
-            )
 
     async def exchange_symbol_associated_to_pair(self, trading_pair: str) -> str:
         """
@@ -333,17 +289,9 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             symbol_map = await self.trading_pair_symbol_map()
 
             if trading_pair not in symbol_map.inverse:
-                self.logger().error(
-                    f"[SYMBOL CONVERSION] Trading pair '{trading_pair}' not found in symbol map. "
-                    f"Available pairs: {list(symbol_map.inverse.keys())[:10]}"
-                )
                 raise KeyError(f"Trading pair '{trading_pair}' not found in symbol map")
 
             orderly_symbol = symbol_map.inverse[trading_pair]
-            self.logger().debug(
-                f"[SYMBOL CONVERSION] Map lookup: Hummingbot '{trading_pair}' -> "
-                f"Orderly '{orderly_symbol}'"
-            )
             return orderly_symbol
         except KeyError:
             # Re-raise KeyError with more context
@@ -517,72 +465,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     # Helper Methods
     # ============================================================
 
-    async def _api_request(
-        self,
-        path: str,
-        method: RESTMethod = RESTMethod.GET,
-        params: Optional[Dict[str, Any]] = None,
-        data: Optional[Dict[str, Any]] = None,
-        is_auth_required: bool = False,
-        **kwargs
-    ) -> Dict[str, Any]:
-        """
-        Make an API request.
-
-        Args:
-            path: API endpoint path
-            method: HTTP method
-            params: Query parameters
-            data: Request body data
-            is_auth_required: Whether authentication is required
-
-        Returns:
-            API response
-        """
-        self.logger().info(
-            f"[AUTH DEBUG] _api_request called - "
-            f"path={path}, method={method.name}, "
-            f"is_auth_required={is_auth_required}, "
-            f"self._auth={self._auth}, "
-            f"factory auth={getattr(self._web_assistants_factory, '_auth', 'MISSING')}"
-        )
-        url = web_utils.private_rest_url(path, self._domain) if is_auth_required else web_utils.public_rest_url(path, self._domain)
-
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-
-        # JSON encode data if it's a dict and method is POST/PUT
-        # The auth module expects request.data to be a JSON string for POST/PUT requests
-        # For DELETE/GET requests, don't pass data at all to avoid Content-Type header issues
-        encoded_data = None
-        if data is not None:
-            if method in (RESTMethod.POST, RESTMethod.PUT):
-                # If data is already a string, use it as-is; otherwise JSON encode
-                if isinstance(data, str):
-                    encoded_data = data
-                else:
-                    encoded_data = json.dumps(data)
-            # For DELETE/GET, explicitly set data to None (don't pass it)
-
-        # For DELETE/GET requests, don't pass data parameter to avoid aiohttp adding Content-Type
-        if method in (RESTMethod.DELETE, RESTMethod.GET):
-            request = RESTRequest(
-                method=method,
-                url=url,
-                params=params,
-                is_auth_required=is_auth_required,
-            )
-        else:
-            request = RESTRequest(
-                method=method,
-                url=url,
-                params=params,
-                data=encoded_data,
-                is_auth_required=is_auth_required,
-            )
-
-        response = await rest_assistant.call(request=request)
-        return await response.json()
-
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         """
         Get last traded price for a trading pair.
@@ -594,10 +476,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             Last traded price
         """
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        self.logger().info(
-            f"[SYMBOL CONVERSION] Converting trading pair: Hummingbot '{trading_pair}' -> "
-            f"Orderly symbol '{symbol}'"
-        )
         url = web_utils.public_rest_url(
             CONSTANTS.SYMBOL_INFO_URL.format(symbol=symbol),
             domain=self._domain
@@ -647,10 +525,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             Tuple of (exchange_order_id, timestamp)
         """
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        self.logger().debug(
-            f"[SYMBOL CONVERSION] Order placement: Hummingbot '{trading_pair}' -> "
-            f"Orderly symbol '{symbol}'"
-        )
 
         # Build order parameters according to Orderly API spec
         # Map Hummingbot order types to Orderly order types
@@ -674,8 +548,14 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             order_params["order_price"] = float(self.quantize_order_price(trading_pair, price))
 
         # Make API call
-        response = await self._api_request(
-            path=CONSTANTS.CREATE_ORDER_URL,
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        url = web_utils.public_rest_url(
+            CONSTANTS.CREATE_ORDER_URL,
+            domain=self._domain
+        )
+        response = await rest_assistant.execute_request(
+            url=url,
+            throttler_limit_id=CONSTANTS.CREATE_ORDER_URL,
             method=RESTMethod.POST,
             data=order_params,
             is_auth_required=True,
@@ -706,9 +586,16 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             "order_id": str(order_id_to_cancel),
             "symbol": symbol,
         }
-
-        response = await self._api_request(
-            path=CONSTANTS.CANCEL_ORDER_URL,
+        
+        # Make API call
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        url = web_utils.public_rest_url(
+            CONSTANTS.CANCEL_ORDER_URL,
+            domain=self._domain
+        )
+        response = await rest_assistant.execute_request(
+            url=url,
+            throttler_limit_id=CONSTANTS.CANCEL_ORDER_URL,
             method=RESTMethod.DELETE,
             params=params,
             is_auth_required=True,
@@ -736,9 +623,15 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 new_state=OrderState.FAILED,
                 client_order_id=tracked_order.client_order_id,
             )
-
-        response = await self._api_request(
-            path=CONSTANTS.GET_ORDER_URL.format(order_id=exchange_order_id),
+        
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        url = web_utils.public_rest_url(
+            CONSTANTS.GET_ORDER_URL.format(order_id=exchange_order_id),
+            domain=self._domain
+        )
+        response = await rest_assistant.execute_request(
+            url=url,
+            throttler_limit_id=CONSTANTS.GET_ORDER_URL,
             method=RESTMethod.GET,
             is_auth_required=True,
         )
@@ -778,12 +671,15 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         try:
             exchange_order_id = await order.get_exchange_order_id()
 
-            # Fetch all trades for this order
-            # Path parameters are sent as strings in URLs
-            response = await self._api_request(
-                path=CONSTANTS.GET_ORDER_TRADES_URL.format(order_id=str(exchange_order_id)),
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+            url = web_utils.public_rest_url(
+                CONSTANTS.GET_ORDER_TRADES_URL.format(order_id=str(exchange_order_id)),
+                domain=self._domain
+            )
+            response = await rest_assistant.execute_request(
+                url=url,
+                throttler_limit_id=CONSTANTS.GET_ORDER_TRADES_URL,
                 method=RESTMethod.GET,
-                is_auth_required=True,
             )
 
             if not response.get("success", False):
@@ -837,8 +733,14 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _update_positions(self):
         """Fetch and update positions"""
-        response = await self._api_request(
-            path=CONSTANTS.POSITIONS_URL,
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        url = web_utils.public_rest_url(
+            CONSTANTS.POSITIONS_URL,
+            domain=self._domain
+        )
+        response = await rest_assistant.execute_request(
+            url=url,
+            throttler_limit_id=CONSTANTS.POSITIONS_URL,
             method=RESTMethod.GET,
             is_auth_required=True,
         )
@@ -905,21 +807,23 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         """
         try:
             symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-            self.logger().debug(
-                f"[SYMBOL CONVERSION] Setting leverage: Hummingbot '{trading_pair}' -> "
-                f"Orderly symbol '{symbol}'"
-            )
 
             data = {
                 "symbol": symbol,
                 "leverage": leverage,
             }
 
-            response = await self._api_request(
-                path=CONSTANTS.SET_LEVERAGE_URL,
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+            url = web_utils.public_rest_url(
+                CONSTANTS.SET_LEVERAGE_URL,
+                domain=self._domain
+            )
+            response = await rest_assistant.execute_request(
+                url=url,
+                throttler_limit_id=CONSTANTS.SET_LEVERAGE_URL,
                 method=RESTMethod.POST,
                 data=data,
-                is_auth_required=True,
+                is_auth_required=True
             )
 
             if response.get("success", False):
@@ -963,25 +867,19 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _update_balances(self):
         """Fetch and update account balances"""
-        self.logger().info(
-            f"[AUTH DEBUG] _update_balances called - "
-            f"self._auth={self._auth}, "
-            f"auth account_id={getattr(self._auth, '_account_id', 'MISSING') if self._auth else 'NO_AUTH'}"
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        url = web_utils.public_rest_url(
+            CONSTANTS.ACCOUNT_HOLDING_URL,
+            domain=self._domain
         )
-        response = await self._api_request(
-            path=CONSTANTS.ACCOUNT_HOLDING_URL,
+        response = await rest_assistant.execute_request(
+            url=url,
+            throttler_limit_id=CONSTANTS.ACCOUNT_HOLDING_URL,
             method=RESTMethod.GET,
             is_auth_required=True,
         )
-        self.logger().info(f"response: {response}")
-        if not response.get("success", False):
-            self.logger().error(f"Failed to fetch balances: {response}")
-            return
-
         data = response.get("data", {})
-        self.logger().info(f"data: {data}")
         holdings = data.get("holding", [])
-        self.logger().info(f"holdings: {holdings}")
 
         self._account_balances.clear()
         self._account_available_balances.clear()
@@ -1011,14 +909,14 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         """
         try:
             symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-            self.logger().debug(
-                f"[SYMBOL CONVERSION] Fetching funding payment: Hummingbot '{trading_pair}' -> "
-                f"Orderly symbol '{symbol}'"
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+            url = web_utils.public_rest_url(
+                CONSTANTS.FUNDING_FEE_HISTORY_URL,
+                domain=self._domain
             )
-
-            # Orderly API requires size parameter as a string
-            response = await self._api_request(
-                path=CONSTANTS.FUNDING_FEE_HISTORY_URL,
+            response = await rest_assistant.execute_request(
+                url=url,
+                throttler_limit_id=CONSTANTS.FUNDING_FEE_HISTORY_URL,
                 method=RESTMethod.GET,
                 params={"symbol": symbol, "size": "1"},
                 is_auth_required=True,

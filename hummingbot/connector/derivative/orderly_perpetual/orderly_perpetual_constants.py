@@ -325,6 +325,33 @@ RATE_LIMITS = [
             LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
         ]
     ),
+    RateLimit(
+        limit_id=GET_ORDER_URL,
+        limit=PRIVATE_ENDPOINTS_LIMIT,
+        time_interval=1,
+        linked_limits=[
+            LinkedLimitWeightPair(PRIVATE_LIMIT_ID),
+            LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
+        ]
+    ),
+    RateLimit(
+        limit_id=GET_ORDER_TRADES_URL,
+        limit=PRIVATE_ENDPOINTS_LIMIT,
+        time_interval=1,
+        linked_limits=[
+            LinkedLimitWeightPair(PRIVATE_LIMIT_ID),
+            LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
+        ]
+    ),
+    RateLimit(
+        limit_id=FUNDING_FEE_HISTORY_URL,
+        limit=PRIVATE_ENDPOINTS_LIMIT,
+        time_interval=1,
+        linked_limits=[
+            LinkedLimitWeightPair(PRIVATE_LIMIT_ID),
+            LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
+        ]
+    ),
 ]
 
 # Error Messages
@@ -333,3 +360,33 @@ ORDER_NOT_EXIST_MESSAGE = "Order not found"
 ORDER_ALREADY_CANCELLED_MESSAGE = "Order already cancelled"
 ORDER_ALREADY_FILLED_MESSAGE = "Order already filled"
 CANCELLING_COMPLETED_ORDER_MESSAGE = "The order is completed"
+
+# ALL_ERROR_CODES = [
+#     {"error_code": -1000, "status_code": 500, "error_name": "UNKNOWN", "description": "An unknown error occurred while processing the request."},
+#     {"error_code:" -1000, "status_code": 500, "error_name": "UNKNOWN", "description": "The data does not exist"},
+#     {"error_code:" -1001, "status_code": 401, "error_name": "INVALID_SIGNATURE", "description": "The api key or secret is in wrong format."},
+#     {"error_code:" -1002, "status_code": 401, "error_name": "UNAUTHORIZED", "description": "API key or secret is invalid, it may be because key have insufficient permission or the key is expired/revoked."},
+#     {"error_code:" -1003, "status_code": 429, "error_name": "TOO_MANY_REQUEST", "description": "Rate limit exceed."},
+#     {"error_code:" -1004, "status_code": 400, "error_name": "UNKNOWN_PARAM", "description": "An unknown parameter was sent."},
+#     {"error_code:" -1005, "status_code": 400, "error_name": "INVALID_PARAM", "description": "Some parameters are in wrong format for api."},
+#     {"error_code:" -1005, "status_code": 400, "error_name": "INVALID_PARAM", "description": "ratio_qty_request should be in range 0-1."},
+#     {"error_code:" -1005, "status_code": 400, "error_name": "INVALID_PARAM", "description": "extra_liquidation_ratio should be in range 0-1."},
+#     {"error_code:" -1005, "status_code": 400, "error_name": "INVALID_PARAM", "description": "if you set extra_liquidation_ratio > 0, ratio_qty_request must be 1."},
+#     {"error_code:" -1006, "status_code": 400, "error_name": "RESOURCE_NOT_FOUND", "description": "The data is not found in server. For example, when client try canceling a CANCELLED order, will raise this error."},
+#     {"error_code:" -1007, "status_code": 409, "error_name": "DUPLICATE_REQUEST", "description": "The data is already exists or your request is duplicated."},
+#     {"error_code:" -1008, "status_code": 400, "error_name": "QUANTITY_TOO_HIGH", "description": "The quantity of settlement is too high than you can request."},
+#     {"error_code:" -1009, "status_code": 400, "error_name": "CAN_NOT_WITHDRAWAL", "description": "Can not request withdrawal settlement, you need to deposit other arrears first."},
+#     {"error_code:" -1011, "status_code": 400, "error_name": "RPC_NOT_CONNECT", "description": "Can not place/cancel orders, it may be because internal network error. Please try again in a few seconds."},
+#     {"error_code:" -1012, "status_code": 400, "error_name": "RPC_REJECT", "description": "The place/cancel order request is rejected by internal module, it may because the account is in liquidation or other internal errors. Please try again in a few seconds."},
+#     {"error_code:" -1012, "status_code": 400, "error_name": "RPC_REJECT", "description": "Another liquidation is in process"},
+#     {"error_code:" -1101, "status_code": 400, "error_name": "RISK_TOO_HIGH", "description": "The risk exposure for client is too high, it may cause by sending too big order or the leverage is too low. please refer to client info to check the current exposure."},
+#     {"error_code:" -1101, "status_code": 400, "error_name": "RISK_TOO_HIGH", "description": "The margin will be insufficient after."},
+#     {"error_code:" -1102, "status_code": 400, "error_name": "MIN_NOTIONAL", "description": "The order value (price * size) is too small."},
+#     {"error_code:" -1103, "status_code": 400, "error_name": "PRICE_FILTER", "description": "The order price is not following the scope or range rules."},
+#     {"error_code:" -1104, "status_code": 400, "error_name": "SIZE_FILTER", "description": "The order quantity is not following the step size rule for the symbol."},
+#     {"error_code:" -1105, "status_code": 400, "error_name": "PERCENTAGE_FILTER", "description": "Price is X% too high or X% too low from the mid price."},
+#     {"error_code:" -1201, "status_code": 400, "error_name": "LIQUIDATION_REQUEST_RATIO_TOO_SMALL", "description": "total notional < 10000, least req ratio should = 1"},
+#     {"error_code:" -1201, "status_code": 400, "error_name": "LIQUIDATION_REQUEST_RATIO_TOO_SMALL", "description": "least req ratio should = xxxx"},
+#     {"error_code:" -1202, "status_code": 400, "error_name": "LIQUIDATION_STATUS_ERROR", "description": "No need to liquidation because user margin is enough."},
+#     {"error_code:" -1202, "status_code": 400, "error_name": "LIQUIDATION_STATUS_ERROR", "description": "Can not find given liquidationId."},
+# ]
