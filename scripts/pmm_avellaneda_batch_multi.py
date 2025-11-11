@@ -1,7 +1,7 @@
 import logging
 import os
 from decimal import Decimal
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 from pydantic import Field, field_validator
@@ -21,7 +21,6 @@ import asyncio
 
 class PairConfig(BaseClientModel):
     """Configuration for a single trading pair"""
-    exchange: str = Field("orderly_perpetual")
     trading_pair: str = Field("BTC-USDC")
     order_amount_quote: Decimal = Field(20)
     risk_aversion_gamma: Decimal = Field(6.0)
@@ -52,10 +51,11 @@ class PairConfig(BaseClientModel):
 
 class PMMAvellanedaMultiConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
+    exchange: str = Field("orderly_perpetual")
     pairs: List[PairConfig] = Field(
         default_factory=lambda: [PairConfig()],
         json_schema_extra={
-            "prompt": "Enter pair configurations (exchange,trading_pair,order_amount_quote,risk_aversion_gamma,volatility_sigma,risk_horizon_tau_hours,max_inventory,leverage:same_for_other_pairs)",
+            "prompt": "Enter pair configurations (trading_pair,order_amount_quote,risk_aversion_gamma,volatility_sigma,risk_horizon_tau_hours,max_inventory,leverage:same_for_other_pairs)",
             "prompt_on_new": True
         }
     )
@@ -68,17 +68,15 @@ class PMMAvellanedaMultiConfig(BaseClientModel):
             pairs = []
             for pair_str in v.split(":"):
                 parts = pair_str.split(",")
-                if len(parts) >= 2:
-                    exchange = parts[0].strip()
-                    trading_pair = parts[1].strip()
-                    order_amount_quote = Decimal(parts[2].strip()) if len(parts) > 2 else Decimal(20)
-                    risk_aversion_gamma = Decimal(parts[3].strip()) if len(parts) > 3 else Decimal(6.0)
-                    volatility_sigma = Decimal(parts[4].strip()) if len(parts) > 4 else Decimal(0.50)
-                    risk_horizon_tau_hours = Decimal(parts[5].strip()) if len(parts) > 5 else Decimal(2.0)
-                    max_inventory = Decimal(parts[6].strip()) if len(parts) > 6 else Decimal(0.01)
-                    leverage = int(parts[7].strip()) if len(parts) > 7 else 10
+                if len(parts) >= 1:
+                    trading_pair = parts[0].strip()
+                    order_amount_quote = Decimal(parts[1].strip()) if len(parts) > 1 else Decimal(20)
+                    risk_aversion_gamma = Decimal(parts[2].strip()) if len(parts) > 2 else Decimal(6.0)
+                    volatility_sigma = Decimal(parts[3].strip()) if len(parts) > 3 else Decimal(0.50)
+                    risk_horizon_tau_hours = Decimal(parts[4].strip()) if len(parts) > 4 else Decimal(2.0)
+                    max_inventory = Decimal(parts[5].strip()) if len(parts) > 5 else Decimal(0.01)
+                    leverage = int(parts[6].strip()) if len(parts) > 6 else 10
                     pairs.append(PairConfig(
-                        exchange=exchange,
                         trading_pair=trading_pair,
                         order_amount_quote=order_amount_quote,
                         risk_aversion_gamma=risk_aversion_gamma,
@@ -112,58 +110,61 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     
     @classmethod
     def init_markets(cls, config: PMMAvellanedaMultiConfig):
-        """Initialize markets from all pair configurations"""
-        markets: Dict[str, Set[str]] = {}
+        """Initialize markets from all pair configurations. All pairs use the same exchange."""
+        if not config.pairs:
+            raise ValueError("At least one pair configuration is required")
+        
+        # All pairs use the same exchange from config
+        exchange = config.exchange
+        markets: Dict[str, Set[str]] = {exchange: set()}
         for pair_config in config.pairs:
-            if pair_config.exchange not in markets:
-                markets[pair_config.exchange] = set()
-            markets[pair_config.exchange].add(pair_config.trading_pair)
+            markets[exchange].add(pair_config.trading_pair)
         cls.markets = markets
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: PMMAvellanedaMultiConfig):
         super().__init__(connectors)
         self.config = config
         
+        # Store the exchange from config
+        self._exchange = config.exchange
+        if self._exchange not in connectors:
+            raise ValueError(f"Connector '{self._exchange}' not found in connectors")
+        
+        self._connector = connectors[self._exchange]
+        
         # Initialize lock for preventing concurrent order operations
         self._order_operation_lock = asyncio.Lock()
         self._order_operation_in_progress = False
         
-        # Create a mapping from market key (exchange, trading_pair) to pair config
-        self._pair_configs: Dict[Tuple[str, str], PairConfig] = {}
+        # Create a mapping from trading_pair to pair config (exchange is same for all)
+        self._pair_configs: Dict[str, PairConfig] = {}
         for pair_config in config.pairs:
-            market_key = (pair_config.exchange, pair_config.trading_pair)
-            self._pair_configs[market_key] = pair_config
+            self._pair_configs[pair_config.trading_pair] = pair_config
         
-        # Per-pair state storage
-        self._current_inventory: Dict[Tuple[str, str], Decimal] = {}
-        self._cached_mid_price: Dict[Tuple[str, str], Decimal] = {}
-        self._cached_reservation_price: Dict[Tuple[str, str], Decimal] = {}
+        # Per-pair state storage (keyed by trading_pair only since exchange is same)
+        self._current_inventory: Dict[str, Decimal] = {}
+        self._cached_mid_price: Dict[str, Decimal] = {}
+        self._cached_reservation_price: Dict[str, Decimal] = {}
         
         # Per-pair DataFrames to store last 6 filled orders
-        self._filled_orders_df: Dict[Tuple[str, str], pd.DataFrame] = {}
+        self._filled_orders_df: Dict[str, pd.DataFrame] = {}
         
         # Initialize per-pair state
-        for market_key in self._pair_configs.keys():
-            self._current_inventory[market_key] = Decimal("0")
-            self._cached_mid_price[market_key] = Decimal("0")
-            self._cached_reservation_price[market_key] = Decimal("0")
-            self._filled_orders_df[market_key] = pd.DataFrame(columns=[
+        for trading_pair in self._pair_configs.keys():
+            self._current_inventory[trading_pair] = Decimal("0")
+            self._cached_mid_price[trading_pair] = Decimal("0")
+            self._cached_reservation_price[trading_pair] = Decimal("0")
+            self._filled_orders_df[trading_pair] = pd.DataFrame(columns=[
                 "Timestamp", "Order ID", "Side", "Amount", "Price", "Inventory"
             ])
-        
-    def _get_market_key(self, exchange: str, trading_pair: str) -> Tuple[str, str]:
-        """Get market key tuple"""
-        return (exchange, trading_pair)
     
-    def _get_pair_config(self, exchange: str, trading_pair: str) -> Optional[PairConfig]:
-        """Get pair configuration for a market"""
-        market_key = self._get_market_key(exchange, trading_pair)
-        return self._pair_configs.get(market_key)
+    def _get_pair_config(self, trading_pair: str) -> Optional[PairConfig]:
+        """Get pair configuration for a trading pair"""
+        return self._pair_configs.get(trading_pair)
     
-    def _get_in_flight_order(self, order_id: str, exchange: str) -> Optional[InFlightOrder]:
+    def _get_in_flight_order(self, order_id: str) -> Optional[InFlightOrder]:
         """Get InFlightOrder from connector's order tracker"""
-        connector = self.connectors[exchange]
-        return connector._order_tracker.fetch_order(client_order_id=order_id)
+        return self._connector._order_tracker.fetch_order(client_order_id=order_id)
 
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
@@ -175,23 +176,23 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                 self.logger().debug("Order operation already in progress, skipping tick")
                 return
             
-            # Process all pairs
+            # Create all order proposals across all pairs first
             all_proposals: List[PerpetualOrderCandidate] = []
-            for market_key, pair_config in self._pair_configs.items():
-                exchange, trading_pair = market_key
-                proposals = self.create_proposal(exchange, trading_pair)
-                proposal_adjusted = self.adjust_proposal_to_budget(proposals, exchange)
-                all_proposals.extend(proposal_adjusted)
+            for trading_pair, pair_config in self._pair_configs.items():
+                proposals = self.create_proposal(trading_pair)
+                all_proposals.extend(proposals)
             
-            # Execute cancel then place sequentially to avoid order accumulation
-            safe_ensure_future(self._cancel_and_place_orders(all_proposals))
+            # Adjust all proposals to budget together
+            all_proposals_adjusted = self.adjust_proposal_to_budget(all_proposals)
+            
+            # Execute cancel all orders, then place all new orders together
+            safe_ensure_future(self._cancel_and_place_orders(all_proposals_adjusted))
             self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
     
     async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
         """
-        Cancel all active orders and then place new orders sequentially.
-        This ensures old orders are cancelled before new ones are placed.
-        Uses a lock to prevent concurrent execution.
+        Cancel all active orders across all pairs, then place all new orders together.
+        Uses batch operations for efficiency. Uses a lock to prevent concurrent execution.
         """
         # Check if operation is already in progress
         if self._order_operation_in_progress:
@@ -201,9 +202,9 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         async with self._order_operation_lock:
             try:
                 self._order_operation_in_progress = True
-                # First, cancel all active orders for all pairs and wait for completion
+                # First, cancel all active orders across all pairs in one batch
                 await self._async_cancel_all_orders()
-                # Then place new orders
+                # Then place all new orders together in one batch
                 await self._async_place_orders(proposal)
             except Exception as e:
                 self.logger().error(f"Error in _cancel_and_place_orders: {e}", exc_info=True)
@@ -214,30 +215,26 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     def apply_initial_setting(self):
         if not self.account_config_set:
             # Apply settings for all pairs
-            for market_key, pair_config in self._pair_configs.items():
-                exchange, trading_pair = market_key
-                connector = self.connectors[exchange]
-                connector.set_leverage(trading_pair, pair_config.leverage)
+            for trading_pair, pair_config in self._pair_configs.items():
+                self._connector.set_leverage(trading_pair, pair_config.leverage)
             self.account_config_set = True
     
-    def create_proposal(self, exchange: str, trading_pair: str) -> List[PerpetualOrderCandidate]:
+    def create_proposal(self, trading_pair: str) -> List[PerpetualOrderCandidate]:
         """Create order proposals for a specific trading pair"""
-        pair_config = self._get_pair_config(exchange, trading_pair)
+        pair_config = self._get_pair_config(trading_pair)
         if not pair_config:
             return []
         
-        connector = self.connectors[exchange]
-        mid_price = connector.get_price_by_type(trading_pair, PriceType.MidPrice)
-        market_key = self._get_market_key(exchange, trading_pair)
-        inventory = self._get_current_inventory(exchange, trading_pair)
+        mid_price = self._connector.get_price_by_type(trading_pair, PriceType.MidPrice)
+        inventory = self._get_current_inventory(trading_pair)
         
         reservation_price = self._calculate_reservation_price(
             mid_price, inventory, pair_config
         )
         
         # Cache values for status reporting
-        self._cached_mid_price[market_key] = mid_price
-        self._cached_reservation_price[market_key] = reservation_price
+        self._cached_mid_price[trading_pair] = mid_price
+        self._cached_reservation_price[trading_pair] = reservation_price
         
         orders = []
         for idx, bid_spread in enumerate(pair_config.bid_spread_levels):
@@ -283,34 +280,24 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                 orders.extend([bid_order, ask_order])
         return orders
 
-    def adjust_proposal_to_budget(self, proposals: List[PerpetualOrderCandidate], exchange: str) -> List[PerpetualOrderCandidate]:
-        """Adjust proposals to budget for a specific exchange"""
-        connector = self.connectors[exchange]
-        budget_checker = connector.budget_checker
-        
+    def adjust_proposal_to_budget(self, proposals: List[PerpetualOrderCandidate]) -> List[PerpetualOrderCandidate]:
+        """Adjust proposals to budget for the exchange"""
+        budget_checker = self._connector.budget_checker
         proposals_adjusted = budget_checker.adjust_candidates(proposals, all_or_none=True)
         return proposals_adjusted
 
     async def _async_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
-        """Place multiple orders using batch API, grouped by exchange"""
+        """Place all orders together using batch API for the single exchange"""
         if not proposal:
             return
         
-        # Group orders by exchange
-        orders_by_exchange: Dict[str, List[Dict]] = {}
+        # Convert all order candidates to order dictionaries
+        orders_to_create: List[Dict] = []
         for order in proposal:
-            # Find which exchange this order belongs to
-            exchange = None
-            for market_key, pair_config in self._pair_configs.items():
-                if order.trading_pair == market_key[1]:
-                    exchange = market_key[0]
-                    break
-            
-            if not exchange:
+            # Verify this trading pair is in our config
+            if order.trading_pair not in self._pair_configs:
+                self.logger().warning(f"Order for unknown trading pair: {order.trading_pair}")
                 continue
-            
-            if exchange not in orders_by_exchange:
-                orders_by_exchange[exchange] = []
             
             order_dict = {
                 "trading_pair": order.trading_pair,
@@ -320,55 +307,47 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                 "price": order.price,
                 "position_action": PositionAction.OPEN
             }
-            orders_by_exchange[exchange].append(order_dict)
+            orders_to_create.append(order_dict)
         
-        # Place orders for each exchange
-        for exchange, orders_to_create in orders_by_exchange.items():
-            connector = self.connectors[exchange]
-            await connector.batch_order_create(orders_to_create)
+        # Place all orders together in one batch call
+        if orders_to_create:
+            await self._connector.batch_order_create(orders_to_create)
         
     async def _async_cancel_all_orders(self):
-        """Cancel all active orders for all pairs using batch API"""
-        # Group orders to cancel by exchange
-        orders_by_exchange: Dict[str, List[InFlightOrder]] = {}
+        """Gather all active orders across all pairs and cancel them together using batch API"""
+        # Get all trading pairs we're tracking
+        tracked_trading_pairs = set(self._pair_configs.keys())
         
-        for market_key, pair_config in self._pair_configs.items():
-            exchange, trading_pair = market_key
-            connector = self.connectors[exchange]
-            
-            # Get orders directly from connector's order tracker
-            all_in_flight_orders = connector._order_tracker.active_orders
-            
-            if exchange not in orders_by_exchange:
-                orders_by_exchange[exchange] = []
-            
-            for in_flight_order in all_in_flight_orders.values():
-                # Filter by current trading pair only
-                if in_flight_order.trading_pair != trading_pair:
-                    continue
-                
-                # Check if order is actually still open
-                if in_flight_order.is_open:
-                    orders_by_exchange[exchange].append(in_flight_order)
-                else:
-                    # Order is already done (filled/cancelled/failed), skip it
-                    self.logger().debug(
-                        f"Order {in_flight_order.client_order_id} is {in_flight_order.current_state.name}, "
-                        f"skipping cancellation"
-                    )
+        # Get all orders directly from connector's order tracker
+        all_in_flight_orders = self._connector._order_tracker.active_orders
         
-        # Cancel orders for each exchange
-        for exchange, orders_to_cancel in orders_by_exchange.items():
-            if orders_to_cancel:
-                try:
-                    connector = self.connectors[exchange]
-                    await connector.batch_order_cancel(orders_to_cancel)
-                except Exception as e:
-                    # Log error but don't fail - orders might already be cancelled
-                    self.logger().warning(
-                        f"Error cancelling orders for {exchange}: {e}. "
-                        f"This may be normal if orders were already cancelled."
-                    )
+        # Gather all open orders across all tracked trading pairs
+        orders_to_cancel: List[InFlightOrder] = []
+        for in_flight_order in all_in_flight_orders.values():
+            # Only include orders for our tracked trading pairs
+            if in_flight_order.trading_pair not in tracked_trading_pairs:
+                continue
+            
+            # Check if order is actually still open
+            if in_flight_order.is_open:
+                orders_to_cancel.append(in_flight_order)
+            else:
+                # Order is already done (filled/cancelled/failed), skip it
+                self.logger().debug(
+                    f"Order {in_flight_order.client_order_id} is {in_flight_order.current_state.name}, "
+                    f"skipping cancellation"
+                )
+        
+        # Cancel all orders together in one batch call
+        if orders_to_cancel:
+            try:
+                await self._connector.batch_order_cancel(orders_to_cancel)
+            except Exception as e:
+                # Log error but don't fail - orders might already be cancelled
+                self.logger().warning(
+                    f"Error cancelling orders: {e}. "
+                    f"This may be normal if orders were already cancelled."
+                )
         
     def did_fill_order(self, event: OrderFilledEvent):
         """
@@ -378,30 +357,25 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         - BUY fill increases inventory (long position)
         - SELL fill decreases inventory (short position)
         """
-        # Find which market this fill belongs to by matching trading pair
-        # Since OrderFilledEvent doesn't have exchange attribute, we match by trading_pair
-        market_key = None
-        for market_key_candidate in self._pair_configs.keys():
-            exchange, trading_pair = market_key_candidate
-            if trading_pair == event.trading_pair:
-                # Verify this connector has this order
-                connector = self.connectors[exchange]
-                order = connector._order_tracker.fetch_order(client_order_id=event.order_id)
-                if order is not None:
-                    market_key = market_key_candidate
-                    break
+        # Verify this trading pair is in our config
+        trading_pair = event.trading_pair
+        if trading_pair not in self._pair_configs:
+            self.logger().warning(f"Fill event for unknown trading pair: {trading_pair} (order_id: {event.order_id})")
+            return
         
-        if not market_key or market_key not in self._current_inventory:
-            self.logger().warning(f"Fill event for unknown market: {event.trading_pair} (order_id: {event.order_id})")
+        # Verify this connector has this order
+        order = self._connector._order_tracker.fetch_order(client_order_id=event.order_id)
+        if order is None:
+            self.logger().warning(f"Fill event for unknown order: {event.order_id}")
             return
         
         # Update inventory based on fill direction
         if event.trade_type == TradeType.BUY:
             # BUY fill = we bought, inventory increases (long position)
-            self._current_inventory[market_key] += event.amount
+            self._current_inventory[trading_pair] += event.amount
         elif event.trade_type == TradeType.SELL:
             # SELL fill = we sold, inventory decreases (short position)
-            self._current_inventory[market_key] -= event.amount
+            self._current_inventory[trading_pair] -= event.amount
         
         # Add fill to DataFrame for this pair
         try:
@@ -415,21 +389,20 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             "Side": event.trade_type.name,
             "Amount": float(event.amount),
             "Price": float(event.price),
-            "Inventory": float(self._current_inventory[market_key])
+            "Inventory": float(self._current_inventory[trading_pair])
         }])
-        self._filled_orders_df[market_key] = pd.concat([self._filled_orders_df[market_key], new_row], ignore_index=True)
+        self._filled_orders_df[trading_pair] = pd.concat([self._filled_orders_df[trading_pair], new_row], ignore_index=True)
         
         # Keep only last 6 fills per pair
-        if len(self._filled_orders_df[market_key]) > 6:
-            self._filled_orders_df[market_key] = self._filled_orders_df[market_key].tail(6).reset_index(drop=True)
+        if len(self._filled_orders_df[trading_pair]) > 6:
+            self._filled_orders_df[trading_pair] = self._filled_orders_df[trading_pair].tail(6).reset_index(drop=True)
         
-        exchange, trading_pair = market_key
         msg = (f"{event.trade_type.name} {round(event.amount, 2)} {trading_pair} "
-               f"{exchange} at {round(event.price, 2)} | Inventory: {self._current_inventory[market_key]:.8f}")
+               f"{self._exchange} at {round(event.price, 2)} | Inventory: {self._current_inventory[trading_pair]:.8f}")
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
 
-    def _get_current_inventory(self, exchange: str, trading_pair: str) -> Decimal:
+    def _get_current_inventory(self, trading_pair: str) -> Decimal:
         """
         Get current inventory position tracked internally from order fills for a specific pair.
         Returns signed position amount: positive for long, negative for short.
@@ -438,8 +411,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         - BUY fills increase inventory (long position)
         - SELL fills decrease inventory (short position)
         """
-        market_key = self._get_market_key(exchange, trading_pair)
-        return self._current_inventory.get(market_key, Decimal("0"))
+        return self._current_inventory.get(trading_pair, Decimal("0"))
 
     def _calculate_reservation_price(self, mid_price: Decimal, inventory: Decimal, pair_config: PairConfig) -> Decimal:
         """
@@ -485,13 +457,13 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append("")
         
         # Display status for each pair
-        for market_key, pair_config in self._pair_configs.items():
-            exchange, trading_pair = market_key
-            mid_price = self._cached_mid_price.get(market_key, Decimal("0"))
-            reservation_price = self._cached_reservation_price.get(market_key, Decimal("0"))
-            inventory = self._current_inventory.get(market_key, Decimal("0"))
+        lines.append(f"  Exchange: {self._exchange}")
+        for trading_pair, pair_config in self._pair_configs.items():
+            mid_price = self._cached_mid_price.get(trading_pair, Decimal("0"))
+            reservation_price = self._cached_reservation_price.get(trading_pair, Decimal("0"))
+            inventory = self._current_inventory.get(trading_pair, Decimal("0"))
             
-            lines.append(f"  Pair: {exchange}:{trading_pair}")
+            lines.append(f"  Pair: {trading_pair}")
             lines.append(f"    Mid Price: {mid_price:.8f}")
             lines.append(f"    Reservation Price: {reservation_price:.8f}")
             lines.append(f"    Price Adjustment: {reservation_price - mid_price:.8f}")
@@ -514,13 +486,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             lines.append("  No active orders.")
         
         # Display last 6 filled orders for each pair
-        for market_key, pair_config in self._pair_configs.items():
-            exchange, trading_pair = market_key
-            filled_df = self._filled_orders_df.get(market_key)
+        for trading_pair, pair_config in self._pair_configs.items():
+            filled_df = self._filled_orders_df.get(trading_pair)
             
             if filled_df is not None and len(filled_df) > 0:
                 lines.append("")
-                lines.append(f"  Last 6 Filled Orders ({exchange}:{trading_pair}):")
+                lines.append(f"  Last 6 Filled Orders ({self._exchange}:{trading_pair}):")
                 # Display in reverse order so most recent appears at bottom
                 filled_df_display = filled_df.iloc[::-1].copy()
                 # Format timestamp for display
