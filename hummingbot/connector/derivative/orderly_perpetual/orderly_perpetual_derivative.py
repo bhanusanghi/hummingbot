@@ -579,23 +579,38 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         """
         symbol = await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
 
-        # IMPORTANT: Parameter order must match SDK: order_id, symbol
-        # Dict insertion order is preserved (Python 3.7+), which matches SDK behavior
-        order_id_to_cancel = tracked_order.exchange_order_id or order_id
-        params = {
-            "order_id": str(order_id_to_cancel),
-            "symbol": symbol,
-        }
+        # Use exchange_order_id if available, otherwise use client_order_id
+        # Orderly has separate endpoints:
+        # - /v1/order: Cancel by exchange_order_id (requires order_id param)
+        # - /v1/client/order: Cancel by client_order_id (requires client_order_id param)
+        if tracked_order.exchange_order_id:
+            # Cancel by exchange_order_id
+            params = {
+                "order_id": str(tracked_order.exchange_order_id),
+                "symbol": symbol,
+            }
+            url = web_utils.public_rest_url(
+                CONSTANTS.CANCEL_ORDER_URL,
+                domain=self._domain
+            )
+            throttler_limit_id = CONSTANTS.CANCEL_ORDER_URL
+        else:
+            # Cancel by client_order_id
+            params = {
+                "client_order_id": str(order_id),
+                "symbol": symbol,
+            }
+            url = web_utils.public_rest_url(
+                CONSTANTS.CANCEL_ORDER_BY_CLIENT_ID_URL,
+                domain=self._domain
+            )
+            throttler_limit_id = CONSTANTS.CANCEL_ORDER_BY_CLIENT_ID_URL
         
         # Make API call
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-        url = web_utils.public_rest_url(
-            CONSTANTS.CANCEL_ORDER_URL,
-            domain=self._domain
-        )
         response = await rest_assistant.execute_request(
             url=url,
-            throttler_limit_id=CONSTANTS.CANCEL_ORDER_URL,
+            throttler_limit_id=throttler_limit_id,
             method=RESTMethod.DELETE,
             params=params,
             is_auth_required=True,
@@ -680,6 +695,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 url=url,
                 throttler_limit_id=CONSTANTS.GET_ORDER_TRADES_URL,
                 method=RESTMethod.GET,
+                is_auth_required=True
             )
 
             if not response.get("success", False):

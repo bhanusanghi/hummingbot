@@ -153,9 +153,10 @@ RATE_LIMITS = [
             LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
         ]
     ),
+    # Batch Create Order: 1 req/sec per swagger docs
     RateLimit(
         limit_id=BATCH_CREATE_ORDER_URL,
-        limit=TRADING_ENDPOINTS_LIMIT,
+        limit=1,
         time_interval=1,
         linked_limits=[
             LinkedLimitWeightPair(TRADING_LIMIT_ID),
@@ -200,19 +201,21 @@ RATE_LIMITS = [
             LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
         ]
     ),
+    # Positions: 30 req per 10 seconds per swagger docs
     RateLimit(
         limit_id=POSITIONS_URL,
-        limit=PRIVATE_ENDPOINTS_LIMIT,
-        time_interval=1,
+        limit=30,
+        time_interval=10,
         linked_limits=[
             LinkedLimitWeightPair(PRIVATE_LIMIT_ID),
             LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
         ]
     ),
+    # Account Info: 10 req per 60 seconds per swagger docs
     RateLimit(
         limit_id=ACCOUNT_INFO_URL,
-        limit=PRIVATE_ENDPOINTS_LIMIT,
-        time_interval=1,
+        limit=10,
+        time_interval=60,
         linked_limits=[
             LinkedLimitWeightPair(PRIVATE_LIMIT_ID),
             LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
@@ -227,9 +230,20 @@ RATE_LIMITS = [
             LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
         ]
     ),
+    # Set Leverage: 5 req per 60 seconds per swagger docs
     RateLimit(
         limit_id=SET_LEVERAGE_URL,
-        limit=PRIVATE_ENDPOINTS_LIMIT,
+        limit=5,
+        time_interval=60,
+        linked_limits=[
+            LinkedLimitWeightPair(PRIVATE_LIMIT_ID),
+            LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
+        ]
+    ),
+    # Get Leverage: 1 req per 1 second per swagger docs (was missing)
+    RateLimit(
+        limit_id=GET_LEVERAGE_URL,
+        limit=1,
         time_interval=1,
         linked_limits=[
             LinkedLimitWeightPair(PRIVATE_LIMIT_ID),
@@ -265,9 +279,10 @@ RATE_LIMITS = [
             LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
         ]
     ),
+    # Orderbook Snapshot: 10 req per 1 second per swagger docs
     RateLimit(
         limit_id=ORDERBOOK_SNAPSHOT_URL,
-        limit=PUBLIC_ENDPOINTS_LIMIT,
+        limit=10,
         time_interval=1,
         linked_limits=[
             LinkedLimitWeightPair(PUBLIC_LIMIT_ID),
@@ -307,9 +322,10 @@ RATE_LIMITS = [
         limit=PUBLIC_ENDPOINTS_LIMIT,
         time_interval=1,
     ),
+    # System Info / Ping: 1 req per 1 second per swagger docs
     RateLimit(
         limit_id=SYSTEM_INFO_URL,
-        limit=PUBLIC_ENDPOINTS_LIMIT,
+        limit=1,
         time_interval=1,
         linked_limits=[
             LinkedLimitWeightPair(PUBLIC_LIMIT_ID),
@@ -318,7 +334,7 @@ RATE_LIMITS = [
     ),
     RateLimit(
         limit_id=PING_URL,
-        limit=PUBLIC_ENDPOINTS_LIMIT,
+        limit=1,
         time_interval=1,
         linked_limits=[
             LinkedLimitWeightPair(PUBLIC_LIMIT_ID),
