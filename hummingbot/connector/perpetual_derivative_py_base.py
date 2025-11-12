@@ -8,7 +8,7 @@ from hummingbot.connector.derivative.perpetual_budget_checker import PerpetualBu
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.perpetual_trading import PerpetualTrading
-from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.core.data_type.funding_info import FundingInfo
 from hummingbot.core.data_type.in_flight_order import PerpetualDerivativeInFlightOrder
 from hummingbot.core.data_type.perpetual_api_order_book_data_source import PerpetualAPIOrderBookDataSource
@@ -33,6 +33,7 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
 
         self._perpetual_trading = PerpetualTrading(self.trading_pairs)
         self._funding_info_listener_task: Optional[asyncio.Task] = None
+        self._mark_price_listener_task: Optional[asyncio.Task] = None
         self._funding_fee_polling_task: Optional[asyncio.Task] = None
         self._funding_fee_poll_notifier = asyncio.Event()
         self._orderbook_ds: PerpetualAPIOrderBookDataSource = self._orderbook_ds  # for type-hinting
@@ -95,6 +96,9 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
         await super().start_network()
         self._perpetual_trading.start()
         self._funding_info_listener_task = safe_ensure_future(self._listen_for_funding_info())
+        # Start separate mark price listener if supported by data source
+        if hasattr(self._orderbook_ds, 'listen_for_mark_price'):
+            self._mark_price_listener_task = safe_ensure_future(self._listen_for_mark_price())
         if self.is_trading_required:
             self._funding_fee_polling_task = safe_ensure_future(self._funding_payment_polling_loop())
 
@@ -207,6 +211,9 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
         if self._funding_info_listener_task is not None:
             self._funding_info_listener_task.cancel()
             self._funding_info_listener_task = None
+        if self._mark_price_listener_task is not None:
+            self._mark_price_listener_task.cancel()
+            self._mark_price_listener_task = None
         self._last_funding_fee_payment_ts.clear()
         await super().stop_network()
 
@@ -294,6 +301,18 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
     ) -> TradeFeeBase:
         raise NotImplementedError
 
+    def get_price_by_type(self, trading_pair: str, price_type: PriceType) -> Decimal:
+        """
+        Override to add MarkPrice support for perpetual derivatives.
+        For MarkPrice, returns the mark price from funding info.
+        For other price types, delegates to parent implementation.
+        """
+        if price_type is PriceType.MarkPrice:
+            funding_info = self.get_funding_info(trading_pair)
+            return funding_info.mark_price
+        # Delegate to parent implementation for other price types
+        return super().get_price_by_type(trading_pair, price_type)
+
     async def _status_polling_loop_fetch_updates(self):
         await safe_gather(
             self._update_positions(),
@@ -362,6 +381,15 @@ class PerpetualDerivativePyBase(ExchangePyBase, ABC):
     async def _listen_for_funding_info(self):
         await self._init_funding_info()
         await self._orderbook_ds.listen_for_funding_info(
+            output=self._perpetual_trading.funding_info_stream
+        )
+
+    async def _listen_for_mark_price(self):
+        """
+        Listen for mark price updates via WebSocket separately from funding rate.
+        Mark price updates are pushed to the same funding_info_stream but processed independently.
+        """
+        await self._orderbook_ds.listen_for_mark_price(
             output=self._perpetual_trading.funding_info_stream
         )
 

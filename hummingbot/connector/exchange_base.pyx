@@ -337,7 +337,7 @@ cdef class ExchangeBase(ConnectorBase):
 
     def get_price_by_type(self, trading_pair: str, price_type: PriceType) -> Decimal:
         """
-        Gets price by type (BestBid, BestAsk, MidPrice or LastTrade)
+        Gets price by type (BestBid, BestAsk, MidPrice, LastTrade, or MarkPrice)
         :param trading_pair: The market trading pair
         :param price_type: The price type
         :returns The price
@@ -350,6 +350,10 @@ cdef class ExchangeBase(ConnectorBase):
             return (self.c_get_price(trading_pair, True) + self.c_get_price(trading_pair, False)) / Decimal("2")
         elif price_type is PriceType.LastTrade:
             return Decimal(self.c_get_order_book(trading_pair).last_trade_price)
+        elif price_type is PriceType.MarkPrice:
+            # MarkPrice is only available for perpetual derivatives
+            # PerpetualDerivativePyBase overrides this method to provide mark price
+            raise NotImplementedError(f"MarkPrice is not supported for {self.name}. Use a perpetual derivative connector.")
 
     async def get_quote_price(self, trading_pair: str, is_buy: bool, amount: Decimal) -> Decimal:
         """

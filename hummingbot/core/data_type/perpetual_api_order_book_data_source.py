@@ -37,9 +37,13 @@ class PerpetualAPIOrderBookDataSource(OrderBookTrackerDataSource, ABC):
         raise NotImplementedError
 
     def _get_messages_queue_keys(self) -> List[str]:
-        return [
+        keys = [
             self._snapshot_messages_queue_key,
             self._diff_messages_queue_key,
             self._trade_messages_queue_key,
             self._funding_info_messages_queue_key,
         ]
+        # Add mark_price queue key if it exists (for connectors that support it)
+        if hasattr(self, '_mark_price_messages_queue_key'):
+            keys.append(self._mark_price_messages_queue_key)
+        return keys

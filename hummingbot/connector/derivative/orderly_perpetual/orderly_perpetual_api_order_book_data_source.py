@@ -76,6 +76,7 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._trading_pairs: List[str] = trading_pairs
         self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self._snapshot_messages_queue_key = "order_book_snapshot"
+        self._mark_price_messages_queue_key = "mark_price"
 
     @property
     def trading_rules_request_path(self) -> str:
@@ -208,6 +209,29 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                     "Unexpected error when processing public funding info updates from exchange"
                 )
                 await self._sleep(CONSTANTS.FUNDING_RATE_UPDATE_INTERVAL_SECOND)
+
+    async def listen_for_mark_price(self, output: asyncio.Queue):
+        """
+        Listen for mark price updates from WebSocket and push to funding info stream.
+        This is separate from funding rate polling and processes mark price updates independently.
+
+        Args:
+            output: Queue to push FundingInfoUpdate messages to
+        """
+        message_queue = self._message_queue[self._mark_price_messages_queue_key]
+        while True:
+            try:
+                mark_price_message = await message_queue.get()
+                await self._parse_mark_price_message(
+                    raw_message=mark_price_message,
+                    message_queue=output
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception(
+                    "Unexpected error when processing mark price updates from WebSocket"
+                )
 
     async def _request_complete_trading_rules(self) -> List[Dict[str, Any]]:
         """
@@ -509,6 +533,15 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 }
                 subscribe_trade_request = WSJSONRequest(payload=trades_payload)
 
+                # Subscribe to mark price channel
+                # Orderly format: {symbol}@markprice (e.g., "PERP_BTC_USDC@markprice")
+                mark_price_payload = {
+                    "id": f"{orderly_symbol}_markprice",
+                    "event": "subscribe",
+                    "topic": f"{orderly_symbol}@{CONSTANTS.WS_MARKPRICE_CHANNEL}"
+                }
+                subscribe_mark_price_request = WSJSONRequest(payload=mark_price_payload)
+
                 self.logger().debug(
                     f"[WEBSOCKET SUBSCRIBE] Sending orderbook subscription: {orderbook_payload}"
                 )
@@ -519,8 +552,13 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 )
                 await ws.send(subscribe_trade_request)
 
+                self.logger().debug(
+                    f"[WEBSOCKET SUBSCRIBE] Sending mark price subscription: {mark_price_payload}"
+                )
+                await ws.send(subscribe_mark_price_request)
+
                 self.logger().info(
-                    f"[WEBSOCKET SUBSCRIBE] Subscribed to public order book and trade channels for {trading_pair}"
+                    f"[WEBSOCKET SUBSCRIBE] Subscribed to public order book, trade, and mark price channels for {trading_pair}"
                 )
 
         except asyncio.CancelledError:
@@ -571,6 +609,8 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                     channel = self._snapshot_messages_queue_key
                 elif channel_name == CONSTANTS.WS_TRADES_CHANNEL:
                     channel = self._trade_messages_queue_key
+                elif channel_name == CONSTANTS.WS_MARKPRICE_CHANNEL:
+                    channel = self._mark_price_messages_queue_key
 
         return channel
 
@@ -773,6 +813,76 @@ class OrderlyPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             message_queue: Queue to push parsed message to
         """
         pass
+
+    async def _parse_mark_price_message(
+        self,
+        raw_message: Dict[str, Any],
+        message_queue: asyncio.Queue
+    ):
+        """
+        Parse mark price message from WebSocket and push FundingInfoUpdate to queue.
+
+        Orderly mark price message format (inferred from REST API structure):
+        {
+            "topic": "PERP_BTC_USDC@markprice",
+            "ts": 1698765432000,
+            "data": {
+                "symbol": "PERP_BTC_USDC",
+                "mark_price": 50000.0,
+                "index_price": 50001.0,  # Optional
+                "timestamp": 1698765432000
+            }
+        }
+
+        Args:
+            raw_message: Raw WebSocket message
+            message_queue: Queue to push FundingInfoUpdate to
+        """
+        try:
+            data = raw_message.get("data", {})
+            # Handle both dict and list formats (Orderly may send either)
+            if isinstance(data, list) and len(data) > 0:
+                data = data[0]
+
+            # Extract symbol from topic (e.g., "PERP_BTC_USDC@markprice" -> "PERP_BTC_USDC")
+            topic = raw_message.get("topic", "")
+            symbol = topic.split("@")[0] if "@" in topic else data.get("symbol")
+
+            if not symbol:
+                self.logger().warning(f"No symbol in mark price message: {raw_message}")
+                return
+
+            # Convert to Hummingbot trading pair
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
+
+            # Extract mark price from data
+            mark_price = Decimal(str(data.get("price", 0)))
+
+            if mark_price == 0:
+                self.logger().warning(f"Invalid mark price in message: {raw_message}")
+                return
+
+            # Extract index_price if available (some exchanges send both)
+            index_price = None
+            if "index_price" in data:
+                index_price = Decimal(str(data.get("index_price", 0)))
+
+            # Create FundingInfoUpdate with mark_price (and optionally index_price) updated
+            # Other fields (rate, next_funding_utc_timestamp) remain None
+            # and will be preserved from existing FundingInfo
+            funding_info_update = FundingInfoUpdate(
+                trading_pair=trading_pair,
+                mark_price=mark_price,
+                index_price=index_price if index_price else None,
+            )
+
+            message_queue.put_nowait(funding_info_update)
+
+        except Exception as e:
+            self.logger().error(
+                f"Error parsing mark price message: {e}",
+                exc_info=True
+            )
 
     async def _make_network_check_request(self) -> bool:
         """

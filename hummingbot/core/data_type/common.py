@@ -55,6 +55,7 @@ class PriceType(Enum):
     LastOwnTrade = 5
     InventoryCost = 6
     Custom = 7
+    MarkPrice = 8
 
 
 class TradeType(Enum):
