@@ -141,9 +141,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             ask_price = reservation_price * (Decimal("1") + ask_spread)
             
             # To make sure the limit maker orders are not immediately taken
-            if bid_price >= best_ask_price or ask_price <= best_bid_price:
-                bid_price = mid_price * (Decimal("1") - bid_spread)
-                ask_price = mid_price * (Decimal("1") + ask_spread)
+            # Only the offending side is adjusted
+            if bid_price >= best_ask_price:
+                bid_price = mid_price # or best_ask_price - 1 tick
+
+            if ask_price <= best_bid_price:
+                ask_price = mid_price # or best_bid_price + 1 tick
                 
             # Convert quote amount to base amount for both buy and sell orders
             # For perpetual orders, amount must be in base currency (BTC), not quote (USDC)
@@ -345,7 +348,8 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         # Calculate absolute inventory ratio
         abs_inventory = abs(inventory)
         inventory_ratio = abs_inventory / self.config.max_inventory
-        
+        inventory_ratio = min(inventory_ratio, Decimal("1"))
+
         # If position size <= 25% max position size, no adjustment
         if inventory_ratio <= Decimal("0.25"):
             return reference_price
