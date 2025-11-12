@@ -1,7 +1,7 @@
 import logging
 import os
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from pydantic import Field
@@ -97,7 +97,17 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         This ensures old orders are cancelled before new ones are placed.
         """
         # First, cancel all active orders and wait for completion
-        await self._async_cancel_all_orders()
+        cancel_results = await self._async_cancel_all_orders()
+        
+        # Verify cancellation succeeded before placing new orders
+        if cancel_results is not None:
+            # Check if any cancel failed
+            if any(not result.get("success", False) for result in cancel_results):
+                self.logger().warning(
+                    "Some orders failed to cancel. Skipping new order placement this cycle."
+                )
+                return
+        
         # Then place new orders
         await self._async_place_orders(proposal)
         
@@ -202,7 +212,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         # Call batch_order_create and wait for completion
         await connector.batch_order_create(orders_to_create)
         
-    async def _async_cancel_all_orders(self):
+    async def _async_cancel_all_orders(self) -> Optional[List[Dict[str, Any]]]:
         """Cancel all active orders using batch API and wait for completion"""
         connector = self.connectors[self.config.exchange]
         
@@ -246,19 +256,20 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                     f"but all are already {orders_skipped} filled/cancelled/failed. "
                     f"No cancellation needed."
                 )
+            return []
         
         # Use batch cancellation if we have orders to cancel and wait for completion
-        if orders_to_cancel:
-            try:
-                self.logger().debug(
-                    f"Cancelling {len(orders_to_cancel)} active order(s) for {self.config.trading_pair}"
-                )
-                await connector.batch_order_cancel(orders_to_cancel)
-            except Exception as e:
-                self.logger().warning(
-                    f"Error cancelling orders: {e}. "
-                    f"This may be normal if orders were already cancelled."
-                )
+        try:
+            self.logger().debug(
+                f"Cancelling {len(orders_to_cancel)} active order(s) for {self.config.trading_pair}"
+            )
+            return await connector.batch_order_cancel(orders_to_cancel)
+        except Exception as e:
+            self.logger().warning(
+                f"Error cancelling orders: {e}. "
+                f"This may be normal if orders were already cancelled."
+            )
+            return None
         
     def did_fill_order(self, event: OrderFilledEvent):
         """
