@@ -213,11 +213,14 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         # Collect InFlightOrder objects for orders to cancel
         orders_to_cancel = []
         orders_skipped = 0
+        total_orders_checked = 0
         
         for in_flight_order in all_in_flight_orders.values():
             # Filter by current trading pair only
             if in_flight_order.trading_pair != self.config.trading_pair:
                 continue
+            
+            total_orders_checked += 1
             
             # Check if order is actually still open
             if in_flight_order.is_open:
@@ -230,9 +233,26 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                 )
                 orders_skipped += 1
         
+        # Log when no orders are found to cancel (important for debugging)
+        if not orders_to_cancel:
+            if total_orders_checked == 0:
+                self.logger().debug(
+                    f"No active orders found for {self.config.trading_pair} to cancel. "
+                    f"This may be normal if all orders were already filled/cancelled."
+                )
+            else:
+                self.logger().info(
+                    f"Found {total_orders_checked} order(s) for {self.config.trading_pair}, "
+                    f"but all are already {orders_skipped} filled/cancelled/failed. "
+                    f"No cancellation needed."
+                )
+        
         # Use batch cancellation if we have orders to cancel and wait for completion
         if orders_to_cancel:
             try:
+                self.logger().debug(
+                    f"Cancelling {len(orders_to_cancel)} active order(s) for {self.config.trading_pair}"
+                )
                 await connector.batch_order_cancel(orders_to_cancel)
             except Exception as e:
                 self.logger().warning(

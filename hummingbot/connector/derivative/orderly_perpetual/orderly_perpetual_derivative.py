@@ -1285,34 +1285,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             if not response.get("success", False):
                 # Check if this is an "order not found" error (acceptable for partial success)
                 error_msg = str(response)
-                if self._is_order_not_found_during_cancelation_error(Exception(error_msg)):
-                    self.logger().warning(
-                        f"[BATCH CANCEL] Some orders not found (may already be cancelled/filled): {response}"
-                    )
-                    # Process all orders as cancelled through order tracker
-                    timestamp = self.current_timestamp
-                    for order in orders_to_cancel:
-                        order_update = OrderUpdate(
-                            client_order_id=order.client_order_id,
-                            exchange_order_id=order.exchange_order_id,
-                            trading_pair=order.trading_pair,
-                            update_timestamp=timestamp,
-                            new_state=OrderState.CANCELED,
-                        )
-                        self._order_tracker.process_order_update(order_update)
-
-                    # Return partial success results
-                    return [
-                        {
-                            "client_order_id": order.client_order_id,
-                            "success": True,  # Consider as success if order doesn't exist
-                            "error_message": "Order not found (already cancelled/filled)"
-                        }
-                        for order in orders_to_cancel
-                    ]
-                else:
-                    self.logger().error(f"[BATCH CANCEL] Batch cancellation failed: {response}")
-                    raise IOError(f"Batch order cancellation failed: {response}")
+                self.logger().error(f"[BATCH CANCEL] Batch cancellation failed: {response}")
+                raise IOError(f"Batch order cancellation failed: {response}")
 
             # Process response through order tracker
             data = response.get("data", {})
@@ -1366,25 +1340,33 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                             f"[BATCH CANCEL] Order {order.client_order_id} cancellation failed: {error_message}"
                         )
                 else:
-                    # Order not found in response - might already be cancelled
-                    # Process as cancelled through order tracker
-                    order_update = OrderUpdate(
-                        client_order_id=order.client_order_id,
-                        exchange_order_id=order.exchange_order_id,
-                        trading_pair=order.trading_pair,
-                        update_timestamp=timestamp,
-                        new_state=OrderState.CANCELED,
+                    self.logger().error(
+                        f"[BATCH CANCEL] Order {order.client_order_id} not found in response"
                     )
-                    self._order_tracker.process_order_update(order_update)
-
                     results.append({
                         "client_order_id": order.client_order_id,
                         "success": True,  # Consider as success (order doesn't exist)
                         "error_message": "Order not found in response (already cancelled)"
                     })
-                    self.logger().warning(
-                        f"[BATCH CANCEL] Order {order.client_order_id} not found in response - marking as cancelled"
-                    )
+                    # # Order not found in response - might already be cancelled
+                    # # Process as cancelled through order tracker
+                    # order_update = OrderUpdate(
+                    #     client_order_id=order.client_order_id,
+                    #     exchange_order_id=order.exchange_order_id,
+                    #     trading_pair=order.trading_pair,
+                    #     update_timestamp=timestamp,
+                    #     new_state=OrderState.CANCELED,
+                    # )
+                    # self._order_tracker.process_order_update(order_update)
+
+                    # results.append({
+                    #     "client_order_id": order.client_order_id,
+                    #     "success": True,  # Consider as success (order doesn't exist)
+                    #     "error_message": "Order not found in response (already cancelled)"
+                    # })
+                    # self.logger().warning(
+                    #     f"[BATCH CANCEL] Order {order.client_order_id} not found in response - marking as cancelled"
+                    # )
 
             success_count = sum(1 for result in results if result["success"])
             self.logger().info(

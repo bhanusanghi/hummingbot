@@ -172,6 +172,17 @@ class PerpetualTrading:
             try:
                 funding_info_message: FundingInfoUpdate = await self._funding_info_stream.get()
                 trading_pair = funding_info_message.trading_pair
+                
+                # Check if funding info has been initialized for this trading pair
+                if trading_pair not in self._funding_info:
+                    # Funding info not yet initialized - skip this update
+                    # It will be initialized by _init_funding_info() and subsequent updates will be processed
+                    self.logger().debug(
+                        f"Funding info for {trading_pair} not yet initialized, skipping update. "
+                        f"Will be initialized shortly."
+                    )
+                    continue
+                
                 funding_info = self._funding_info[trading_pair]
                 funding_info.update(funding_info_message)
             except asyncio.CancelledError:
