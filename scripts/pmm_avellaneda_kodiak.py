@@ -23,14 +23,12 @@ class PMMAvellanedaMultiConfig(BaseClientModel):
     exchange: str = Field("orderly_perpetual")
     trading_pair: str = Field("BTC-USDC")
     order_amount_quote: Decimal = Field(20)
-    risk_aversion_gamma: Decimal = Field(6.0)
-    volatility_sigma: Decimal = Field(0.50)
-    risk_horizon_tau_hours: Decimal = Field(2.0)
     bid_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
     ask_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
     order_refresh_time: int = Field(10)
     max_inventory: Decimal = Field(0.01) # 1k usd
-    leverage: int = Field(10)
+    max_price_adjustment: Decimal = Field(default=Decimal("0.001")) #  10 bps
+    leverage: int = Field(100)
     
     # target_inventory: Decimal = Field(0.0)
     
@@ -69,7 +67,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         super().__init__(connectors)
         self.config = config
         self._last_update_timestamp: float = 0
-        self._cached_mid_price: Decimal = Decimal("0")
+        self._cached_mark_price: Decimal = Decimal("0")
         self._cached_reservation_price: Decimal = Decimal("0")
         
         # DataFrame to store last 6 filled orders
@@ -114,12 +112,16 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         connector = self.connectors[self.config.exchange]
         # Use mark price from exchange instead of mid price
         mark_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MarkPrice)
+        best_bid_price = connector.get_price_by_type(self.config.trading_pair, PriceType.BestBid)
+        best_ask_price = connector.get_price_by_type(self.config.trading_pair, PriceType.BestAsk)
+        mid_price = (best_bid_price + best_ask_price) / 2
+        
         inventory = self._get_current_inventory()
         
-        reservation_price = self._calculate_reservation_price(mark_price, inventory)
-        
+        reservation_price = self._get_reservation_price(mark_price, inventory)
+
         # Cache values for status reporting
-        self._cached_mid_price = mark_price
+        self._cached_mark_price = mark_price
         self._cached_reservation_price = reservation_price
         
         orders = []
@@ -127,7 +129,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             ask_spread = self.config.ask_spread_levels[idx]
             bid_price = reservation_price * (Decimal("1") - bid_spread)
             ask_price = reservation_price * (Decimal("1") + ask_spread)
-
+            
+            # To make sure the limit maker orders are not immediately taken
+            if bid_price >= best_ask_price or ask_price <= best_bid_price:
+                bid_price = mid_price * (Decimal("1") - bid_spread)
+                ask_price = mid_price * (Decimal("1") + ask_spread)
+                
             # Convert quote amount to base amount for both buy and sell orders
             # For perpetual orders, amount must be in base currency (BTC), not quote (USDC)
             bid_amount = Decimal(self.config.order_amount_quote) / bid_price
@@ -153,12 +160,15 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                 leverage=Decimal(self.config.leverage)
             )
             
-            current_inventory = self._get_current_inventory()
-            if current_inventory >= self.config.max_inventory:
+            # Inventory-based order placement logic:
+            if inventory >= self.config.max_inventory:
+                # At max long position, only place ask orders to reduce position
                 orders.extend([ask_order])
-            elif current_inventory <= -self.config.max_inventory:
+            elif inventory <= -self.config.max_inventory:
+                # At max short position, only place bid orders to reduce position
                 orders.extend([bid_order])
             else:
+                # Normal market making: place both sides
                 orders.extend([bid_order, ask_order])
         return orders
 
@@ -290,30 +300,41 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         else:
             return Decimal("0")
 
-    def _calculate_reservation_price(self, mid_price: Decimal, inventory: Decimal) -> Decimal:
+    def _get_reservation_price(self, reference_price: Decimal, inventory: Decimal) -> Decimal:
         """
-        Calculate reservation price using Avellaneda-Stoikov formula:
-        r = s - q·γ·σ²·τ
+        Calculate reservation price with inventory-based adjustment.
         
-        Where:
-        - s = mid_price
-        - q = inventory (signed, positive for long, negative for short)
-        - γ = risk_aversion_gamma
-        - σ = volatility_sigma (annualized)
-        - τ = risk_horizon_tau_hours / 8760 (convert hours to years)
+        Logic:
+        - If abs(position_size) <= 25% of max_position_size: no adjustment
+        - Else: linearly increasing adjustment from 0% at 25% to max_adjustment at 100%
+        
+        For long positions (inventory > 0): lower reservation price to encourage selling
+        For short positions (inventory < 0): raise reservation price to encourage buying
         """
-        # Convert tau from hours to years
-        tau_years = self.config.risk_horizon_tau_hours / Decimal("8760")
+        # Calculate absolute inventory ratio
+        abs_inventory = abs(inventory)
+        inventory_ratio = abs_inventory / self.config.max_inventory
         
+        # If position size <= 25% max position size, no adjustment
+        if inventory_ratio <= Decimal("0.25"):
+            return reference_price
         
-        # Calculate inventory adjustment: q·γ·σ²·τ
-        inventory_adjustment = inventory * self.config.risk_aversion_gamma * \
-                               (self.config.volatility_sigma ** Decimal("2")) * tau_years
+        # Linearly increasing adjustment from 0 at 25% to max_adjustment at 100%
+        # Formula: adjustment = (ratio - 0.25) / (1.0 - 0.25) * max_adjustment
+        adjustment_ratio = (inventory_ratio - Decimal("0.25")) / Decimal("0.75")
+        adjustment = adjustment_ratio * self.config.max_price_adjustment
         
-        # Reservation price: r = s - q·γ·σ²·τ
-        reservation_price = mid_price - inventory_adjustment
+        # Apply adjustment with correct sign:
+        # - Long position (inventory > 0): lower price (subtract adjustment)
+        # - Short position (inventory < 0): raise price (add adjustment)
+        if inventory > 0:
+            reservation_price = reference_price * (Decimal("1") - adjustment)
+        else:
+            reservation_price = reference_price * (Decimal("1") + adjustment)
         
         return reservation_price
+        
+        
 
     def format_status(self) -> str:
         """
@@ -323,7 +344,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             return "Market connectors are not ready."
         
         # Use cached values instead of making connector calls
-        mark_price = self._cached_mid_price  # Note: variable name kept for compatibility, but contains mark price
+        mark_price = self._cached_mark_price  # Note: variable name kept for compatibility, but contains mark price
         reservation_price = self._cached_reservation_price
         inventory = self._get_current_inventory()
         
