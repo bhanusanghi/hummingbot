@@ -8,7 +8,7 @@ from pydantic import Field
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.data_type.common import OrderType, PriceType, PositionAction, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, PositionAction, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
 from hummingbot.core.event.events import (
@@ -68,7 +68,6 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     def __init__(self, connectors: Dict[str, ConnectorBase], config: PMMAvellanedaMultiConfig):
         super().__init__(connectors)
         self.config = config
-        self._current_inventory: Decimal = Decimal("0")
         self._last_update_timestamp: float = 0
         self._cached_mid_price: Decimal = Decimal("0")
         self._cached_reservation_price: Decimal = Decimal("0")
@@ -154,9 +153,10 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                 leverage=Decimal(self.config.leverage)
             )
             
-            if self._current_inventory >= self.config.max_inventory:
+            current_inventory = self._get_current_inventory()
+            if current_inventory >= self.config.max_inventory:
                 orders.extend([bid_order])
-            elif self._current_inventory <= -self.config.max_inventory:
+            elif current_inventory <= -self.config.max_inventory:
                 orders.extend([ask_order])
             else:
                 orders.extend([bid_order, ask_order])
@@ -233,18 +233,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     def did_fill_order(self, event: OrderFilledEvent):
         """
         Called automatically by framework when order is filled.
-        Update tracked order state and inventory position based on order fills.
-        For perpetual futures:
-        - BUY fill increases inventory (long position)
-        - SELL fill decreases inventory (short position)
+        Logs the fill and updates the filled orders DataFrame.
+        Note: Inventory is now retrieved from the connector's actual position,
+        not tracked manually from fills.
         """
-        # Update inventory based on fill direction
-        if event.trade_type == TradeType.BUY:
-            # BUY fill = we bought, inventory increases (long position)
-            self._current_inventory += event.amount
-        elif event.trade_type == TradeType.SELL:
-            # SELL fill = we sold, inventory decreases (short position)
-            self._current_inventory -= event.amount
+        # Get current inventory from connector's actual position
+        current_inventory = self._get_current_inventory()
         
         # Add fill to DataFrame
         try:
@@ -258,7 +252,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             "Side": event.trade_type.name,
             "Amount": float(event.amount),
             "Price": float(event.price),
-            "Inventory": float(self._current_inventory)
+            "Inventory": float(current_inventory)
         }])
         self._filled_orders_df = pd.concat([self._filled_orders_df, new_row], ignore_index=True)
         
@@ -267,20 +261,34 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             self._filled_orders_df = self._filled_orders_df.tail(6).reset_index(drop=True)
         
         msg = (f"{event.trade_type.name} {round(event.amount, 2)} {event.trading_pair} "
-               f"{self.config.exchange} at {round(event.price, 2)} | Inventory: {self._current_inventory:.8f}")
+               f"{self.config.exchange} at {round(event.price, 2)} | Inventory: {current_inventory:.8f}")
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
 
     def _get_current_inventory(self) -> Decimal:
         """
-        Get current inventory position tracked internally from order fills.
+        Get current inventory position from the connector's actual position.
         Returns signed position amount: positive for long, negative for short.
         
-        Position is tracked by accumulating fills:
-        - BUY fills increase inventory (long position)
-        - SELL fills decrease inventory (short position)
+        For perpetual futures in ONEWAY mode:
+        - Gets the actual position from the exchange via connector
+        - Converts to signed value: positive for long, negative for short
         """
-        return self._current_inventory
+        connector = self.connectors[self.config.exchange]
+        
+        # For ONEWAY mode, get position by trading pair (no side needed)
+        position = connector._perpetual_trading.get_position(self.config.trading_pair)
+        
+        if position is None:
+            return Decimal("0")
+        
+        # Convert to signed inventory: positive for long, negative for short
+        if position.position_side == PositionSide.LONG:
+            return position.amount
+        elif position.position_side == PositionSide.SHORT:
+            return -position.amount
+        else:
+            return Decimal("0")
 
     def _calculate_reservation_price(self, mid_price: Decimal, inventory: Decimal) -> Decimal:
         """
@@ -316,7 +324,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         # Use cached values instead of making connector calls
         mark_price = self._cached_mid_price  # Note: variable name kept for compatibility, but contains mark price
         reservation_price = self._cached_reservation_price
-        inventory = self._current_inventory
+        inventory = self._get_current_inventory()
         
         lines = []
         lines.append("")
