@@ -111,7 +111,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         
         # Verify cancellation succeeded before placing new orders
         if cancel_results is None:
-            self.logger().warning("Some orders failed to cancel. Skipping new order placement this cycle.")
+            self.logger().warning("cancel_results is None. Skipping new order placement this cycle.")
             return
 
         if cancel_results is not None:
