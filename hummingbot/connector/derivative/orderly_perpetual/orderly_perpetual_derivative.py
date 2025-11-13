@@ -1237,7 +1237,23 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         # Build API request
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
 
-        if use_exchange_ids:
+        cancel_all = True
+        if cancel_all:
+            url = web_utils.public_rest_url(
+                CONSTANTS.CANCEL_ALL_ORDERS_URL,
+                domain=self._domain
+            )
+            throttler_limit_id = CONSTANTS.TRADING_LIMIT_ID
+
+            params = {
+                "symbol": exchange_symbols[0],
+            }
+
+            self.logger().info(
+                f"[CANCEL ALL] Cancelling all order for ${exchange_symbols[0]}"
+            )
+
+        elif use_exchange_ids:
             # Use DELETE /v1/batch-order with exchange order_ids
             url = web_utils.public_rest_url(
                 CONSTANTS.BATCH_CANCEL_ORDER_URL,
