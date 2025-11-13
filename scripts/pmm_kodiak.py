@@ -72,7 +72,6 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: PMMAvellanedaMultiConfig):
         super().__init__(connectors)
-        # self.current_timestamp = None
         self.config = config
         self._last_update_timestamp: float = 0
         self._cached_mark_price: Decimal = Decimal("0")
