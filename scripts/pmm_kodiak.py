@@ -91,15 +91,15 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
     
     def on_tick(self):
-        # if waiting for cooldown - don't have any* active orders
-        if self.current_timestamp < self._cooldown_until_timestamp:
-            safe_ensure_future(self._async_cancel_all_orders())
-
         if self.create_timestamp <= self.current_timestamp:
-            proposals: List[PerpetualOrderCandidate] = self.create_proposal()
-            proposal_adjusted: List[PerpetualOrderCandidate] = proposals #temp skip this branch #self.adjust_proposal_to_budget(proposals)
-            # Execute cancel then place sequentially to avoid order accumulation
-            safe_ensure_future(self._cancel_and_place_orders(proposal_adjusted))
+
+            if self.current_timestamp < self._cooldown_until_timestamp:
+                safe_ensure_future(self._async_cancel_all_orders()) # if waiting for cooldown - just cancel orders and return
+            else:
+                proposals: List[PerpetualOrderCandidate] = self.create_proposal()
+                proposal_adjusted: List[PerpetualOrderCandidate] = proposals #temp skip this branch #self.adjust_proposal_to_budget(proposals)
+                safe_ensure_future(self._cancel_and_place_orders(proposal_adjusted)) # Execute cancel then place sequentially to avoid order accumulation
+
             self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
     
     async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
