@@ -76,8 +76,8 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._last_update_timestamp: float = 0
         self._cached_mark_price: Decimal = Decimal("0")
         self._cached_reservation_price: Decimal = Decimal("0")
-        self._cooldown_until_timestamp: float = 0  # Timestamp until which we're in cooldown
-        
+        self._cooldown_until_timestamp: float = 0
+
         # DataFrame to store last 6 filled orders
         self._filled_orders_df: pd.DataFrame = pd.DataFrame(columns=[
             "Timestamp", "Order ID", "Side", "Amount", "Price", "Inventory"
@@ -91,7 +91,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
     
     def on_tick(self):
-        if self.create_timestamp <= self.current_timestamp:
+        if self.current_timestamp > self.create_timestamp:
 
             if self.current_timestamp < self._cooldown_until_timestamp:
                 safe_ensure_future(self._async_cancel_all_orders()) # if waiting for cooldown - just cancel orders and return
@@ -99,8 +99,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                 proposals: List[PerpetualOrderCandidate] = self.create_proposal()
                 proposal_adjusted: List[PerpetualOrderCandidate] = proposals #temp skip this branch #self.adjust_proposal_to_budget(proposals)
                 safe_ensure_future(self._cancel_and_place_orders(proposal_adjusted)) # Execute cancel then place sequentially to avoid order accumulation
-
-            self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
+                self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
     
     async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
         """
@@ -111,12 +110,13 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         cancel_results = await self._async_cancel_all_orders()
         
         # Verify cancellation succeeded before placing new orders
+        if cancel_results is None:
+            self.logger().warning("Some orders failed to cancel. Skipping new order placement this cycle.")
+            return
+
         if cancel_results is not None:
-            # Check if any cancel failed
             if any(not result.get("success", False) for result in cancel_results):
-                self.logger().warning(
-                    "Some orders failed to cancel. Skipping new order placement this cycle."
-                )
+                self.logger().warning("Some orders failed to cancel. Skipping new order placement this cycle.")
                 return
         
         # Then place new orders
@@ -444,6 +444,9 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Total Filled Sell Orders: {self.total_sell_orders:.2f}")
         lines.append(f"    Total Buy Volume: {self.total_buy_volume:.2f}")
         lines.append(f"    Total Sell Volume: {self.total_sell_volume:.2f}")
+        lines.append(f"    Order cooldown timestamp: {self._cooldown_until_timestamp}")
+        lines.append(f"    Current timestamp: {self.current_timestamp}")
+        lines.append(f"    Create timestamp: {self.create_timestamp}")
         
         # Display last 6 filled orders (most recent last)
         if len(self._filled_orders_df) > 0:
