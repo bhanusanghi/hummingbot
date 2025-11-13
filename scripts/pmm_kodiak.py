@@ -60,6 +60,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     create_timestamp = 0
     account_config_set = False
     
+    total_sell_orders = 0
+    total_buy_orders = 0
+    total_sell_volume = 0
+    total_buy_volume = 0
+
+    
     @classmethod
     def init_markets(cls, config: PMMAvellanedaMultiConfig):
         cls.markets = {config.exchange: {config.trading_pair}}
@@ -311,6 +317,13 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         # Get current inventory from connector's actual position
         current_inventory = self._get_current_inventory()
         
+        if event.trade_type == TradeType.BUY:
+            self.total_buy_orders += 1
+            self.total_buy_volume += event.amount * event.price
+        elif event.trade_type == TradeType.SELL:
+            self.total_sell_orders += 1
+            self.total_sell_volume += event.amount * event.price
+
         # Add fill to DataFrame
         try:
             timestamp = pd.Timestamp.fromtimestamp(event.timestamp) if event.timestamp else pd.Timestamp.now()
@@ -428,14 +441,10 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Spread Levels: {[f'{s*100:.4f}%' for s in self.config.ask_spread_levels]}")
         lines.append(f"    Bid Spread Levels: {[f'{s*100:.4f}%' for s in self.config.bid_spread_levels]}")
         
-        try:
-            df = self.active_orders_df()
-            lines.append("")
-            lines.append("  Active Orders:")
-            lines.extend(["    " + line for line in df.to_string(index=False).split("\n")])
-        except ValueError:
-            lines.append("")
-            lines.append("  No active orders.")
+        lines.append(f"    Total Filled Buy Orders: {self.total_buy_orders:.2f}")
+        lines.append(f"    Total Filled Sell Orders: {self.total_sell_orders:.2f}")
+        lines.append(f"    Total Buy Volume: {self.total_buy_volume:.2f}")
+        lines.append(f"    Total Sell Volume: {self.total_sell_volume:.2f}")
         
         # Display last 6 filled orders (most recent last)
         if len(self._filled_orders_df) > 0:
