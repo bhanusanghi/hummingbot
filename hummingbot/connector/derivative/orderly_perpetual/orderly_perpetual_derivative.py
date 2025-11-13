@@ -453,13 +453,15 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         """Check if error is due to order not found during cancel"""
         error_str = str(cancelation_exception)
+        self.logger().info(error_str)
+        self.logger().info("-1005" in error_str)
         return (
             CONSTANTS.ORDER_NOT_EXIST_MESSAGE in error_str
             or CONSTANTS.ORDER_ALREADY_CANCELLED_MESSAGE in error_str
             or CONSTANTS.ORDER_ALREADY_FILLED_MESSAGE in error_str
             or CONSTANTS.CANCELLING_COMPLETED_ORDER_MESSAGE in error_str
             or f"'code': {CONSTANTS.ORDER_NOT_FOUND_ERROR_CODE}" in error_str  # Check code -1006
-            or ("-1005" in error_str and "order" in error_str.lower() and "invalid" in error_str.lower())  # -1005 "The order ID is invalid"
+            or ("-1005" in error_str and "order" in error_str.lower() and "invalid" in error_str.lower())# -1005 "The order ID is invalid"
         )
 
     # ============================================================
@@ -1292,7 +1294,9 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 # Check if this is an "order not found/invalid" error - orders don't exist on exchange
                 error_msg = str(response)
                 error_exception = IOError(f"Batch order cancellation failed: {response}")
-                
+
+                is_order_not_found = self._is_order_not_found_during_cancelation_error(error_exception)
+                self.logger().info("is_order_not_found: ", is_order_not_found)
                 if self._is_order_not_found_during_cancelation_error(error_exception):
                     # Orders don't exist on exchange - mark all as cancelled locally
                     self.logger().warning(
