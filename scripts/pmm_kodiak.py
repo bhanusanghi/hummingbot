@@ -65,6 +65,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: PMMAvellanedaMultiConfig):
         super().__init__(connectors)
+        self.current_timestamp = None
         self.config = config
         self._last_update_timestamp: float = 0
         self._cached_mark_price: Decimal = Decimal("0")
@@ -79,7 +80,6 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         """Get InFlightOrder from connector's order tracker"""
         connector = self.connectors[self.config.exchange]
         return connector._order_tracker.fetch_order(client_order_id=order_id)
-
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
     
@@ -136,24 +136,28 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         best_ask_size = Decimal(str(asks_df.iloc[0].amount))
             
         mid_price = (best_bid_price + best_ask_price) / 2
-        
-        mid_price_weighted = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (best_bid_size + best_ask_size)
+
+        if best_bid_size + best_ask_size > 0:
+            mid_price = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (best_bid_size + best_ask_size)
         
         # self.logger().info(f"Mid price: {mid_price}, Mid price weighted: {mid_price_weighted}, bid_size: {best_bid_size}, ask_size: {best_ask_size}, Difference: {mid_price_weighted - mid_price}")
         
         inventory = self._get_current_inventory()
         
-        reservation_price = self._get_reservation_price(mark_price, inventory)
+        reservation_price_mark = self._get_reservation_price(mark_price, inventory)
+        reservation_price_mid = self._get_reservation_price(mid_price, inventory)
 
         # Cache values for status reporting
         self._cached_mark_price = mark_price
-        self._cached_reservation_price = reservation_price
+        self._cached_mid_price = mid_price
+        self._cached_reservation_price_mark = reservation_price_mark
+        self._cached_reservation_price_mid = reservation_price_mid
         
         orders = []
         for idx, bid_spread in enumerate(self.config.bid_spread_levels):
             ask_spread = self.config.ask_spread_levels[idx]
-            bid_price = reservation_price * (Decimal("1") - bid_spread)
-            ask_price = reservation_price * (Decimal("1") + ask_spread)
+            bid_price = min(reservation_price_mid, reservation_price_mark) * (Decimal("1") - bid_spread)
+            ask_price = max(reservation_price_mid, reservation_price_mark) * (Decimal("1") + ask_spread)
             
             # To make sure the limit maker orders are not immediately taken
             # Only the offending side is adjusted
@@ -393,9 +397,11 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         if not self.ready_to_trade:
             return "Market connectors are not ready."
         
-        # Use cached values instead of making connector calls
-        mark_price = self._cached_mark_price  # Note: variable name kept for compatibility, but contains mark price
-        reservation_price = self._cached_reservation_price
+
+        mark_price = self._cached_mark_price
+        mid_price = self._cached_mid_price
+        reservation_price_mark = self._cached_reservation_price_mark
+        reservation_price_mid = self._cached_reservation_price_mid
         inventory = self._get_current_inventory()
         
         lines = []
@@ -404,8 +410,11 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Trading Pair: {self.config.trading_pair}")
         lines.append(f"    Exchange: {self.config.exchange}")
         lines.append(f"    Mark Price: {mark_price:.8f}")
-        lines.append(f"    Reservation Price: {reservation_price:.8f}")
-        lines.append(f"    Price Adjustment: {reservation_price - mark_price:.8f}")
+        lines.append(f"    Mid Price: {mid_price:.8f}")
+        lines.append(f"    Reservation Price Mid: {reservation_price_mid:.8f}")
+        lines.append(f"    Reservation Price Mark: {reservation_price_mark:.8f}")
+        lines.append(f"    Price Adjustment Mid: {reservation_price_mid - mid_price:.8f}")
+        lines.append(f"    Price Adjustment Mark: {reservation_price_mark - mark_price:.8f}")
         lines.append(f"    Current Inventory: {inventory:.8f}")
         lines.append(f"    Max Inventory: {self.config.max_inventory:.8f}")
         lines.append(f"    Spread Levels: {[f'{s*100:.4f}%' for s in self.config.ask_spread_levels]}")
