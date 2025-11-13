@@ -1,6 +1,7 @@
 exchange: orderly_perpetual
 trading_pair: BTC-USDC
-order_amount_quote: 20
+order_amount_quote: [20]
+order_cooldown: 10 # 10 seconds
 bid_spread_levels: [0.0005]
 ask_spread_levels: [0.0005]
 order_refresh_time: 10
