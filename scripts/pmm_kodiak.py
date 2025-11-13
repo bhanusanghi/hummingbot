@@ -291,7 +291,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
 
         # Use batch cancellation if we have orders to cancel and wait for completion
         try:
-            self.logger().info(
+            self.logger().debug(
                 f"Cancelling {len(orders_to_cancel)} active order(s) for {self.config.trading_pair}"
             )
 
