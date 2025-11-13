@@ -453,8 +453,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         """Check if error is due to order not found during cancel"""
         error_str = str(cancelation_exception)
-        self.logger().info(error_str)
-        self.logger().info("-1005" in error_str)
         return (
             CONSTANTS.ORDER_NOT_EXIST_MESSAGE in error_str
             or CONSTANTS.ORDER_ALREADY_CANCELLED_MESSAGE in error_str
@@ -1257,10 +1255,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().info(
                 f"[BATCH CANCEL] Cancelling {len(exchange_order_ids)} orders by exchange_order_id"
             )
-
-            for exchange_order_id in exchange_order_ids:
-                self.logger().info(f"Batch cancelling ${exchange_order_id}")
-
 
         else:
             # Use DELETE /v1/client/batch-order with client_order_ids
