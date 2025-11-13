@@ -6,7 +6,7 @@ ask_spread_levels: [0.0003, 0.0006] #in bps
 order_refresh_time: 3 #in seconds
 max_inventory: 1 #in ETH terms
 max_price_adjustment: 0.0012 #0.12% maximum skew to fair price at max inventory
-min_inventory_pct_for_adjustment: 0.25 #25% of max inventory: no adjustment
+min_inventory_pct_for_adjustment: 0.2 #25% of max inventory: no adjustment
 max_spread_widening: 0.5 #spreads widen up to 50%
-size_randomization: 0.25 #25%
+randomization: 0.2 #20%
 leverage: 100

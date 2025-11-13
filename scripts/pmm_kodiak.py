@@ -32,7 +32,7 @@ class PMMAvellanedaMultiConfig(BaseClientModel):
     min_inventory_pct_for_adjustment: Decimal = Field(default=Decimal("0.25"))
     max_price_adjustment: Decimal = Field(default=Decimal("0.001")) #  10 bps
     max_spread_widening: Decimal = Field(default=Decimal("0.5"))  # spreads widen up to 50%
-    size_randomization: Decimal = Field(default=Decimal("0.25"))  # 25%
+    randomization: Decimal = Field(default=Decimal("0.25"))  # 25%
     leverage: int = Field(100)
     
     # target_inventory: Decimal = Field(0.0)
@@ -83,7 +83,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._cached_reservation_price_mark: Decimal = Decimal("0")
         self._cached_reservation_price_mid: Decimal = Decimal("0")
         self._cached_spread_widening_factor: Decimal = Decimal("0")
-        self._cached_size_random_factor: Decimal = Decimal("0")
+        self._cached_random_factor: Decimal = Decimal("0")
         # self._cooldown_until_timestamp: float = 0
 
         # DataFrame to store last 6 filled orders
@@ -171,15 +171,15 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         spread_widening_factor = Decimal("1") + self._linear_inventory_factor(inventory) * self.config.max_spread_widening
         self._cached_spread_widening_factor = spread_widening_factor
 
-        random_factor = self._size_random_factor()
-        self._cached_size_random_factor = random_factor
+        random_factor = self._random_factor()
+        self._cached_random_factor = random_factor
 
         orders = []
         for idx, bid_spread in enumerate(self.config.bid_spread_levels):
             ask_spread = self.config.ask_spread_levels[idx]
 
-            bid_price = min(reservation_price_mid, reservation_price_mark) * (Decimal("1") - bid_spread * spread_widening_factor)
-            ask_price = max(reservation_price_mid, reservation_price_mark) * (Decimal("1") + ask_spread * spread_widening_factor)
+            bid_price = min(reservation_price_mid, reservation_price_mark) * (Decimal("1") - bid_spread * spread_widening_factor * random_factor)
+            ask_price = max(reservation_price_mid, reservation_price_mark) * (Decimal("1") + ask_spread * spread_widening_factor * random_factor)
             
             # To make sure the limit maker orders are not immediately taken
             # Only the offending side is adjusted, but still respecting the spread level
@@ -428,12 +428,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         # factor is simply r (not rescaled)
         return inventory_ratio
 
-    def _size_random_factor(self) -> Decimal:
+    def _random_factor(self) -> Decimal:
         """
-        Returns a multiplier in [1 - size_randomization, 1 + size_randomization].
-        E.g. size_randomization = 0.25 → [0.75, 1.25]
+        Returns a multiplier in [1 - randomization, 1 + randomization].
+        E.g. randomization = 0.25 → [0.75, 1.25]
         """
-        max_var = float(self.config.size_randomization)  # e.g. 0.25
+        max_var = float(self.config.randomization)  # e.g. 0.25
         variation = random.uniform(-max_var, max_var)  # float in [-0.25, 0.25]
         return Decimal("1") + Decimal(str(variation))
 
@@ -451,7 +451,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         reservation_price_mark = self._cached_reservation_price_mark
         reservation_price_mid = self._cached_reservation_price_mid
         inventory = self._get_current_inventory()
-        random_factor = self._cached_size_random_factor
+        random_factor = self._cached_random_factor
         spread_widening_factor = self._cached_spread_widening_factor
         
         lines = []
