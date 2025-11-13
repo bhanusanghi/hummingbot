@@ -1177,12 +1177,12 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             ValueError: If more than 10 orders provided (Orderly limitation)
             IOError: If the API request itself fails
         """
-        # Validation: Check batch size limit
-        if len(orders_to_cancel) > 10:
-            raise ValueError(
-                f"Batch order cancellation limited to 10 orders per request. "
-                f"Received {len(orders_to_cancel)} orders."
-            )
+        # # Validation: Check batch size limit
+        # if len(orders_to_cancel) > 10:
+        #     raise ValueError(
+        #         f"Batch order cancellation limited to 10 orders per request. "
+        #         f"Received {len(orders_to_cancel)} orders."
+        #     )
 
         if not orders_to_cancel:
             self.logger().warning("[BATCH CANCEL] No orders to cancel")
