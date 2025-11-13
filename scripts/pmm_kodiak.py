@@ -300,7 +300,6 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         except Exception as e:
             self.logger().warning(
                 f"Error cancelling orders: {e}. "
-                f"This may be normal if orders were already cancelled."
             )
             return None
         

@@ -1290,6 +1290,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 is_auth_required=True,
             )
 
+            self.logger().info(response)
+
             if not response.get("success", False):
                 # Check if this is an "order not found/invalid" error - orders don't exist on exchange
                 error_msg = str(response)
