@@ -46,17 +46,6 @@ def validate_trading_pair(trading_pair: str) -> bool:
 def _bot_instance_id() -> str:
     return md5(f"{platform.uname()}_pid:{os.getpid()}_ppid:{os.getppid()}".encode("utf-8")).hexdigest()
 
-
-def get_client_order_id_orderly(
-    is_buy: bool, trading_pair: str, hbot_order_id_prefix: str = "", index_in_batch: int = 0
-) -> str:
-    side = "B" if is_buy else "S"
-    symbols = split_hb_trading_pair(trading_pair)
-    base_str = symbols[0].upper()
-    ts_hex = hex(get_tracking_nonce())[2:]
-    client_instance_id = _bot_instance_id()
-    return f"{hbot_order_id_prefix}{side}{base_str}{index_in_batch}{ts_hex}{client_instance_id}".replace("$", "")
-
 def get_new_client_order_id(
     is_buy: bool, trading_pair: str, hbot_order_id_prefix: str = "", max_id_len: Optional[int] = None
 ) -> str:

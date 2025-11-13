@@ -33,7 +33,7 @@ from hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_user_st
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.connector.utils import combine_to_hb_trading_pair, get_client_order_id_orderly
+from hummingbot.connector.utils import combine_to_hb_trading_pair, get_new_client_order_id
 from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
@@ -927,11 +927,11 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
                 # Generate client_order_id if not provided
                 if not order_id:
-                    order_id = get_client_order_id_orderly(
+                    order_id = get_new_client_order_id(
                         is_buy=order_data["trade_type"] == TradeType.BUY,
                         trading_pair=order_data["trading_pair"],
-                        hbot_order_id_prefix=self.client_order_id_prefix,
-                        index_in_batch=i
+                        hbot_order_id_prefix=self.client_order_id_prefix+i,
+                        max_id_len=self.client_order_id_max_length,
                     )
                     order_data["order_id"] = order_id
 
