@@ -6,4 +6,7 @@ ask_spread_levels: [0.0003]
 order_refresh_time: 3
 max_inventory: 0.05
 max_price_adjustment: 0.001
+min_inventory_pct_for_adjustment: 0.25 #25% of max inventory: no adjustment
+max_spread_widening: 0.5
+size_randomization: 0.25 #25%
 leverage: 100

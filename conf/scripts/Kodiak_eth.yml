@@ -1,9 +1,12 @@
 exchange: orderly_perpetual
 trading_pair: ETH-USDC
-order_amount_quote: [150, 300]
-bid_spread_levels: [0.0003, 0.0006]
-ask_spread_levels: [0.0003, 0.0006]
-order_refresh_time: 4
-max_inventory: 1
-max_price_adjustment: 0.0012
+order_amount_quote: [160, 320] #in USD
+bid_spread_levels: [0.0003, 0.0006] #in bps
+ask_spread_levels: [0.0003, 0.0006] #in bps
+order_refresh_time: 3 #in seconds
+max_inventory: 1 #in ETH terms
+max_price_adjustment: 0.0012 #0.12% maximum skew to fair price at max inventory
+min_inventory_pct_for_adjustment: 0.25 #25% of max inventory: no adjustment
+max_spread_widening: 0.5 #spreads widen up to 50%
+size_randomization: 0.25 #25%
 leverage: 100
