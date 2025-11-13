@@ -1,0 +1,9 @@
+exchange: orderly_perpetual
+trading_pair: BTC-USDC
+order_amount_quote: 20
+bid_spread_levels: [0.0005]
+ask_spread_levels: [0.0005]
+order_refresh_time: 10
+max_inventory: 0.002 # 200 usd
+max_price_adjustment: 0.001 # 10 bps
+leverage: 100
