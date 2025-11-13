@@ -1528,7 +1528,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     # ============================================================
     # Position Management
     # ============================================================
-
     async def _update_positions(self):
         """Fetch and update positions"""
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
@@ -1844,7 +1843,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _process_position_event(self, event: Dict[str, Any]):
         """Process position update event from WebSocket"""
-        # Trigger position update
+        # Trigger position update with the event data itself instead of fetching via the rest client
         await self._update_positions()
 
     async def _process_balance_event(self, event: Dict[str, Any]):

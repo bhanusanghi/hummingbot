@@ -22,10 +22,11 @@ class PMMAvellanedaMultiConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
     exchange: str = Field("orderly_perpetual")
     trading_pair: str = Field("BTC-USDC")
-    order_amount_quote: Decimal = Field(20)
+    order_amount_quote: List[Decimal] = Field(default=[Decimal("20")])
     bid_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
     ask_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
     order_refresh_time: int = Field(10)
+    order_cooldown: int = Field(0)  # Cooldown in seconds after an order fill
     max_inventory: Decimal = Field(0.01) # 1k usd
     max_price_adjustment: Decimal = Field(default=Decimal("0.001")) #  10 bps
     leverage: int = Field(100)
@@ -65,11 +66,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: PMMAvellanedaMultiConfig):
         super().__init__(connectors)
-        self.current_timestamp = None
+        # self.current_timestamp = None
         self.config = config
         self._last_update_timestamp: float = 0
         self._cached_mark_price: Decimal = Decimal("0")
         self._cached_reservation_price: Decimal = Decimal("0")
+        self._cooldown_until_timestamp: float = 0  # Timestamp until which we're in cooldown
         
         # DataFrame to store last 6 filled orders
         self._filled_orders_df: pd.DataFrame = pd.DataFrame(columns=[
@@ -84,6 +86,10 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
     
     def on_tick(self):
+        # Check if we're in cooldown period
+        if self.current_timestamp < self._cooldown_until_timestamp:
+            return
+        
         if self.create_timestamp <= self.current_timestamp:
             proposals: List[PerpetualOrderCandidate] = self.create_proposal()
             proposal_adjusted: List[PerpetualOrderCandidate] = self.adjust_proposal_to_budget(proposals)
@@ -160,17 +166,15 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             ask_price = max(reservation_price_mid, reservation_price_mark) * (Decimal("1") + ask_spread)
             
             # To make sure the limit maker orders are not immediately taken
-            # Only the offending side is adjusted
+            # Only the offending side is adjusted, but still respecting the spread level
             if bid_price >= best_ask_price:
-                bid_price = mid_price # or best_ask_price - 1 tick
+                bid_price = mid_price * (Decimal("1") - bid_spread)
 
             if ask_price <= best_bid_price:
-                ask_price = mid_price # or best_bid_price + 1 tick
+                ask_price = mid_price * (Decimal("1") + ask_spread)
                 
-            # Convert quote amount to base amount for both buy and sell orders
-            # For perpetual orders, amount must be in base currency (BTC), not quote (USDC)
-            bid_amount = Decimal(self.config.order_amount_quote) / bid_price
-            ask_amount = Decimal(self.config.order_amount_quote) / ask_price
+            bid_amount = self.config.order_amount_quote[idx] / reservation_price_mid # reservation_price_mid used only to keep the order size same
+            ask_amount = self.config.order_amount_quote[idx] / reservation_price_mid # reservation_price_mid usedonly to keep the order size same
 
             bid_order = PerpetualOrderCandidate(
                 trading_pair=self.config.trading_pair,
@@ -300,6 +304,10 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         Note: Inventory is now retrieved from the connector's actual position,
         not tracked manually from fills.
         """
+        # Set cooldown period after order fill
+        if self.config.order_cooldown > 0:
+            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
+        
         # Get current inventory from connector's actual position
         current_inventory = self._get_current_inventory()
         
