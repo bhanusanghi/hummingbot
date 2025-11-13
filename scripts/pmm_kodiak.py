@@ -288,13 +288,20 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                     f"No cancellation needed."
                 )
             return []
-        
+
         # Use batch cancellation if we have orders to cancel and wait for completion
         try:
             self.logger().debug(
                 f"Cancelling {len(orders_to_cancel)} active order(s) for {self.config.trading_pair}"
             )
-            return await connector.batch_order_cancel(orders_to_cancel)
+
+            results = await connector.batch_order_cancel(orders_to_cancel[0:9])
+
+            if len(orders_to_cancel) > 10:
+                return None
+
+            return results
+
         except Exception as e:
             self.logger().warning(
                 f"Error cancelling orders: {e}. "
