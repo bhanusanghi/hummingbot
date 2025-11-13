@@ -63,10 +63,10 @@ def get_new_client_order_id(
     """
     side = "B" if is_buy else "S"
     symbols = split_hb_trading_pair(trading_pair)
-    base = symbols[0].upper()
-    quote = symbols[1].upper()
-    base_str = f"{base[0]}{base[-1]}"
-    quote_str = f"{quote[0]}{quote[-1]}"
+    base_str = symbols[0].upper()
+    # quote = symbols[1].upper()
+    # base_str = f"{base[0]}{base[-1]}"
+    # quote_str = f"{quote[0]}{quote[-1]}"
     client_instance_id = "" #_bot_instance_id()
     ts_hex = hex(get_tracking_nonce())[2:]
     client_order_id = f"{hbot_order_id_prefix}{side}{base_str}{quote_str}{ts_hex}{client_instance_id}".replace("$", "")

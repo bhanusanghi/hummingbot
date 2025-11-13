@@ -1250,7 +1250,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             }
 
             self.logger().info(
-                f"[CANCEL ALL] Cancelling all order for ${exchange_symbols[0]}"
+                f"[CANCEL ALL] Cancelling all orders for {exchange_symbols[0]}"
             )
 
         elif use_exchange_ids:
