@@ -26,7 +26,7 @@ class PMMAvellanedaMultiConfig(BaseClientModel):
     bid_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
     ask_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
     order_refresh_time: int = Field(10)
-    order_cooldown: int = Field(10)  # Cooldown in seconds after an order fill
+    # order_cooldown: int = Field(10)  # Cooldown in seconds after an order fill
     max_inventory: Decimal = Field(0.01) # 1k usd
     max_price_adjustment: Decimal = Field(default=Decimal("0.001")) #  10 bps
     leverage: int = Field(100)
@@ -76,7 +76,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._last_update_timestamp: float = 0
         self._cached_mark_price: Decimal = Decimal("0")
         self._cached_reservation_price: Decimal = Decimal("0")
-        self._cooldown_until_timestamp: float = 0
+        # self._cooldown_until_timestamp: float = 0
 
         # DataFrame to store last 6 filled orders
         self._filled_orders_df: pd.DataFrame = pd.DataFrame(columns=[
@@ -93,13 +93,13 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     def on_tick(self):
         if self.current_timestamp > self.create_timestamp:
 
-            if self.current_timestamp < self._cooldown_until_timestamp:
-                safe_ensure_future(self._async_cancel_all_orders()) # if waiting for cooldown - just cancel orders and return
-            else:
-                proposals: List[PerpetualOrderCandidate] = self.create_proposal()
-                proposal_adjusted: List[PerpetualOrderCandidate] = proposals #temp skip this branch #self.adjust_proposal_to_budget(proposals)
-                safe_ensure_future(self._cancel_and_place_orders(proposal_adjusted)) # Execute cancel then place sequentially to avoid order accumulation
-                self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
+            # if self.current_timestamp < self._cooldown_until_timestamp:
+            #     safe_ensure_future(self._async_cancel_all_orders()) # if waiting for cooldown - just cancel orders and return
+            # else:
+            proposals: List[PerpetualOrderCandidate] = self.create_proposal()
+            proposal_adjusted: List[PerpetualOrderCandidate] = proposals #temp skip this branch #self.adjust_proposal_to_budget(proposals)
+            safe_ensure_future(self._cancel_and_place_orders(proposal_adjusted)) # Execute cancel then place sequentially to avoid order accumulation
+            self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
     
     async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
         """
@@ -315,9 +315,9 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         Note: Inventory is now retrieved from the connector's actual position,
         not tracked manually from fills.
         """
-        # Set cooldown period after order fill
-        if self.config.order_cooldown > 0:
-            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
+        # # Set cooldown period after order fill
+        # if self.config.order_cooldown > 0:
+        #     self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
 
         # Get current inventory from connector's actual position
         current_inventory = self._get_current_inventory()
@@ -450,7 +450,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Total Filled Sell Orders: {self.total_sell_orders:.2f}")
         lines.append(f"    Total Buy Volume: {self.total_buy_volume:.2f}")
         lines.append(f"    Total Sell Volume: {self.total_sell_volume:.2f}")
-        lines.append(f"    Order cooldown timestamp: {self._cooldown_until_timestamp}")
+        # lines.append(f"    Order cooldown timestamp: {self._cooldown_until_timestamp}")
         lines.append(f"    Current timestamp: {self.current_timestamp}")
         lines.append(f"    Create timestamp: {self.create_timestamp}")
         

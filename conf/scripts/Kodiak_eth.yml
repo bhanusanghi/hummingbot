@@ -1,10 +1,9 @@
 exchange: orderly_perpetual
 trading_pair: ETH-USDC
-order_amount_quote: [100, 200, 300]
-bid_spread_levels: [0.0002, 0.0004, 0.0007]
-ask_spread_levels: [0.0002, 0.0004, 0.0007]
-order_refresh_time: 2
-order_cooldown: 5
+order_amount_quote: [150, 300]
+bid_spread_levels: [0.0003, 0.0006]
+ask_spread_levels: [0.0003, 0.0006]
+order_refresh_time: 4
 max_inventory: 1
 max_price_adjustment: 0.0012
 leverage: 100
