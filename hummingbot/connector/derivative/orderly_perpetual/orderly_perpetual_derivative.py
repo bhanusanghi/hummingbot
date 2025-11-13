@@ -1255,6 +1255,11 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().info(
                 f"[BATCH CANCEL] Cancelling {len(exchange_order_ids)} orders by exchange_order_id"
             )
+
+            for exchange_order_id in exchange_order_ids:
+                self.logger().info(f"Batch cancelling ${exchange_order_id}")
+
+
         else:
             # Use DELETE /v1/client/batch-order with client_order_ids
             url = web_utils.public_rest_url(
