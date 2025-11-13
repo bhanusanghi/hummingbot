@@ -91,10 +91,13 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
     
     def on_tick(self):
+        # if waiting for cooldown - don't have any* active orders
+        if self.current_timestamp < self._cooldown_until_timestamp:
+            safe_ensure_future(self._async_cancel_all_orders())
 
         if self.create_timestamp <= self.current_timestamp:
             proposals: List[PerpetualOrderCandidate] = self.create_proposal()
-            proposal_adjusted: List[PerpetualOrderCandidate] = self.adjust_proposal_to_budget(proposals)
+            proposal_adjusted: List[PerpetualOrderCandidate] = proposals #temp skip this branch #self.adjust_proposal_to_budget(proposals)
             # Execute cancel then place sequentially to avoid order accumulation
             safe_ensure_future(self._cancel_and_place_orders(proposal_adjusted))
             self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
@@ -127,12 +130,6 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             self.account_config_set = True
     
     def create_proposal(self) -> List[PerpetualOrderCandidate]:
-        orders = []
-
-        # if waiting for cooldown - don't have any* active orders
-        if self.current_timestamp < self._cooldown_until_timestamp:
-            return orders
-
         connector = self.connectors[self.config.exchange]
         # Use mark price from exchange instead of mid price
         mark_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MarkPrice)
@@ -166,7 +163,8 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._cached_mid_price = mid_price
         self._cached_reservation_price_mark = reservation_price_mark
         self._cached_reservation_price_mid = reservation_price_mid
-        
+
+        orders = []
         for idx, bid_spread in enumerate(self.config.bid_spread_levels):
             ask_spread = self.config.ask_spread_levels[idx]
             bid_price = min(reservation_price_mid, reservation_price_mark) * (Decimal("1") - bid_spread)
