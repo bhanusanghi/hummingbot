@@ -82,6 +82,8 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._cached_mid_price: Decimal = Decimal("0")
         self._cached_reservation_price_mark: Decimal = Decimal("0")
         self._cached_reservation_price_mid: Decimal = Decimal("0")
+        self._cached_spread_widening_factor: Decimal = Decimal("0")
+        self._cached_size_random_factor: Decimal = Decimal("0")
         # self._cooldown_until_timestamp: float = 0
 
         # DataFrame to store last 6 filled orders
@@ -167,6 +169,10 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._cached_reservation_price_mid = reservation_price_mid
 
         spread_widening_factor = Decimal("1") + self._linear_inventory_factor(inventory) * self.config.max_spread_widening
+        self._cached_spread_widening_factor = spread_widening_factor
+
+        random_factor = self._size_random_factor()
+        self._cached_size_random_factor = random_factor
 
         orders = []
         for idx, bid_spread in enumerate(self.config.bid_spread_levels):
@@ -191,7 +197,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
 
             base_amount = self.config.order_amount_quote[idx] / reservation_price_mid
 
-            bid_amount = base_amount * self._size_random_factor()
+            bid_amount = base_amount * random_factor
             ask_amount = bid_amount
 
             bid_order = PerpetualOrderCandidate(
@@ -445,6 +451,8 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         reservation_price_mark = self._cached_reservation_price_mark
         reservation_price_mid = self._cached_reservation_price_mid
         inventory = self._get_current_inventory()
+        random_factor = self._cached_size_random_factor
+        spread_widening_factor = self._cached_spread_widening_factor
         
         lines = []
         lines.append("")
@@ -459,8 +467,11 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Price Adjustment Mark: {reservation_price_mark - mark_price:.8f}")
         lines.append(f"    Current Inventory: {inventory:.8f}")
         lines.append(f"    Max Inventory: {self.config.max_inventory:.8f}")
-        lines.append(f"    Spread Levels: {[f'{s*100:.4f}%' for s in self.config.ask_spread_levels]}")
+        lines.append(f"    Sizes: {[f'{s*100:.4f}%' for s in self.config.order_amount_quote]}")
+        lines.append(f"    Ask Spread Levels: {[f'{s*100:.4f}%' for s in self.config.ask_spread_levels]}")
         lines.append(f"    Bid Spread Levels: {[f'{s*100:.4f}%' for s in self.config.bid_spread_levels]}")
+        lines.append(f"    Random Factor: {random_factor:.4f}")
+        lines.append(f"    Spread Widening Factor: {spread_widening_factor:.4f}")
         
         lines.append(f"    Total Filled Buy Orders: {self.total_buy_orders:.2f}")
         lines.append(f"    Total Filled Sell Orders: {self.total_sell_orders:.2f}")
