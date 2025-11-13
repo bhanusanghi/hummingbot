@@ -122,9 +122,24 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         connector = self.connectors[self.config.exchange]
         # Use mark price from exchange instead of mid price
         mark_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MarkPrice)
-        best_bid_price = connector.get_price_by_type(self.config.trading_pair, PriceType.BestBid)
-        best_ask_price = connector.get_price_by_type(self.config.trading_pair, PriceType.BestAsk)
+        # best_bid_price = connector.get_price_by_type(self.config.trading_pair, PriceType.BestBid)
+        # best_ask_price = connector.get_price_by_type(self.config.trading_pair, PriceType.BestAsk)
+        
+            # Get order book
+        order_book = connector.get_order_book(self.config.trading_pair)
+        bids_df, asks_df = order_book.snapshot
+        
+        # Get best bid/ask prices and sizes
+        best_bid_price = Decimal(str(bids_df.iloc[0].price))
+        best_bid_size = Decimal(str(bids_df.iloc[0].amount))
+        best_ask_price = Decimal(str(asks_df.iloc[0].price))
+        best_ask_size = Decimal(str(asks_df.iloc[0].amount))
+            
         mid_price = (best_bid_price + best_ask_price) / 2
+        
+        mid_price_weighted = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (best_bid_size + best_ask_size)
+        
+        # self.logger().info(f"Mid price: {mid_price}, Mid price weighted: {mid_price_weighted}, bid_size: {best_bid_size}, ask_size: {best_ask_size}, Difference: {mid_price_weighted - mid_price}")
         
         inventory = self._get_current_inventory()
         
