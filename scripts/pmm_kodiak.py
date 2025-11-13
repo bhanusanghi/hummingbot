@@ -294,6 +294,8 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             self.logger().debug(
                 f"Cancelling {len(orders_to_cancel)} active order(s) for {self.config.trading_pair}"
             )
+            for order in orders_to_cancel:
+                self.logger().debug(f"Cancelling {order.client_order_id} in batch")
             return await connector.batch_order_cancel(orders_to_cancel)
         except Exception as e:
             self.logger().warning(
