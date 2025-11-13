@@ -26,7 +26,7 @@ class PMMAvellanedaMultiConfig(BaseClientModel):
     bid_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
     ask_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")]) #10 bps
     order_refresh_time: int = Field(10)
-    order_cooldown: int = Field(0)  # Cooldown in seconds after an order fill
+    order_cooldown: int = Field(10)  # Cooldown in seconds after an order fill
     max_inventory: Decimal = Field(0.01) # 1k usd
     max_price_adjustment: Decimal = Field(default=Decimal("0.001")) #  10 bps
     leverage: int = Field(100)
@@ -91,10 +91,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
     
     def on_tick(self):
-        # Check if we're in cooldown period
-        if self.current_timestamp < self._cooldown_until_timestamp:
-            return
-        
+
         if self.create_timestamp <= self.current_timestamp:
             proposals: List[PerpetualOrderCandidate] = self.create_proposal()
             proposal_adjusted: List[PerpetualOrderCandidate] = self.adjust_proposal_to_budget(proposals)
@@ -130,6 +127,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             self.account_config_set = True
     
     def create_proposal(self) -> List[PerpetualOrderCandidate]:
+        orders = []
+
+        # if waiting for cooldown - don't have any* active orders
+        if self.current_timestamp < self._cooldown_until_timestamp:
+            return orders
+
         connector = self.connectors[self.config.exchange]
         # Use mark price from exchange instead of mid price
         mark_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MarkPrice)
@@ -164,7 +167,6 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._cached_reservation_price_mark = reservation_price_mark
         self._cached_reservation_price_mid = reservation_price_mid
         
-        orders = []
         for idx, bid_spread in enumerate(self.config.bid_spread_levels):
             ask_spread = self.config.ask_spread_levels[idx]
             bid_price = min(reservation_price_mid, reservation_price_mark) * (Decimal("1") - bid_spread)
@@ -312,7 +314,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         # Set cooldown period after order fill
         if self.config.order_cooldown > 0:
             self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
-        
+
         # Get current inventory from connector's actual position
         current_inventory = self._get_current_inventory()
         
