@@ -930,7 +930,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     order_id = get_new_client_order_id(
                         is_buy=order_data["trade_type"] == TradeType.BUY,
                         trading_pair=order_data["trading_pair"],
-                        hbot_order_id_prefix=self.client_order_id_prefix+i,
+                        hbot_order_id_prefix=self.client_order_id_prefix+str(i),
                         max_id_len=self.client_order_id_max_length,
                     )
                     order_data["order_id"] = order_id
