@@ -295,10 +295,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
                 f"Cancelling {len(orders_to_cancel)} active order(s) for {self.config.trading_pair}"
             )
 
-            results = await connector.batch_order_cancel(orders_to_cancel[0:9])
-
-            if len(orders_to_cancel) > 10:
-                return None
+            results = await connector.batch_order_cancel(orders_to_cancel) #Technically this should do cancel_all if > 10, right now default cancel_all
 
             return results
 
