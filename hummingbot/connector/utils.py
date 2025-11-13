@@ -69,10 +69,10 @@ def get_new_client_order_id(
     # quote_str = f"{quote[0]}{quote[-1]}"
     client_instance_id = "" #_bot_instance_id()
     ts_hex = hex(get_tracking_nonce())[2:]
-    client_order_id = f"{hbot_order_id_prefix}{side}{base_str}{quote_str}{ts_hex}{client_instance_id}".replace("$", "")
+    client_order_id = f"{hbot_order_id_prefix}{side}{base_str}{ts_hex}{client_instance_id}".replace("$", "")
 
     if max_id_len is not None:
-        id_prefix = f"{hbot_order_id_prefix}{side}{base_str}{quote_str}"
+        id_prefix = f"{hbot_order_id_prefix}{side}{base_str}"
         suffix_max_length = max_id_len - len(id_prefix)
         if suffix_max_length < len(ts_hex):
             id_suffix = md5(f"{ts_hex}{client_instance_id}".encode()).hexdigest()
