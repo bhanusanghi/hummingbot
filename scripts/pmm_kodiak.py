@@ -86,6 +86,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._cached_spread_widening_factor: Decimal = Decimal("0")
         self._cached_random_factor: Decimal = Decimal("0")
         self._cached_skew_factor: Decimal = Decimal("0")
+        self._cached_proposals: List[PerpetualOrderCandidate] = []
         # self._cooldown_until_timestamp: float = 0
 
         # DataFrame to store last 6 filled orders
@@ -107,6 +108,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             #     safe_ensure_future(self._async_cancel_all_orders()) # if waiting for cooldown - just cancel orders and return
             # else:
             proposals: List[PerpetualOrderCandidate] = self.create_proposal()
+            self._cached_proposals = proposals
             proposal_adjusted: List[PerpetualOrderCandidate] = proposals #temp skip this branch #self.adjust_proposal_to_budget(proposals)
             safe_ensure_future(self._cancel_and_place_orders(proposal_adjusted)) # Execute cancel then place sequentially to avoid order accumulation
             self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
@@ -470,7 +472,6 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Price Adjustment: {reservation_price - mid_price:.8f}")
         lines.append(f"    Current Inventory: {inventory:.8f}")
         lines.append(f"    Max Inventory: {self.config.max_inventory:.8f}")
-        lines.append(f"    Sizes: {[f'{s*100:.4f}%' for s in self.config.order_amount_quote]}")
         lines.append(f"    Ask Spread Levels: {[f'{s*100:.4f}%' for s in self.config.ask_spread_levels]}")
         lines.append(f"    Bid Spread Levels: {[f'{s*100:.4f}%' for s in self.config.bid_spread_levels]}")
         lines.append(f"    Random Factor: {random_factor:.4f}")
@@ -484,7 +485,14 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Total Sell Volume: {self.total_sell_volume:.2f}")
         lines.append(f"    Current timestamp: {self.current_timestamp}")
         lines.append(f"    Create timestamp: {self.create_timestamp}")
-        
+
+
+        proposals = self._cached_proposals
+        if(len(proposals) > 0):
+            lines.append("")
+            lines.append("  Order Proposals:")
+            lines.append(f" {proposal.order_side, proposal.price, proposal.amount}" for proposal in proposals)
+
         # Display last 6 filled orders (most recent last)
         if len(self._filled_orders_df) > 0:
             lines.append("")
