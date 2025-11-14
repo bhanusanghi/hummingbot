@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+from numpy.ma.mrecords import reserved_fields
 from pydantic import Field
 
 from hummingbot.client.config.config_data_types import BaseClientModel
@@ -80,10 +81,11 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._last_update_timestamp: float = 0
         self._cached_mark_price: Decimal = Decimal("0")
         self._cached_mid_price: Decimal = Decimal("0")
-        self._cached_reservation_price_mark: Decimal = Decimal("0")
-        self._cached_reservation_price_mid: Decimal = Decimal("0")
+        self._cached_reservation_price: Decimal = Decimal("0")
+        self._cached_inventory_factor: Decimal = Decimal("0")
         self._cached_spread_widening_factor: Decimal = Decimal("0")
         self._cached_random_factor: Decimal = Decimal("0")
+        self._cached_skew_factor: Decimal = Decimal("0")
         # self._cooldown_until_timestamp: float = 0
 
         # DataFrame to store last 6 filled orders
@@ -158,17 +160,18 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             mid_price = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (best_bid_size + best_ask_size)
 
         inventory = self._get_current_inventory()
-        
-        reservation_price_mark = self._get_reservation_price(mark_price, inventory)
-        reservation_price_mid = self._get_reservation_price(mid_price, inventory)
+        skew_factor = self._get_price_skew(inventory)
+        reservation_price = mid_price * skew_factor
+        inventory_factor = self._linear_inventory_factor(inventory)
 
         # Cache values for status reporting
         self._cached_mark_price = mark_price
         self._cached_mid_price = mid_price
-        self._cached_reservation_price_mark = reservation_price_mark
-        self._cached_reservation_price_mid = reservation_price_mid
+        self._cached_reservation_price = reservation_price
+        self._cached_inventory_factor = inventory_factor
+        self._cached_skew_factor = skew_factor
 
-        spread_widening_factor = Decimal("1") + self._linear_inventory_factor(inventory) * self.config.max_spread_widening
+        spread_widening_factor = Decimal("1") + inventory_factor * self.config.max_spread_widening
         self._cached_spread_widening_factor = spread_widening_factor
 
         random_factor = self._random_factor()
@@ -178,27 +181,26 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         for idx, bid_spread in enumerate(self.config.bid_spread_levels):
             ask_spread = self.config.ask_spread_levels[idx]
 
-            bid_price = min(reservation_price_mid, reservation_price_mark) * (Decimal("1") - bid_spread * spread_widening_factor * random_factor)
-            ask_price = max(reservation_price_mid, reservation_price_mark) * (Decimal("1") + ask_spread * spread_widening_factor * random_factor)
+            # Spreads relative to top of book
+            bid_price = reservation_price * (Decimal("1") - bid_spread * spread_widening_factor * random_factor)
+            ask_price = reservation_price * (Decimal("1") + ask_spread * spread_widening_factor * random_factor)
             
             # To make sure the limit maker orders are not immediately taken
-            # Only the offending side is adjusted, but still respecting the spread level
-            if bid_price >= best_ask_price:
-                if idx == 0:
-                    bid_price = mid_price
-                else:
-                    bid_price = mid_price * (Decimal("1") - bid_spread * spread_widening_factor)
+            # Only the offending side is adjusted, and placed at top of book
+            if bid_price >= mid_price:
+                bid_price = Decimal(str(bids_df.iloc[idx*2].price))
 
-            if ask_price <= best_bid_price:
-                if idx == 0:
-                    ask_price = mid_price
-                else:
-                    ask_price = mid_price * (Decimal("1") + ask_spread * spread_widening_factor)
+            if ask_price <= mid_price:
+                ask_price = Decimal(str(asks_df.iloc[idx*2].price))
 
-            base_amount = self.config.order_amount_quote[idx] / reservation_price_mid
+            size = self.config.order_amount_quote[idx] / mid_price * random_factor
 
-            bid_amount = base_amount * random_factor
-            ask_amount = bid_amount
+            if inventory > 0:
+                bid_amount = size * (Decimal("1") - inventory_factor)
+                ask_amount = size
+            else:
+                bid_amount = size
+                ask_amount = size * (Decimal("1") - inventory_factor)
 
             bid_order = PerpetualOrderCandidate(
                 trading_pair=self.config.trading_pair,
@@ -221,15 +223,17 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
             )
             
             # Inventory-based order placement logic:
-            if inventory >= self.config.max_inventory:
+            if inventory >= self.config.max_inventory and ask_amount > 0:
                 # At max long position, only place ask orders to reduce position
                 orders.extend([ask_order])
-            elif inventory <= -self.config.max_inventory:
+            elif inventory <= -self.config.max_inventory and bid_amount > 0:
                 # At max short position, only place bid orders to reduce position
                 orders.extend([bid_order])
             else:
-                # Normal market making: place both sides
-                orders.extend([bid_order, ask_order])
+                if bid_amount > 0:
+                    orders.extend([bid_order])
+                if ask_amount > 0:
+                    orders.extend([ask_order])
         return orders
 
     def adjust_proposal_to_budget(self, proposals: List[PerpetualOrderCandidate]) -> List[PerpetualOrderCandidate]:
@@ -393,7 +397,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         else:
             return Decimal("0")
 
-    def _get_reservation_price(self, reference_price: Decimal, inventory: Decimal) -> Decimal:
+    def _get_price_skew(self, inventory: Decimal) -> Decimal:
         """
         Calculate reservation price with inventory-based adjustment.
         For long positions (inventory > 0): lower reservation price to encourage selling
@@ -406,11 +410,11 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         # - Long position (inventory > 0): lower price (subtract adjustment)
         # - Short position (inventory < 0): raise price (add adjustment)
         if inventory > 0:
-            reservation_price = reference_price * (Decimal("1") - adjustment)
+            skew = Decimal("1") - adjustment
         else:
-            reservation_price = reference_price * (Decimal("1") + adjustment)
+            skew = Decimal("1") + adjustment
 
-        return reservation_price
+        return skew
 
     def _linear_inventory_factor(self, inventory: Decimal) -> Decimal:
         """
@@ -448,11 +452,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
 
         mark_price = self._cached_mark_price
         mid_price = self._cached_mid_price
-        reservation_price_mark = self._cached_reservation_price_mark
-        reservation_price_mid = self._cached_reservation_price_mid
+        reservation_price = self._cached_reservation_price
         inventory = self._get_current_inventory()
         random_factor = self._cached_random_factor
         spread_widening_factor = self._cached_spread_widening_factor
+        inventory_factor = self._cached_inventory_factor
+        skew_factor = self._cached_skew_factor
         
         lines = []
         lines.append("")
@@ -461,10 +466,8 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Exchange: {self.config.exchange}")
         lines.append(f"    Mark Price: {mark_price:.8f}")
         lines.append(f"    Mid Price: {mid_price:.8f}")
-        lines.append(f"    Reservation Price Mid: {reservation_price_mid:.8f}")
-        lines.append(f"    Reservation Price Mark: {reservation_price_mark:.8f}")
-        lines.append(f"    Price Adjustment Mid: {reservation_price_mid - mid_price:.8f}")
-        lines.append(f"    Price Adjustment Mark: {reservation_price_mark - mark_price:.8f}")
+        lines.append(f"    Reservation Price: {reservation_price:.8f}")
+        lines.append(f"    Price Adjustment: {reservation_price - mid_price:.8f}")
         lines.append(f"    Current Inventory: {inventory:.8f}")
         lines.append(f"    Max Inventory: {self.config.max_inventory:.8f}")
         lines.append(f"    Sizes: {[f'{s*100:.4f}%' for s in self.config.order_amount_quote]}")
@@ -472,12 +475,13 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Bid Spread Levels: {[f'{s*100:.4f}%' for s in self.config.bid_spread_levels]}")
         lines.append(f"    Random Factor: {random_factor:.4f}")
         lines.append(f"    Spread Widening Factor: {spread_widening_factor:.4f}")
+        lines.append(f"    Inventory Factor: {inventory_factor:.4f}")
+        lines.append(f"    Skew Factor: {skew_factor:.4f}")
         
         lines.append(f"    Total Filled Buy Orders: {self.total_buy_orders:.2f}")
         lines.append(f"    Total Filled Sell Orders: {self.total_sell_orders:.2f}")
         lines.append(f"    Total Buy Volume: {self.total_buy_volume:.2f}")
         lines.append(f"    Total Sell Volume: {self.total_sell_volume:.2f}")
-        # lines.append(f"    Order cooldown timestamp: {self._cooldown_until_timestamp}")
         lines.append(f"    Current timestamp: {self.current_timestamp}")
         lines.append(f"    Create timestamp: {self.create_timestamp}")
         
