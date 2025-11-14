@@ -18,6 +18,7 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.core.clock import Clock
 
 
 class PMMAvellanedaMultiConfig(BaseClientModel):
@@ -35,6 +36,7 @@ class PMMAvellanedaMultiConfig(BaseClientModel):
     max_spread_widening: Decimal = Field(default=Decimal("0.5"))  # spreads widen up to 50%
     randomization: Decimal = Field(default=Decimal("0.25"))  # 25%
     leverage: int = Field(100)
+    order_tag: Optional[str] = Field(default="None")  # Optional tag to add to all orders, default uses your own ref-code
     
     # target_inventory: Decimal = Field(0.0)
     
@@ -101,6 +103,10 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
     
+    def start(self, clock: Clock, timestamp: float):
+        self.apply_initial_setting()
+        super().start(clock, timestamp)
+    
     def on_tick(self):
         if self.current_timestamp > self.create_timestamp:
 
@@ -139,6 +145,10 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         if not self.account_config_set:
             connector = self.connectors[self.config.exchange]
             connector.set_leverage(self.config.trading_pair, self.config.leverage)
+            # Set order tag if configured
+            if self.config.exchange == "orderly_perpetual" and self.config.order_tag:
+                self.logger().info(f"Setting order tag: {self.config.order_tag}")
+                connector.set_order_tag(self.config.order_tag)
             self.account_config_set = True
     
     def create_proposal(self) -> List[PerpetualOrderCandidate]:
