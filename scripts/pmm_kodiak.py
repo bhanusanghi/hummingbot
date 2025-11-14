@@ -486,12 +486,12 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         lines.append(f"    Current timestamp: {self.current_timestamp}")
         lines.append(f"    Create timestamp: {self.create_timestamp}")
 
-
-        proposals = self._cached_proposals
-        if(len(proposals) > 0):
-            lines.append("")
-            lines.append("  Order Proposals:")
-            lines.append(f" {proposal.order_side, proposal.price, proposal.amount}" for proposal in proposals)
+        #
+        # proposals = self._cached_proposals
+        # if(len(proposals) > 0):
+        #     lines.append("")
+        #     lines.append("  Order Proposals:")
+        #     lines.append(f" {proposal.order_side, proposal.price, proposal.amount}" for proposal in proposals)
 
         # Display last 6 filled orders (most recent last)
         if len(self._filled_orders_df) > 0:
