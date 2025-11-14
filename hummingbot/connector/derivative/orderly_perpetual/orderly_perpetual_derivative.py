@@ -65,6 +65,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
         domain: str = CONSTANTS.DOMAIN,
+        order_tag: Optional[str] = None,
     ):
         """
         Initialize Orderly Perpetual connector.
@@ -78,6 +79,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             trading_pairs: List of trading pairs to trade
             trading_required: Whether trading is required
             domain: Domain (mainnet or testnet)
+            order_tag: Optional tag to add to all orders placed through this connector
         """
         self._orderly_perpetual_api_key = orderly_perpetual_api_key
         self._orderly_perpetual_api_secret = orderly_perpetual_api_secret
@@ -86,6 +88,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         self._trading_pairs = trading_pairs or []
         self._domain = domain
         self._position_mode = None
+        self._order_tag = order_tag
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # ============================================================
@@ -169,6 +172,19 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     def funding_fee_poll_interval(self) -> int:
         """Funding fee polling interval in seconds"""
         return 120
+
+    def set_order_tag(self, order_tag: Optional[str]) -> None:
+        """
+        Set order tag that will be added to all orders placed through this connector.
+        
+        Args:
+            order_tag: Tag string to add to orders, or None to remove tag
+        """
+        self._order_tag = order_tag
+        if order_tag:
+            self.logger().info(f"Order tag set to: {order_tag}")
+        else:
+            self.logger().info("Order tag cleared")
 
     # ============================================================
     # Abstract Methods Implementation
@@ -801,12 +817,18 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         if order_type != OrderType.MARKET:
             order_params["order_price"] = float(self.quantize_order_price(trading_pair, price))
 
+        # Add order tag if configured
+        if self._order_tag:
+            self.logger().info(f"Adding order tag: {self._order_tag}")
+            order_params["order_tag"] = self._order_tag
+
         # Make API call
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
         url = web_utils.public_rest_url(
             CONSTANTS.CREATE_ORDER_URL,
             domain=self._domain
         )
+        self.logger().info(f"Order params: {order_params}")
         response = await rest_assistant.execute_request(
             url=url,
             throttler_limit_id=CONSTANTS.CREATE_ORDER_URL,
@@ -998,6 +1020,11 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 # Add price for non-MARKET orders
                 if in_flight_order.order_type != OrderType.MARKET:
                     order_params["order_price"] = float(in_flight_order.price)
+
+                # Add order tag if configured
+                if self._order_tag:
+                    self.logger().info(f"Adding order tag: {self._order_tag}")
+                    order_params["order_tag"] = self._order_tag
 
                 batch_orders.append(order_params)
 

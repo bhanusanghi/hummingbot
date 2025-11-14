@@ -10,3 +10,4 @@ min_inventory_pct_for_adjustment: 0 #25% of max inventory: no adjustment
 max_spread_widening: 1
 randomization: 0.25 #25%
 leverage: 100
+order_tag: "BERIZARD"
