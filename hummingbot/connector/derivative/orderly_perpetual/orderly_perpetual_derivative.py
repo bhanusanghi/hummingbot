@@ -1023,7 +1023,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
                 # Add order tag if configured
                 if self._order_tag:
-                    self.logger().info(f"Adding order tag: {self._order_tag}")
+                    # self.logger().info(f"Adding order tag: {self._order_tag}")
                     order_params["order_tag"] = self._order_tag
 
                 batch_orders.append(order_params)
