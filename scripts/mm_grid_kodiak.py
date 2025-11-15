@@ -213,13 +213,13 @@ class MMGrid(ScriptStrategyBase):
         last_trade = self._last_trade
         same_direction_trade = sign(trade) == sign(last_trade)
 
-        if same_direction_trade:
-            self.logger().info(f"Same-direction trade: {trade:.4f}. Half cooldown")
-            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown / 2
-
-        elif sign(last_trade) == 0:
+        if sign(last_trade) == 0:
             self.logger().info(f"First trade: {trade:.4f}. Starting cooldown")
             self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
+
+        elif same_direction_trade:
+            self.logger().info(f"Same-direction trade: {trade:.4f}. Add half cooldown")
+            self._cooldown_until_timestamp = self.config.order_cooldown + self.config.order_cooldown / 2
 
         else:
             self.logger().info(f"Opposite-direction trade: {trade:.4f}. Starting cooldown")
@@ -426,24 +426,32 @@ class MMGrid(ScriptStrategyBase):
         if proposals:
             lines.append("")
             lines.append("  Current Order Proposals (sorted like order book):")
-            lines.append("           PRICE        SIDE     AMOUNT")
-            lines.append("    ----------------------------------------")
+            lines.append("        PRICE         SIDE        AMOUNT")
+            lines.append("    ---------------------------------------------")
 
-            # Sort by price descending
             sorted_props = sorted(proposals, key=lambda p: p.price, reverse=True)
 
-            # Insert mid-price line dynamically
             mid = self._cached_mid_price
+            inserted_mid = False
 
             for p in sorted_props:
-                # Determine if we need the MID separator
-                if p.price < mid and not any("MID" in l for l in lines):
-                    lines.append("    ------------------- MID -----------------")
 
-                price_str = f"{p.price:.4f}".rjust(12)
-                side_str = p.order_side.name.ljust(6)
-                amount_str = f"{p.amount:.6f}".rjust(10)
+                # Insert MID row once, when price crosses below mid
+                if not inserted_mid and p.price < mid:
+                    lines.append(
+                        f"    {mid:>12.4f}     {'MID':<6}   {'-':>10}"
+                    )
+                    inserted_mid = True
 
-                lines.append(f"        {price_str}     {side_str}   {amount_str}")
+                # Format proposal rows
+                lines.append(
+                    f"    {p.price:>12.4f}     {p.order_side.name:<6}   {p.amount:>10.6f}"
+                )
+
+            # If all proposals are above mid, show MID at bottom
+            if not inserted_mid:
+                lines.append(
+                    f"    {mid:>12.4f}     {'MID':<6}   {'-':>10}"
+                )
 
         return "\n".join(lines)
