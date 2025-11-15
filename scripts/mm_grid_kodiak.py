@@ -422,8 +422,8 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Last Trade: {self._last_trade:.8f}")
 
         proposals = self._cached_proposals
-        if(len(proposals) > 0):
+        if len(proposals) > 0:
             for p in proposals:
-                lines.append(f"    ({p.order_side}, {p.price}, {p.amount})")
+                self.logger().info({p.order_side}, {p.price}, {p.amount})
 
         return "\n".join(lines)
