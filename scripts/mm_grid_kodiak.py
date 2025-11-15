@@ -422,13 +422,27 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Last Trade: {self._last_trade:.8f}")
 
         proposals = self._cached_proposals
-        if len(proposals) > 0:
+        if proposals:
             lines.append("")
-            lines.append("  Current Order Proposals:")
-            for p in proposals:
-                # p.order_side is a TradeType enum, so use .name
-                lines.append(
-                    f"    Side: {p.order_side.name}, Price: {p.price:.8f}, Amount: {p.amount:.8f}"
-                )
+            lines.append("  Current Order Proposals (sorted like order book):")
+            lines.append("           PRICE        SIDE     AMOUNT")
+            lines.append("    ----------------------------------------")
+
+            # Sort by price descending
+            sorted_props = sorted(proposals, key=lambda p: p.price, reverse=True)
+
+            # Insert mid-price line dynamically
+            mid = self._cached_mid_price
+
+            for p in sorted_props:
+                # Determine if we need the MID separator
+                if p.price < mid and not any("MID" in l for l in lines):
+                    lines.append("    ------------------- MID -----------------")
+
+                price_str = f"{p.price:.4f}".rjust(12)
+                side_str = p.order_side.name.ljust(6)
+                amount_str = f"{p.amount:.6f}".rjust(10)
+
+                lines.append(f"        {price_str}     {side_str}   {amount_str}")
 
         return "\n".join(lines)
