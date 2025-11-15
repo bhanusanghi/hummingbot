@@ -410,7 +410,7 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Mid Price: {self._cached_mid_price:.8f}")
         lines.append(f"    Current Inventory: {self._cached_inventory:.4f}")
         lines.append(f"    Max Inventory: {self.config.max_inventory:.4f}")
-        lines.append(f"    Inventory Ratio %: {self._cached_inventory_ratio & 100:.2f}")
+        lines.append(f"    Inventory Ratio %: {self._cached_inventory_ratio * 100:.2f}")
         lines.append(f"    Reservation Price: {self._cached_reservation_price:.4f}")
         lines.append(f"    Price Adjustment: {self._cached_reservation_price - self._cached_mid_price:.4f}")
         lines.append(f"    Price Skew: {(self._cached_skew_mult - Decimal('1')) * 100:.4f}")
