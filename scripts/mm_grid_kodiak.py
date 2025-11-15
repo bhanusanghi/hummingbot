@@ -135,7 +135,7 @@ class MMGrid(ScriptStrategyBase):
         self._cached_skew_mult = skew_factor
         self._cached_inventory_ratio = inventory_ratio
 
-        spread_mult = abs(inventory_ratio) * self.config.max_spread_mult
+        spread_mult = Decimal("1") + abs(inventory_ratio) * (self.config.max_spread_mult - Decimal("1"))
         self._cached_spread_mult = spread_mult
 
         random_factor = self._random_factor()
