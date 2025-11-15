@@ -18,7 +18,7 @@ import asyncio
 import json
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
-
+from async_timeout import timeout
 from bidict import bidict
 
 import hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_constants as CONSTANTS
@@ -35,6 +35,7 @@ from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativ
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair, get_new_client_order_id
 from hummingbot.core.api_throttler.data_types import RateLimit
+from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -1097,7 +1098,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                             order=in_flight_order,
                             update_timestamp=timestamp,
                         )
-                        self.logger().info(
+                        self.logger().debug(
                             f"[BATCH ORDER] Order {in_flight_order.client_order_id} created successfully "
                             f"with exchange_order_id {exchange_order_id}"
                         )
@@ -1178,6 +1179,137 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     position_action=in_flight_order.position,
                 )
             raise IOError(f"Batch order creation failed: {e}")
+
+    async def cancel_all(self, timeout_seconds: float = 10.0) -> List[CancellationResult]:
+        """
+        Override ExchangePyBase.cancel_all to use Orderly's CANCEL_ALL-per-symbol endpoint.
+
+        Semantics:
+        - All-or-nothing per symbol:
+          * cancel_all_symbol(trading_pair) is responsible for:
+              - Calling the exchange CANCEL_ALL endpoint
+              - Marking all non-done local orders for that trading_pair as CANCELED
+          * Here we only aggregate per-order CancellationResult based on the
+            per-symbol success flags.
+        """
+        incomplete_orders = [o for o in self.in_flight_orders.values() if not o.is_done]
+
+        if not incomplete_orders:
+            self.logger().info("[CANCEL_ALL] No in-flight orders to cancel.")
+            return []
+
+        trading_pairs = sorted({o.trading_pair for o in incomplete_orders})
+        self.logger().info(
+            f"[CANCEL_ALL] Cancelling all orders across {len(trading_pairs)} trading pair(s): {trading_pairs}"
+        )
+
+        # Call CANCEL_ALL per symbol, with timeout
+        try:
+            async with timeout(timeout_seconds):
+                # cancel_all_symbol returns bool for each trading_pair
+                raw_results = await safe_gather(
+                    *[self.cancel_all_symbol(tp) for tp in trading_pairs],
+                    return_exceptions=False,
+                )
+        except Exception:
+            # Only fires if the *whole* operation (timeout or something global) fails
+            self.logger().network(
+                "[CANCEL_ALL] Unexpected error while cancelling all orders.",
+                exc_info=True,
+                app_warning_msg="Failed to cancel all orders. Check API key and network connection.",
+            )
+            return [CancellationResult(o.client_order_id, False) for o in incomplete_orders]
+
+        # Map trading_pair -> success flag (True/False)
+        symbol_success: Dict[str, bool] = {
+            tp: bool(res) for tp, res in zip(trading_pairs, raw_results)
+        }
+
+        # Build per-order results; local state is already handled in cancel_all_symbol
+        results: List[CancellationResult] = []
+        for o in incomplete_orders:
+            success_for_symbol = symbol_success.get(o.trading_pair, False)
+            results.append(CancellationResult(o.client_order_id, success_for_symbol))
+
+        return results
+
+    async def cancel_all_symbol(self, trading_pair: str) -> bool:
+        """
+        Cancel all orders for a single trading pair (symbol) via Orderly's CANCEL_ALL endpoint.
+
+        Side effects on success:
+        - All locally tracked, non-done InFlightOrders for this trading_pair
+          are marked CANCELED via OrderUpdate.
+
+        Returns:
+            True  -> we consider CANCEL_ALL successful for this symbol
+            False -> request failed or response was not the expected "success" shape
+        """
+        try:
+            symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+            url = web_utils.public_rest_url(
+                CONSTANTS.CANCEL_ALL_ORDERS_URL,
+                domain=self._domain,
+            )
+            params = {"symbol": symbol}
+
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+            self.logger().info(f"[CANCEL_ALL] Cancelling all orders for {symbol}")
+            resp = await rest_assistant.execute_request(
+                url=url,
+                throttler_limit_id=CONSTANTS.TRADING_LIMIT_ID,
+                method=RESTMethod.DELETE,
+                params=params,
+                is_auth_required=True,
+            )
+
+            success_flag = resp.get("success", True)
+            status = resp.get("status")
+
+            if not success_flag or status != "CANCEL_ALL_SENT":
+                self.logger().warning(f"[CANCEL_ALL] Unexpected response for {symbol}: {resp}")
+                return False
+
+            # ------- Local state update on success (per symbol) -------
+            timestamp = self.current_timestamp
+
+            # Collect all active (non-done) in-flight orders for this trading_pair
+            affected_orders = [
+                o for o in self.in_flight_orders.values()
+                if o.trading_pair == trading_pair and not o.is_done
+            ]
+
+            if not affected_orders:
+                self.logger().info(
+                    f"[CANCEL_ALL] No non-done in-flight orders to update locally for {trading_pair}"
+                )
+                return True
+
+            self.logger().info(
+                f"[CANCEL_ALL] Marking {len(affected_orders)} local in-flight order(s) "
+                f"as CANCELED for {trading_pair}"
+            )
+
+            for order in affected_orders:
+                order_update = OrderUpdate(
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=order.exchange_order_id,
+                    trading_pair=order.trading_pair,
+                    update_timestamp=timestamp,
+                    new_state=OrderState.CANCELED,
+                )
+                self._order_tracker.process_order_update(order_update)
+
+            return True
+
+        except Exception as e:
+            # Swallow the error, just mark symbol-level failure
+            self.logger().warning(
+                f"[CANCEL_ALL] Error cancelling all orders for {trading_pair}: {e}",
+                exc_info=True,
+            )
+            return False
+
 
     async def batch_order_cancel(
         self,
@@ -1264,23 +1396,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         # Build API request
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
 
-        cancel_all = True
-        if cancel_all:
-            url = web_utils.public_rest_url(
-                CONSTANTS.CANCEL_ALL_ORDERS_URL,
-                domain=self._domain
-            )
-            throttler_limit_id = CONSTANTS.TRADING_LIMIT_ID
-
-            params = {
-                "symbol": exchange_symbols[0],
-            }
-
-            self.logger().info(
-                f"[CANCEL ALL] Cancelling all orders for {exchange_symbols[0]}"
-            )
-
-        elif use_exchange_ids:
+        if use_exchange_ids:
             # Use DELETE /v1/batch-order with exchange order_ids
             url = web_utils.public_rest_url(
                 CONSTANTS.BATCH_CANCEL_ORDER_URL,
@@ -1373,10 +1489,37 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     "success": True,
                     "error_message": ""
                 })
-                return results
+
+            return results
 
         self.logger().error(f"[BATCH CANCEL] Bad response in batch cancellation")
         raise IOError(f"Batch order cancellation failed.")
+
+    # async def fetch_open_orders_from_exchange(self, trading_pair: str):
+    #     symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+    #     url = web_utils.public_rest_url(CONSTANTS.GET_ORDERS_URL, domain=self._domain)
+    #     params = {
+    #         "symbol": symbol,
+    #         "status": "INCOMPLETE",
+    #         "page": 1,
+    #         "size": 500,
+    #     }
+    #
+    #     rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+    #     resp = await rest_assistant.execute_request(
+    #         url=url,
+    #         throttler_limit_id=CONSTANTS.GET_ORDERS_URL,
+    #         method=RESTMethod.GET,
+    #         params=params,
+    #         is_auth_required=True,
+    #     )
+    #
+    #     if not resp.get("success", False):
+    #         self.logger().warning(f"[ORDERS] Failed to fetch open orders: {resp}")
+    #         return []
+    #
+    #     rows = resp.get("data", {}).get("rows", [])
+    #     return rows  # each row is an order dict
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """

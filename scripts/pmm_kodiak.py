@@ -345,10 +345,6 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         Note: Inventory is now retrieved from the connector's actual position,
         not tracked manually from fills.
         """
-        # # Set cooldown period after order fill
-        # if self.config.order_cooldown > 0:
-        #     self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
-
         # Get current inventory from connector's actual position
         current_inventory = self._get_current_inventory()
         
@@ -376,7 +372,7 @@ class PMMAvellanedaMulti(ScriptStrategyBase):
         self._filled_orders_df = pd.concat([self._filled_orders_df, new_row], ignore_index=True)
         
         # Keep only last 6 fills
-        if len(self._filled_orders_df) > 6:
+        if len(self._filled_orders_df) > 10:
             self._filled_orders_df = self._filled_orders_df.tail(6).reset_index(drop=True)
         
         msg = (f"{event.trade_type.name} {round(event.amount, 2)} {event.trading_pair} "

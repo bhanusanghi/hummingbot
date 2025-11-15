@@ -60,8 +60,7 @@ class MMGrid(ScriptStrategyBase):
     - Batch order placement and cancel all
     """
 
-    create_timestamp = 0
-    account_config_set = False
+    current_timestamp: float
 
     @classmethod
     def init_markets(cls, config: MMGridConfig):
@@ -70,6 +69,8 @@ class MMGrid(ScriptStrategyBase):
     def __init__(self, connectors: Dict[str, ConnectorBase], config: MMGridConfig):
         super().__init__(connectors)
         self.config = config
+        self.account_config_set = False
+        self.create_timestamp = 0
         self._cached_mark_price: Decimal = Decimal("0")
         self._cached_mid_price: Decimal = Decimal("0")
         self._cached_bid_anchor: Decimal = Decimal("0")
@@ -282,18 +283,12 @@ class MMGrid(ScriptStrategyBase):
         Cancel all active orders and then place new orders sequentially.
         This ensures old orders are cancelled before new ones are placed.
         """
-        # First, cancel all active orders and wait for completion
-        cancel_results = await self._async_cancel_all_orders()
+        connector = self.connectors[self.config.exchange]
 
-        # Verify cancellation succeeded before placing new orders
-        if cancel_results is None:
-            self.logger().warning("cancel_results is None. Skipping new order placement this cycle.")
+        cancel_success = await connector.cancel_all_symbol(self.config.trading_pair)
+        if not cancel_success:
+            self.logger().warning(f"Cancel all failed: Skipping new order placement this cycle.")
             return
-
-        if cancel_results is not None:
-            if any(not result.get("success", False) for result in cancel_results):
-                self.logger().warning("Some orders failed to cancel. Skipping new order placement this cycle.")
-                return
 
         # Then place new orders
         await self._async_place_orders(proposal)
@@ -320,76 +315,6 @@ class MMGrid(ScriptStrategyBase):
 
         # Call batch_order_create and wait for completion
         await connector.batch_order_create(orders_to_create)
-
-    async def _async_cancel_all_orders(self) -> Optional[List[Dict[str, Any]]]:
-        """Cancel all active orders using batch API and wait for completion"""
-        connector = self.connectors[self.config.exchange]
-
-        # Get orders directly from connector's order tracker instead of strategy's order tracker
-        # This ensures we get the most up-to-date list including orders just placed
-        all_in_flight_orders = connector._order_tracker.active_orders
-
-        # Collect InFlightOrder objects for orders to cancel
-        orders_to_cancel = []
-        orders_skipped = 0
-        total_orders_checked = 0
-
-        for in_flight_order in all_in_flight_orders.values():
-            # Filter by current trading pair only
-            if in_flight_order.trading_pair != self.config.trading_pair:
-                continue
-
-            total_orders_checked += 1
-
-            # Check if order is actually still open
-            if in_flight_order.is_open:
-                orders_to_cancel.append(in_flight_order)
-            else:
-                # Order is already done (filled/cancelled/failed), skip it
-                self.logger().debug(
-                    f"Order {in_flight_order.client_order_id} is {in_flight_order.current_state.name}, "
-                    f"skipping cancellation"
-                )
-                orders_skipped += 1
-
-        # Log when no orders are found to cancel (important for debugging)
-        if not orders_to_cancel:
-            if total_orders_checked == 0:
-                self.logger().debug(
-                    f"No active orders found for {self.config.trading_pair} to cancel. "
-                    f"This may be normal if all orders were already filled/cancelled."
-                )
-            else:
-                self.logger().info(
-                    f"Found {total_orders_checked} order(s) for {self.config.trading_pair}, "
-                    f"but all are already {orders_skipped} filled/cancelled/failed. "
-                    f"No cancellation needed."
-                )
-            return []
-
-        # Use batch cancellation if we have orders to cancel and wait for completion
-        try:
-            self.logger().debug(f"Cancelling {len(orders_to_cancel)} active order(s) for {self.config.trading_pair}")
-
-            results = await connector.batch_order_cancel(
-                orders_to_cancel)  # Technically this should do cancel_all if > 10, right now default cancel_all
-
-            return results
-
-        except Exception as e:
-            self.logger().warning(
-                f"Error cancelling orders: {e}. "
-            )
-            return None
-
-    def did_fill_order(self, event: OrderFilledEvent):
-        """
-        Called automatically by framework when order is filled.
-        Logs the fill and updates the filled orders DataFrame.
-        Note: Inventory is now retrieved from the connector's actual position,
-        not tracked manually from fills.
-        """
-        return
 
     def _get_current_inventory(self) -> Decimal:
         """
@@ -442,91 +367,76 @@ class MMGrid(ScriptStrategyBase):
         return Decimal("1") + Decimal(str(variation))
 
     def format_status(self) -> str:
-        """
-        Return status string showing current strategy state.
-        """
         if not self.ready_to_trade:
             return "Market connectors are not ready."
 
+        mid = self._cached_mid_price
+        ema = self._ema_mid
+        mark = self._cached_mark_price
+
+        skew_bps = (self._cached_skew_mult - Decimal("1")) * Decimal("10000")
+        spread_mult = self._cached_spread_mult
+        inv_ratio_pct = self._cached_inventory_ratio * Decimal("100")
+
         lines = []
         lines.append("")
-        lines.append("  Strategy Status:")
-        lines.append(f"    Trading Pair: {self.config.trading_pair}")
-        lines.append(f"    Exchange: {self.config.exchange}")
-        lines.append(f"    Ask Spread Levels: {[f'{s * 100:.4f}%' for s in self.config.ask_spread_levels]}")
-        lines.append(f"    Bid Spread Levels: {[f'{s * 100:.4f}%' for s in self.config.bid_spread_levels]}")
-        lines.append(f"    Mark Price: {self._cached_mark_price:.4f}")
-        lines.append(f"    Mid Price: {self._cached_mid_price:.4f}")
-        lines.append(f"    EMA: {self._ema_mid:.4f}")
-        lines.append(f"    Current Inventory: {self._cached_inventory:.4f}")
-        lines.append(f"    Max Inventory: {self.config.max_inventory:.4f}")
-        lines.append(f"    Inventory Ratio %: {self._cached_inventory_ratio * 100:.2f}")
-        lines.append(f"    Price Skew: {(self._cached_skew_mult - Decimal('1')) * 100:.4f}")
-        lines.append(f"    Spread Mult: {self._cached_spread_mult:.4f}")
-        lines.append(f"    Random Factor: {self._cached_random_factor:.4f}")
-        lines.append(f"    Current timestamp: {_fmt(self.current_timestamp)}")
-        lines.append(f"    Create timestamp: {_fmt(self.create_timestamp)}")
-        lines.append(f"    Cooldown timestamp: {_fmt(self._cooldown_until_timestamp)}")
-        lines.append(f"    Last Trade: {self._last_trade:.8f}")
+        lines.append("  Strategy Status")
+        lines.append("  ----------------------------")
+        lines.append(f"    Exchange:            {self.config.exchange}")
+        lines.append(f"    Trading Pair:        {self.config.trading_pair}")
+        lines.append("")
+        lines.append(f"    Mark Price:          {mark:.4f}")
+        lines.append(f"    Mid Price:           {mid:.4f}")
+        lines.append(f"    EMA ({self.config.ema_window}):            {ema:.4f}")
+        lines.append("")
+        lines.append(f"    Inventory:           {self._cached_inventory:.4f}")
+        lines.append(f"    Max Inventory:       {self.config.max_inventory:.4f}")
+        lines.append(f"    Inventory Ratio:     {inv_ratio_pct:.2f}%")
+        lines.append("")
+        lines.append(f"    Price Skew:          {skew_bps:+.2f} bps")
+        lines.append(f"    Spread Multiplier:   {spread_mult:.3f}x")
+        lines.append(f"    Random Factor:       {self._cached_random_factor:.4f}x")
+        lines.append("")
+        lines.append(f"    Current Time:        {_fmt(self.current_timestamp)}")
+        lines.append(f"    Cooldown Ends At:    {_fmt(self._cooldown_until_timestamp)}")
+        lines.append(f"    Next Refresh:        {_fmt(self.create_timestamp)}")
+        lines.append("")
+        lines.append(f"    Last Trade Size:     {self._last_trade:.6f}")
+        lines.append("")
 
+        # Order proposals
         proposals = self._cached_proposals
         if proposals:
-            lines.append("")
-            lines.append("  Current Order Proposals (sorted like order book):")
-            lines.append("        PRICE         SIDE        AMOUNT    ΔMID (bps)")
-            lines.append("    -----------------------------------------------------")
-
-            mid = self._cached_mid_price
-            ema = self._ema_mid
-
-            def spread_bps(price: Decimal) -> str:
-                if mid == 0:
-                    return "     n/a"
-                bps = (float(price / mid) - 1.0) * 10000.0
-                return f"{bps:>11.2f}"
+            lines.append("  Current Proposals (Orderbook-style Sort)")
+            lines.append("        PRICE        SIDE      AMOUNT     ΔMID (bps)")
+            lines.append("    --------------------------------------------------")
 
             rows = []
 
-            # Proposals
+            # append proposals
             for p in proposals:
                 rows.append({
                     "price": p.price,
                     "side": p.order_side.name,
                     "amount": p.amount,
-                    "is_marker": False
+                    "marker": False
                 })
 
-            # EMA marker
-            rows.append({
-                "price": ema,
-                "side": "EMA",
-                "amount": None,
-                "is_marker": True
-            })
+            # markers: MID + EMA (makes visual alignment)
+            rows.append({"price": mid, "side": "MID", "amount": None, "marker": True})
+            rows.append({"price": ema, "side": "EMA", "amount": None, "marker": True})
 
-            # MID marker
-            rows.append({
-                "price": mid,
-                "side": "MID",
-                "amount": None,
-                "is_marker": True
-            })
-
-            # Sort descending (order-book style)
             rows.sort(key=lambda r: r["price"], reverse=True)
 
-            for row in rows:
-                price = row["price"]
-                side = row["side"]
-                is_marker = row["is_marker"]
+            def spread_bps(price):
+                if mid == 0:
+                    return "   n/a"
+                return f"{((float(price / mid) - 1) * 10000):>10.2f}"
 
-                if is_marker:
-                    amount_str = "-".rjust(10)
-                else:
-                    amount_str = f"{row['amount']:>10.6f}"
-
+            for r in rows:
+                amount = "-" if r["marker"] else f"{r['amount']:.6f}"
                 lines.append(
-                    f"    {price:>12.4f}     {side:<6}   {amount_str}  {spread_bps(price)}"
+                    f"    {r['price']:>12.4f}   {r['side']:<6}   {amount:>10}   {spread_bps(r['price'])}"
                 )
 
         return "\n".join(lines)
