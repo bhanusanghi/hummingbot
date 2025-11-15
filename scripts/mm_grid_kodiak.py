@@ -95,7 +95,6 @@ class MMGrid(ScriptStrategyBase):
             self.account_config_set = True
 
     def on_tick(self):
-        self.logger().info(f"Current timestamp: {_fmt(self.current_timestamp)}")
         if self.current_timestamp > self.create_timestamp:
             proposals: List[PerpetualOrderCandidate] = self.create_proposal()
             self._cached_proposals = proposals
@@ -216,11 +215,11 @@ class MMGrid(ScriptStrategyBase):
 
         if same_direction_trade:
             self.logger().info(f"Same-direction trade: {trade:.4f}. Half cooldown")
-            self._cooldown_until_timestamp = self._current_timestamp + self.config.order_cooldown
+            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown / 2
 
         elif sign(last_trade) == 0:
             self.logger().info(f"First trade: {trade:.4f}. Starting cooldown")
-            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
+            # self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
 
         else:
             self.logger().info(f"Opposite-direction trade: {trade:.4f}. Starting cooldown")
