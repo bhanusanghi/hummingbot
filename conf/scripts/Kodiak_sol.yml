@@ -1,0 +1,14 @@
+exchange: orderly_perpetual
+trading_pair: SOL-USDC
+order_size: [1, 0.5] #in SOL
+bid_spread_levels: [0.00015, 0.00025] #in bps
+ask_spread_levels: [0.00015, 0.00025] #in bps
+order_refresh_time: 2 #in seconds
+max_inventory: 10 #in SOL terms
+max_price_adjustment: 0.001 #0.12% maximum skew to fair price at max inventory
+min_inventory_pct_for_adjustment: 0.1 #25% of max inventory: no adjustment
+max_spread_mult: 2.0 #spreads widen up to 100%
+randomization: 0.2 #20%
+leverage: 100
+order_cooldown: 30
+order_tag: ""
