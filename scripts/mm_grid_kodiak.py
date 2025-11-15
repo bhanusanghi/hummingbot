@@ -219,7 +219,7 @@ class MMGrid(ScriptStrategyBase):
 
         elif sign(last_trade) == 0:
             self.logger().info(f"First trade: {trade:.4f}. Starting cooldown")
-            # self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
+            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
 
         else:
             self.logger().info(f"Opposite-direction trade: {trade:.4f}. Starting cooldown")
