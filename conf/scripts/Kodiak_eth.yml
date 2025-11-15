@@ -7,7 +7,7 @@ order_refresh_time: 3 #in seconds
 max_inventory: 3 #in ETH terms
 max_price_adjustment: 0.0012 #0.12% maximum skew to fair price at max inventory
 min_inventory_pct_for_adjustment: 0.1 #25% of max inventory: no adjustment
-max_spread_widening: 1.0 #spreads widen up to 100%
+max_spread_mult: 2.0 #spreads widen up to 100%
 randomization: 0.1 #20%
 leverage: 100
 order_cooldown: 30

@@ -18,7 +18,10 @@ from hummingbot.core.event.events import (
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.core.clock import Clock
+from datetime import datetime
 
+def _fmt(ts):
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
 def sign(x):
     return (x > 0) - (x < 0)
@@ -35,7 +38,7 @@ class MMGridConfig(BaseClientModel):
     max_inventory: Decimal = Field(0.01)
     min_inventory_pct_for_adjustment: Decimal = Field(default=Decimal("0.25"))
     max_price_adjustment: Decimal = Field(default=Decimal("0.001"))
-    max_spread_widening: Decimal = Field(default=Decimal("0.5"))
+    max_spread_mult: Decimal = Field(default=Decimal("0.5"))
     randomization: Decimal = Field(default=Decimal("0.25"))
     leverage: int = Field(100)
     order_tag: Optional[str] = Field(default="None")
@@ -66,9 +69,9 @@ class MMGrid(ScriptStrategyBase):
         self._cached_mark_price: Decimal = Decimal("0")
         self._cached_mid_price: Decimal = Decimal("0")
         self._cached_reservation_price: Decimal = Decimal("0")
-        self._cached_spread_widening_factor: Decimal = Decimal("0")
+        self._cached_spread_mult: Decimal = Decimal("0")
         self._cached_random_factor: Decimal = Decimal("0")
-        self._cached_skew_factor: Decimal = Decimal("0")
+        self._cached_skew_mult: Decimal = Decimal("0")
         self._cached_proposals: List[PerpetualOrderCandidate] = []
         self._cooldown_until_timestamp: int = 0
         self._last_trade = Decimal("0")
@@ -129,11 +132,11 @@ class MMGrid(ScriptStrategyBase):
         self._cached_mark_price = mark_price
         self._cached_mid_price = mid_price
         self._cached_reservation_price = reservation_price
-        self._cached_skew_factor = skew_factor
+        self._cached_skew_mult = skew_factor
         self._cached_inventory_ratio = inventory_ratio
 
-        spread_widening_factor = Decimal("1") + abs(inventory_ratio) * self.config.max_spread_widening
-        self._cached_spread_widening_factor = spread_widening_factor
+        spread_mult = abs(inventory_ratio) * self.config.max_spread_mult
+        self._cached_spread_mult = spread_mult
 
         random_factor = self._random_factor()
         self._cached_random_factor = random_factor
@@ -147,8 +150,8 @@ class MMGrid(ScriptStrategyBase):
             ask_spread = self.config.ask_spread_levels[idx]
 
             # Spreads relative to top of book
-            bid_price = reservation_price * (Decimal("1") - bid_spread * spread_widening_factor * random_factor)
-            ask_price = reservation_price * (Decimal("1") + ask_spread * spread_widening_factor * random_factor)
+            bid_price = reservation_price * (Decimal("1") - bid_spread * spread_mult * random_factor)
+            ask_price = reservation_price * (Decimal("1") + ask_spread * spread_mult * random_factor)
 
             # To make sure the limit maker orders are not immediately taken
             # Only the offending side is adjusted, and placed at top of book
@@ -396,9 +399,6 @@ class MMGrid(ScriptStrategyBase):
         if not self.ready_to_trade:
             return "Market connectors are not ready."
 
-        spread_widening_factor = self._cached_spread_widening_factor
-        skew_factor = self._cached_skew_factor
-
         lines = []
         lines.append("")
         lines.append("  Strategy Status:")
@@ -408,23 +408,22 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Bid Spread Levels: {[f'{s * 100:.4f}%' for s in self.config.bid_spread_levels]}")
         lines.append(f"    Mark Price: {self._cached_mark_price:.8f}")
         lines.append(f"    Mid Price: {self._cached_mid_price:.8f}")
-        lines.append(f"    Current Inventory: {self._cached_inventory:.8f}")
-        lines.append(f"    Max Inventory: {self.config.max_inventory:.8f}")
-        lines.append(f"    Inventory Ratio: {self._cached_inventory_ratio:.4f}")
-        lines.append(f"    Reservation Price: {self._cached_reservation_price:.8f}")
-        lines.append(f"    Price Adjustment: {self._cached_reservation_price - self._cached_mid_price:.8f}")
-        lines.append(f"    Skew: {skew_factor:.6f}")
-        lines.append(f"    Spread Widening Factor: {spread_widening_factor:.4f}")
+        lines.append(f"    Current Inventory: {self._cached_inventory:.4f}")
+        lines.append(f"    Max Inventory: {self.config.max_inventory:.4f}")
+        lines.append(f"    Inventory Ratio %: {self._cached_inventory_ratio & 100:.2f}")
+        lines.append(f"    Reservation Price: {self._cached_reservation_price:.4f}")
+        lines.append(f"    Price Adjustment: {self._cached_reservation_price - self._cached_mid_price:.4f}")
+        lines.append(f"    Price Skew: {(self._cached_skew_mult - Decimal('1')) * 100:.4f}")
+        lines.append(f"    Spread Mult: {self._cached_spread_mult:.4f}")
         lines.append(f"    Random Factor: {self._cached_random_factor:.4f}")
-        lines.append(f"    Current timestamp: {self.current_timestamp}")
-        lines.append(f"    Create timestamp: {self.create_timestamp}")
+        lines.append(f"    Current timestamp: {_fmt(self.current_timestamp)}")
+        lines.append(f"    Create timestamp: {_fmt(self.create_timestamp)}")
+        lines.append(f"    Cooldown timestamp: {_fmt(self._cooldown_until_timestamp)}")
         lines.append(f"    Last Trade: {self._last_trade:.8f}")
-        lines.append(f"    Cooldown timestamp: {self._cooldown_until_timestamp}")
 
-        # proposals = self._cached_proposals
-        # if(len(proposals) > 0):
-        #     lines.append("")
-        #     lines.append("  Order Proposals:")
-        #     lines.append(f" {proposal.order_side, proposal.price, proposal.amount}" for proposal in proposals)
+        proposals = self._cached_proposals
+        if(len(proposals) > 0):
+            for p in proposals:
+                lines.append(f"    ({p.order_side}, {p.price}, {p.amount})")
 
         return "\n".join(lines)
