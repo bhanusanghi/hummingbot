@@ -4,7 +4,6 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from numpy.ma.mrecords import reserved_fields
 from pydantic import Field
 
 from hummingbot.client.config.config_data_types import BaseClientModel
@@ -38,10 +37,11 @@ class MMGridConfig(BaseClientModel):
     max_inventory: Decimal = Field(0.01)
     min_inventory_pct_for_adjustment: Decimal = Field(default=Decimal("0.25"))
     max_price_adjustment: Decimal = Field(default=Decimal("0.001"))
-    max_spread_mult: Decimal = Field(default=Decimal("0.5"))
+    max_spread_mult: Decimal = Field(default=Decimal("1.5"))
     randomization: Decimal = Field(default=Decimal("0.25"))
     leverage: int = Field(100)
     order_tag: Optional[str] = Field(default="None")
+    ema_window: int = Field(10)  # multiple of refresh rate
 #    target_inventory: Decimal = Field(0.0)
 
 class MMGrid(ScriptStrategyBase):
@@ -49,11 +49,15 @@ class MMGrid(ScriptStrategyBase):
     Market Making + Grid Strategy with Batch Order Operations
 
     Key features:
-    - Reservation price calculation based on inventory
+    - Price skew based on inventory
+    - Size skew based on inventory
+    - Size randomization
+    - Cooldown on order fill to avoid immediate recenter
+    - Ema to guide bid_anchor and ask_anchor
     - Multiple constant spread levels
     - Inventory management and tracking
     - Order lifecycle management via connector's order tracker
-    - Batch order placement and cancellation for improved efficiency
+    - Batch order placement and cancel all
     """
 
     create_timestamp = 0
@@ -68,7 +72,8 @@ class MMGrid(ScriptStrategyBase):
         self.config = config
         self._cached_mark_price: Decimal = Decimal("0")
         self._cached_mid_price: Decimal = Decimal("0")
-        self._cached_reservation_price: Decimal = Decimal("0")
+        self._cached_bid_anchor: Decimal = Decimal("0")
+        self._cached_ask_anchor: Decimal = Decimal("0")
         self._cached_spread_mult: Decimal = Decimal("0")
         self._cached_random_factor: Decimal = Decimal("0")
         self._cached_skew_mult: Decimal = Decimal("0")
@@ -77,6 +82,8 @@ class MMGrid(ScriptStrategyBase):
         self._last_trade = Decimal("0")
         self._cached_inventory: Decimal = Decimal("0")
         self._cached_inventory_ratio: Decimal = Decimal("0")
+        self._mid_history: List[Decimal] = []
+        self._ema_mid: Decimal = Decimal("0")
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
 
@@ -85,6 +92,11 @@ class MMGrid(ScriptStrategyBase):
         super().start(clock, timestamp)
 
     def apply_initial_setting(self):
+        n = len(self.config.order_size)
+        if len(self.config.bid_spread_levels) != n or len(self.config.ask_spread_levels) != n:
+            raise ValueError("order_size, bid_spread_levels, and ask_spread_levels must have the same length")
+
+        #TODO: add other config validations
         if not self.account_config_set:
             connector = self.connectors[self.config.exchange]
             connector.set_leverage(self.config.trading_pair, self.config.leverage)
@@ -111,6 +123,10 @@ class MMGrid(ScriptStrategyBase):
         order_book = connector.get_order_book(self.config.trading_pair)
         bids_df, asks_df = order_book.snapshot
 
+        if bids_df.empty or asks_df.empty:
+            self.logger().warning("Order book snapshot is empty, skipping proposal.")
+            return []
+
         # Get best bid/ask prices and sizes
         best_bid_price = Decimal(str(bids_df.iloc[0].price))
         best_bid_size = Decimal(str(bids_df.iloc[0].amount))
@@ -123,15 +139,20 @@ class MMGrid(ScriptStrategyBase):
             mid_price = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (
                         best_bid_size + best_ask_size)
 
+        ema = self._update_ema_mid(mid_price)
+
         inventory = self._detect_trade()
         inventory_ratio = self._inventory_ratio(inventory)
         skew_factor = Decimal("1") - inventory_ratio * self.config.max_price_adjustment
-        reservation_price = mid_price * skew_factor
+
+        bid_anchor = min(ema, mid_price, mark_price)
+        ask_anchor = max(ema, mid_price, mark_price)
 
         # Cache values for status reporting
+        self._cached_bid_anchor = bid_anchor
+        self._cached_ask_anchor = ask_anchor
         self._cached_mark_price = mark_price
         self._cached_mid_price = mid_price
-        self._cached_reservation_price = reservation_price
         self._cached_skew_mult = skew_factor
         self._cached_inventory_ratio = inventory_ratio
 
@@ -150,16 +171,20 @@ class MMGrid(ScriptStrategyBase):
             ask_spread = self.config.ask_spread_levels[idx]
 
             # Spreads relative to top of book
-            bid_price = reservation_price * (Decimal("1") - bid_spread * spread_mult * random_factor)
-            ask_price = reservation_price * (Decimal("1") + ask_spread * spread_mult * random_factor)
+            bid_price = bid_anchor * skew_factor * (Decimal("1") - bid_spread * spread_mult)
+            ask_price = ask_anchor * skew_factor * (Decimal("1") + ask_spread * spread_mult)
 
             # To make sure the limit maker orders are not immediately taken
             # Only the offending side is adjusted, and placed at top of book
+
+            bid_index = min(idx * 2, len(bids_df) - 1)
+            ask_index = min(idx * 2, len(asks_df) - 1)
+
             if bid_price >= mid_price:
-                bid_price = Decimal(str(bids_df.iloc[idx * 2].price))
+                bid_price = Decimal(str(bids_df.iloc[bid_index].price))
 
             if ask_price <= mid_price:
-                ask_price = Decimal(str(asks_df.iloc[idx * 2].price))
+                ask_price = Decimal(str(asks_df.iloc[ask_index].price))
 
             size = self.config.order_size[idx] * random_factor
 
@@ -201,6 +226,7 @@ class MMGrid(ScriptStrategyBase):
         # Initialization
         if self._last_trade == 0 and last_inventory == 0:
             self._cached_inventory = inventory
+            self._cooldown_until_timestamp = self.current_timestamp
             return inventory
 
         # change in position = trade
@@ -219,7 +245,7 @@ class MMGrid(ScriptStrategyBase):
 
         elif same_direction_trade:
             self.logger().info(f"Same-direction trade: {trade:.4f}. Add half cooldown")
-            self._cooldown_until_timestamp = self.config.order_cooldown + self.config.order_cooldown / 2
+            self._cooldown_until_timestamp = max(self.current_timestamp, self._cooldown_until_timestamp) + self.config.order_cooldown / 2
 
         else:
             self.logger().info(f"Opposite-direction trade: {trade:.4f}. Starting cooldown")
@@ -228,6 +254,28 @@ class MMGrid(ScriptStrategyBase):
         self._last_trade = trade
         self._cached_inventory = inventory
         return inventory
+
+    def _update_ema_mid(self, mid: Decimal) -> Decimal:
+        """
+        Update EMA of mid price using pandas.
+        Keeps at most ema_window mids in history.
+        """
+        self._mid_history.append(mid)
+
+        # Keep only the last ema_window
+        max_len = self.config.ema_window
+        if len(self._mid_history) > max_len:
+            self._mid_history = self._mid_history[-max_len:]
+
+        # Use pandas to compute EMA
+        # Convert Decimals to float for pandas, then back to Decimal
+        s = pd.Series([float(m) for m in self._mid_history])
+
+        # span = ema_window is the standard EMA parameter
+        ema_val = s.ewm(span=self.config.ema_window, adjust=False).mean().iloc[-1]
+
+        self._ema_mid = Decimal(str(ema_val))
+        return self._ema_mid
 
     async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
         """
@@ -407,13 +455,12 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Exchange: {self.config.exchange}")
         lines.append(f"    Ask Spread Levels: {[f'{s * 100:.4f}%' for s in self.config.ask_spread_levels]}")
         lines.append(f"    Bid Spread Levels: {[f'{s * 100:.4f}%' for s in self.config.bid_spread_levels]}")
-        lines.append(f"    Mark Price: {self._cached_mark_price:.8f}")
-        lines.append(f"    Mid Price: {self._cached_mid_price:.8f}")
+        lines.append(f"    Mark Price: {self._cached_mark_price:.4f}")
+        lines.append(f"    Mid Price: {self._cached_mid_price:.4f}")
+        lines.append(f"    EMA: {self._ema_mid:.4f}")
         lines.append(f"    Current Inventory: {self._cached_inventory:.4f}")
         lines.append(f"    Max Inventory: {self.config.max_inventory:.4f}")
         lines.append(f"    Inventory Ratio %: {self._cached_inventory_ratio * 100:.2f}")
-        lines.append(f"    Reservation Price: {self._cached_reservation_price:.4f}")
-        lines.append(f"    Price Adjustment: {self._cached_reservation_price - self._cached_mid_price:.4f}")
         lines.append(f"    Price Skew: {(self._cached_skew_mult - Decimal('1')) * 100:.4f}")
         lines.append(f"    Spread Mult: {self._cached_spread_mult:.4f}")
         lines.append(f"    Random Factor: {self._cached_random_factor:.4f}")
@@ -426,32 +473,60 @@ class MMGrid(ScriptStrategyBase):
         if proposals:
             lines.append("")
             lines.append("  Current Order Proposals (sorted like order book):")
-            lines.append("        PRICE         SIDE        AMOUNT")
-            lines.append("    ---------------------------------------------")
-
-            sorted_props = sorted(proposals, key=lambda p: p.price, reverse=True)
+            lines.append("        PRICE         SIDE        AMOUNT    ΔMID (bps)")
+            lines.append("    -----------------------------------------------------")
 
             mid = self._cached_mid_price
-            inserted_mid = False
+            ema = self._ema_mid
 
-            for p in sorted_props:
+            def spread_bps(price: Decimal) -> str:
+                if mid == 0:
+                    return "     n/a"
+                bps = (float(price / mid) - 1.0) * 10000.0
+                return f"{bps:>11.2f}"
 
-                # Insert MID row once, when price crosses below mid
-                if not inserted_mid and p.price < mid:
-                    lines.append(
-                        f"    {mid:>12.4f}     {'MID':<6}   {'-':>10}"
-                    )
-                    inserted_mid = True
+            rows = []
 
-                # Format proposal rows
+            # Proposals
+            for p in proposals:
+                rows.append({
+                    "price": p.price,
+                    "side": p.order_side.name,
+                    "amount": p.amount,
+                    "is_marker": False
+                })
+
+            # EMA marker
+            rows.append({
+                "price": ema,
+                "side": "EMA",
+                "amount": None,
+                "is_marker": True
+            })
+
+            # MID marker
+            rows.append({
+                "price": mid,
+                "side": "MID",
+                "amount": None,
+                "is_marker": True
+            })
+
+            # Sort descending (order-book style)
+            rows.sort(key=lambda r: r["price"], reverse=True)
+
+            for row in rows:
+                price = row["price"]
+                side = row["side"]
+                is_marker = row["is_marker"]
+
+                if is_marker:
+                    amount_str = "-".rjust(10)
+                else:
+                    amount_str = f"{row['amount']:>10.6f}"
+
                 lines.append(
-                    f"    {p.price:>12.4f}     {p.order_side.name:<6}   {p.amount:>10.6f}"
-                )
-
-            # If all proposals are above mid, show MID at bottom
-            if not inserted_mid:
-                lines.append(
-                    f"    {mid:>12.4f}     {'MID':<6}   {'-':>10}"
+                    f"    {price:>12.4f}     {side:<6}   {amount_str}  {spread_bps(price)}"
                 )
 
         return "\n".join(lines)
