@@ -423,7 +423,12 @@ class MMGrid(ScriptStrategyBase):
 
         proposals = self._cached_proposals
         if len(proposals) > 0:
+            lines.append("")
+            lines.append("  Current Order Proposals:")
             for p in proposals:
-                self.logger().info({p.order_side}, {p.price}, {p.amount})
+                # p.order_side is a TradeType enum, so use .name
+                lines.append(
+                    f"    Side: {p.order_side.name}, Price: {p.price:.8f}, Amount: {p.amount:.8f}"
+                )
 
         return "\n".join(lines)
