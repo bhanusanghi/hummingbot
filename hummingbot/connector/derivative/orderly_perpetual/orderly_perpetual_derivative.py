@@ -1264,7 +1264,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             )
 
             success_flag = resp.get("success", True)
-            status = resp.get("status")
+            data = resp.get("data") or {}
+            status = data.get("status")
 
             if not success_flag or status != "CANCEL_ALL_SENT":
                 self.logger().warning(f"[CANCEL_ALL] Unexpected response for {symbol}: {resp}")
@@ -1470,8 +1471,11 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().error(f"[BATCH CANCEL] Error in batch cancellation: {e}", exc_info=True)
             raise IOError(f"Batch order cancellation failed: {e}")
 
+        success_flag = response.get("success", True)
+        data = response.get("data") or {}
+        status = data.get("status")
 
-        if response.get("success", True) and response.get("status", "CANCEL_ALL_SENT"):
+        if success_flag and status == "CANCEL_ALL_SENT":
             timestamp = self.current_timestamp
             results = []
 
