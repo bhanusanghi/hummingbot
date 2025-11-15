@@ -1,5 +1,4 @@
 import random
-import logging
 import os
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -11,7 +10,7 @@ from pydantic import Field
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, PriceType, PositionAction, PositionSide, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder
+#from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
 from hummingbot.core.event.events import (
     OrderFilledEvent,
@@ -21,11 +20,14 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.core.clock import Clock
 
 
+def sign(x):
+    return (x > 0) - (x < 0)
+
 class MMGridConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
     exchange: str = Field("orderly_perpetual")
     trading_pair: str = Field("BTC-USDC")
-    order_amount_quote: List[Decimal] = Field(default=[Decimal("20")])
+    order_size: List[Decimal] = Field(default=[Decimal("0.1")])
     bid_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")])
     ask_spread_levels: List[Decimal] = Field(default=[Decimal("0.001")])
     order_refresh_time: int = Field(10)
@@ -64,13 +66,14 @@ class MMGrid(ScriptStrategyBase):
         self._cached_mark_price: Decimal = Decimal("0")
         self._cached_mid_price: Decimal = Decimal("0")
         self._cached_reservation_price: Decimal = Decimal("0")
-        self._cached_inventory_factor: Decimal = Decimal("0")
         self._cached_spread_widening_factor: Decimal = Decimal("0")
         self._cached_random_factor: Decimal = Decimal("0")
         self._cached_skew_factor: Decimal = Decimal("0")
         self._cached_proposals: List[PerpetualOrderCandidate] = []
         self._cooldown_until_timestamp: int = 0
-        self._last_inventory: Optional[Decimal] = None
+        self._last_trade = Decimal("0")
+        self._cached_inventory: Decimal = Decimal("0")
+        self._cached_inventory_ratio: Decimal = Decimal("0")
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
 
@@ -78,65 +81,23 @@ class MMGrid(ScriptStrategyBase):
         self.apply_initial_setting()
         super().start(clock, timestamp)
 
-    def on_tick(self):
-
-        if self.current_timestamp > self.create_timestamp:
-
-            self._detect_position_increase()
-
-            if self.current_timestamp < self._cooldown_until_timestamp:
-                self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
-                return
-
-            proposals: List[PerpetualOrderCandidate] = self.create_proposal()
-            self._cached_proposals = proposals
-            safe_ensure_future(self._cancel_and_place_orders(proposals))  # Execute cancel then place sequentially to avoid order accumulation
-            self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
-
-    def _detect_position_increase(self) -> None:
-        inventory = self._get_current_inventory()
-
-        if self._last_inventory is None:
-            self._last_inventory = inventory
-            return
-
-        delta = abs(inventory) - abs(self._last_inventory)
-        if delta > 0:
-            self.logger().info(f"Detected position increase: {delta:.8f}. Entering cooldown")
-            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
-
-        self._last_inventory = inventory
-
-    async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
-        """
-        Cancel all active orders and then place new orders sequentially.
-        This ensures old orders are cancelled before new ones are placed.
-        """
-        # First, cancel all active orders and wait for completion
-        cancel_results = await self._async_cancel_all_orders()
-
-        # Verify cancellation succeeded before placing new orders
-        if cancel_results is None:
-            self.logger().warning("cancel_results is None. Skipping new order placement this cycle.")
-            return
-
-        if cancel_results is not None:
-            if any(not result.get("success", False) for result in cancel_results):
-                self.logger().warning("Some orders failed to cancel. Skipping new order placement this cycle.")
-                return
-
-        # Then place new orders
-        await self._async_place_orders(proposal)
-
     def apply_initial_setting(self):
         if not self.account_config_set:
             connector = self.connectors[self.config.exchange]
             connector.set_leverage(self.config.trading_pair, self.config.leverage)
             # Set order tag if configured
-            if self.config.exchange == "orderly_perpetual" and self.config.order_tag:
+            if self.config.exchange == "orderly_perpetual" and self.config.order_tag and len(self.config.order_tag) > 0:
                 self.logger().info(f"Setting order tag: {self.config.order_tag}")
                 connector.set_order_tag(self.config.order_tag)
             self.account_config_set = True
+
+    def on_tick(self):
+        if self.current_timestamp > self.create_timestamp:
+            proposals: List[PerpetualOrderCandidate] = self.create_proposal()
+            self._cached_proposals = proposals
+            if len(proposals) > 0:
+                safe_ensure_future(self._cancel_and_place_orders(proposals))  # Execute cancel then place sequentially to avoid order accumulation
+            self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
 
     def create_proposal(self) -> List[PerpetualOrderCandidate]:
         connector = self.connectors[self.config.exchange]
@@ -159,23 +120,27 @@ class MMGrid(ScriptStrategyBase):
             mid_price = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (
                         best_bid_size + best_ask_size)
 
-        inventory = self._get_current_inventory()
-        skew_factor = self._get_price_skew(inventory)
+        inventory = self._detect_trade()
+        inventory_ratio = self._inventory_ratio(inventory)
+        skew_factor = Decimal("1") - inventory_ratio * self.config.max_price_adjustment
         reservation_price = mid_price * skew_factor
-        inventory_factor = self._inventory_ratio(inventory)
 
         # Cache values for status reporting
         self._cached_mark_price = mark_price
         self._cached_mid_price = mid_price
         self._cached_reservation_price = reservation_price
-        self._cached_inventory_factor = inventory_factor
         self._cached_skew_factor = skew_factor
+        self._cached_inventory_ratio = inventory_ratio
 
-        spread_widening_factor = Decimal("1") + inventory_factor * self.config.max_spread_widening
+        spread_widening_factor = Decimal("1") + abs(inventory_ratio) * self.config.max_spread_widening
         self._cached_spread_widening_factor = spread_widening_factor
 
         random_factor = self._random_factor()
         self._cached_random_factor = random_factor
+
+        # After caching is done, check for cooldown
+        if self.current_timestamp < self._cooldown_until_timestamp:
+            return []
 
         orders = []
         for idx, bid_spread in enumerate(self.config.bid_spread_levels):
@@ -193,48 +158,93 @@ class MMGrid(ScriptStrategyBase):
             if ask_price <= mid_price:
                 ask_price = Decimal(str(asks_df.iloc[idx * 2].price))
 
-            size = self.config.order_amount_quote[idx] / mid_price * random_factor
+            size = self.config.order_size[idx] * random_factor
 
-            if inventory > 0:
-                bid_amount = size * (Decimal("1") - inventory_factor)
-                ask_amount = size
-            else:
-                bid_amount = size
-                ask_amount = size * (Decimal("1") - inventory_factor)
+            # Adjust bid and ask size for inventory. Note: at max inventory, amount is zero
+            bid_amount = size * (Decimal("1") - max(inventory_ratio, Decimal("0"))) # reduce bids if long
+            ask_amount = size * (Decimal("1") - max(-inventory_ratio, Decimal("0"))) # reduce asks if short
 
-            bid_order = PerpetualOrderCandidate(
-                trading_pair=self.config.trading_pair,
-                is_maker=True,
-                order_type=OrderType.LIMIT_MAKER,
-                order_side=TradeType.BUY,
-                amount=bid_amount,
-                price=bid_price,
-                leverage=Decimal(self.config.leverage)
-            )
-
-            ask_order = PerpetualOrderCandidate(
-                trading_pair=self.config.trading_pair,
-                is_maker=True,
-                order_type=OrderType.LIMIT_MAKER,
-                order_side=TradeType.SELL,
-                amount=ask_amount,
-                price=ask_price,
-                leverage=Decimal(self.config.leverage)
-            )
-
-            # Inventory-based order placement logic:
-            if inventory >= self.config.max_inventory and ask_amount > 0:
-                # At max long position, only place ask orders to reduce position
-                orders.extend([ask_order])
-            elif inventory <= -self.config.max_inventory and bid_amount > 0:
-                # At max short position, only place bid orders to reduce position
+            if bid_amount > 0:
+                bid_order = PerpetualOrderCandidate(
+                    trading_pair=self.config.trading_pair,
+                    is_maker=True,
+                    order_type=OrderType.LIMIT_MAKER,
+                    order_side=TradeType.BUY,
+                    amount=bid_amount,
+                    price=bid_price,
+                    leverage=Decimal(self.config.leverage)
+                )
                 orders.extend([bid_order])
-            else:
-                if bid_amount > 0:
-                    orders.extend([bid_order])
-                if ask_amount > 0:
-                    orders.extend([ask_order])
+
+            if ask_amount > 0:
+                ask_order = PerpetualOrderCandidate(
+                    trading_pair=self.config.trading_pair,
+                    is_maker=True,
+                    order_type=OrderType.LIMIT_MAKER,
+                    order_side=TradeType.SELL,
+                    amount=ask_amount,
+                    price=ask_price,
+                    leverage=Decimal(self.config.leverage)
+                )
+                orders.extend([ask_order])
+
         return orders
+
+    # Detect trades, update order cooldown, and return current inventory
+    def _detect_trade(self) -> Decimal:
+        inventory = self._get_current_inventory()
+        last_inventory = self._cached_inventory
+
+        # Initialization
+        if self._last_trade == 0 and last_inventory == 0:
+            self._cached_inventory = inventory
+            return inventory
+
+        # change in position = trade
+        trade = inventory - last_inventory
+
+        if trade == 0:
+            self._cached_inventory = inventory
+            return inventory
+
+        last_trade = self._last_trade
+        same_direction_trade = sign(trade) == sign(last_trade)
+
+        if same_direction_trade:
+            self.logger().info(f"Same-direction trade: {trade:.4f}. No additional cooldown")
+
+        elif sign(last_trade) == 0:
+            self.logger().info(f"First trade: {trade:.4f}. Starting cooldown")
+            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
+
+        else:
+            self.logger().info(f"Opposite-direction trade: {trade:.4f}. Starting cooldown")
+            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
+
+        self._last_trade = trade
+        self._cached_inventory = inventory
+        return inventory
+
+    async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
+        """
+        Cancel all active orders and then place new orders sequentially.
+        This ensures old orders are cancelled before new ones are placed.
+        """
+        # First, cancel all active orders and wait for completion
+        cancel_results = await self._async_cancel_all_orders()
+
+        # Verify cancellation succeeded before placing new orders
+        if cancel_results is None:
+            self.logger().warning("cancel_results is None. Skipping new order placement this cycle.")
+            return
+
+        if cancel_results is not None:
+            if any(not result.get("success", False) for result in cancel_results):
+                self.logger().warning("Some orders failed to cancel. Skipping new order placement this cycle.")
+                return
+
+        # Then place new orders
+        await self._async_place_orders(proposal)
 
     async def _async_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
         """Place multiple orders using batch API and wait for completion"""
@@ -354,25 +364,9 @@ class MMGrid(ScriptStrategyBase):
         else:
             return Decimal("0")
 
-    def _get_price_skew(self, inventory: Decimal) -> Decimal:
-        """
-        Calculate price skew factor based on inventory
-        Apply adjustment with correct sign:
-        - Long position (inventory > 0): lower price (subtract adjustment)
-        - Short position (inventory < 0): raise price (add adjustment)
-        """
-        adjustment = self._inventory_ratio(inventory) * self.config.max_price_adjustment
-
-        if inventory > 0:
-            skew = Decimal("1") - adjustment
-        else:
-            skew = Decimal("1") + adjustment
-
-        return skew
-
     def _inventory_ratio(self, inventory: Decimal) -> Decimal:
         """
-        Returns a factor in [0, 1].
+        Returns a factor in [0, 1] * sign(inventory).
         """
         if self.config.max_inventory == 0:
             return Decimal("0")
@@ -384,7 +378,7 @@ class MMGrid(ScriptStrategyBase):
             return Decimal("0")
 
         # factor is simply r (not rescaled)
-        return inventory_ratio
+        return inventory_ratio * sign(inventory)
 
     def _random_factor(self) -> Decimal:
         """
@@ -402,15 +396,8 @@ class MMGrid(ScriptStrategyBase):
         if not self.ready_to_trade:
             return "Market connectors are not ready."
 
-        mark_price = self._cached_mark_price
-        mid_price = self._cached_mid_price
-        reservation_price = self._cached_reservation_price
-        random_factor = self._cached_random_factor
         spread_widening_factor = self._cached_spread_widening_factor
-        inventory_factor = self._cached_inventory_factor
         skew_factor = self._cached_skew_factor
-
-
 
         lines = []
         lines.append("")
@@ -419,18 +406,19 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Exchange: {self.config.exchange}")
         lines.append(f"    Ask Spread Levels: {[f'{s * 100:.4f}%' for s in self.config.ask_spread_levels]}")
         lines.append(f"    Bid Spread Levels: {[f'{s * 100:.4f}%' for s in self.config.bid_spread_levels]}")
-        lines.append(f"    Mark Price: {mark_price:.8f}")
-        lines.append(f"    Mid Price: {mid_price:.8f}")
-        lines.append(f"    Current Inventory: {self._last_inventory:.8f}")
+        lines.append(f"    Mark Price: {self._cached_mark_price:.8f}")
+        lines.append(f"    Mid Price: {self._cached_mid_price:.8f}")
+        lines.append(f"    Current Inventory: {self._cached_inventory:.8f}")
         lines.append(f"    Max Inventory: {self.config.max_inventory:.8f}")
-        lines.append(f"    Inventory Factor: {inventory_factor:.4f}")
-        lines.append(f"    Reservation Price: {reservation_price:.8f}")
-        lines.append(f"    Price Adjustment: {reservation_price - mid_price:.8f}")
-        lines.append(f"    Skew Factor: {skew_factor:.4f}")
+        lines.append(f"    Inventory Ratio: {self._cached_inventory_ratio:.4f}")
+        lines.append(f"    Reservation Price: {self._cached_reservation_price:.8f}")
+        lines.append(f"    Price Adjustment: {self._cached_reservation_price - self._cached_mid_price:.8f}")
+        lines.append(f"    Skew: {skew_factor:.6f}")
         lines.append(f"    Spread Widening Factor: {spread_widening_factor:.4f}")
-        lines.append(f"    Random Factor: {random_factor:.4f}")
+        lines.append(f"    Random Factor: {self._cached_random_factor:.4f}")
         lines.append(f"    Current timestamp: {self.current_timestamp}")
         lines.append(f"    Create timestamp: {self.create_timestamp}")
+        lines.append(f"    Last Trade: {self._last_trade:.8f}")
         lines.append(f"    Cooldown timestamp: {self._cooldown_until_timestamp}")
 
         # proposals = self._cached_proposals

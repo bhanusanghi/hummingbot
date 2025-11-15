@@ -1,6 +1,6 @@
 exchange: orderly_perpetual
 trading_pair: ETH-USDC
-order_amount_quote: [300, 300, 300] #in USD
+order_size: [0.1, 0.1, 0.1] #in ETH
 bid_spread_levels: [0.0003, 0.0008, 0.0015] #in bps
 ask_spread_levels: [0.0003, 0.0008, 0.0015] #in bps
 order_refresh_time: 3 #in seconds
@@ -11,4 +11,4 @@ max_spread_widening: 1.0 #spreads widen up to 100%
 randomization: 0.1 #20%
 leverage: 100
 order_cooldown: 30
-order_tag: "BERIZARD"
+order_tag: ""
