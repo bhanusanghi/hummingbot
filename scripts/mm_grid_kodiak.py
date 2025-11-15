@@ -95,6 +95,7 @@ class MMGrid(ScriptStrategyBase):
             self.account_config_set = True
 
     def on_tick(self):
+        self.logger().info(f"Current timestamp: {_fmt(self.current_timestamp)}")
         if self.current_timestamp > self.create_timestamp:
             proposals: List[PerpetualOrderCandidate] = self.create_proposal()
             self._cached_proposals = proposals
