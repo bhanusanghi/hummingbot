@@ -1,0 +1,15 @@
+exchange: orderly_perpetual
+trading_pair: ASTER-USDC
+order_size: [50, 100, 150] #in ASTER
+bid_spread_levels: [0.001, 0.0022, 0.004] #in bps
+ask_spread_levels: [0.001, 0.0022, 0.004] #in bps
+order_refresh_time: 6 #in seconds
+max_inventory: 5000 #in ASTER terms
+max_price_adjustment: 0.002 #0.2% maximum skew to fair price at max inventory
+min_inventory_pct_for_adjustment: 0.05 #5% of max inventory: no adjustment
+max_spread_mult: 2.0 #spreads widen up to 100%
+randomization: 0.25 #20%
+leverage: 10
+order_cooldown: 20
+ema_window: 60
+order_tag: ""
