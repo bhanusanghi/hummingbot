@@ -9,7 +9,7 @@ max_price_adjustment: 0.0025 #0.12% maximum skew to fair price at max inventory
 min_inventory_pct_for_adjustment: 0.05 #5% of max inventory: no adjustment
 max_spread_mult: 2.0 #spreads widen up to 100%
 randomization: 0.2 #20%
-leverage: 100
+leverage: 10
 order_cooldown: 20
 ema_window: 60
 order_tag: ""
