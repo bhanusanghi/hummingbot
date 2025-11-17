@@ -20,6 +20,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from async_timeout import timeout
 from bidict import bidict
+import pandas as pd
 
 import hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_constants as CONSTANTS
 import hummingbot.connector.derivative.orderly_perpetual.orderly_perpetual_web_utils as web_utils
@@ -90,6 +91,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         self._domain = domain
         self._position_mode = None
         self._order_tag = order_tag
+        self._position_history: Optional[pd.DataFrame] = None  # Store closed position history
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # ============================================================
@@ -158,6 +160,37 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     def trading_pairs(self) -> List[str]:
         """List of trading pairs"""
         return self._trading_pairs
+
+    @property
+    def position_history(self) -> Optional[pd.DataFrame]:
+        """
+        DataFrame containing closed position history.
+        
+        Columns:
+            - position_id: Unique position identifier
+            - status: Position status (e.g., 'closed')
+            - type: Position type (e.g., 'liquidated', 'normal')
+            - symbol: Trading pair symbol
+            - side: Position side (LONG/SHORT)
+            - avg_open_price: Average entry price
+            - avg_close_price: Average exit price
+            - max_position_qty: Maximum position quantity reached
+            - closed_position_qty: Quantity closed
+            - realized_pnl: Realized profit/loss
+            - trading_fee: Trading fees paid
+            - funding_fee: Accumulated funding fees
+            - insurance_fund_fee: Insurance fund fees
+            - liquidator_fee: Liquidator fees
+            - liquidation_id: Liquidation ID (if applicable)
+            - leverage: Leverage used
+            - open_timestamp: Unix timestamp when position was opened
+            - close_timestamp: Unix timestamp when position was closed
+            - last_update_timestamp: Unix timestamp of last update
+            
+        Returns:
+            DataFrame with closed position history, or None if no history available
+        """
+        return self._position_history
 
     @property
     def is_cancel_request_in_exchange_synchronous(self) -> bool:
@@ -1571,10 +1604,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             exchange_order_id=exchange_order_id,
         )
 
-    async def _update_order_status(self):
-        """Update status of all active orders"""
-        await super()._update_order_status()
-
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         """
         Fetches all trade updates for a specific order from Orderly.
@@ -1688,7 +1717,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     self._perpetual_trading.remove_position(pos_key)
                     continue
 
-                unrealized_pnl = Decimal(str(position_data.get("unrealized_pnl", "0")))
+                # unrealized_pnl = Decimal(str(position_data.get("unsettled_pnl", "0")))
                 entry_price = Decimal(str(position_data.get("average_open_price", "0")))
                 leverage = Decimal(str(position_data.get("leverage", "1")))
 
@@ -1696,7 +1725,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 if position is not None:
                     position.update_position(
                         position_side=position_side,
-                        unrealized_pnl=unrealized_pnl,
+                        unrealized_pnl=Decimal("0"),
                         entry_price=entry_price,
                         amount=abs(position_qty),
                     )
@@ -1704,7 +1733,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     _position = Position(
                         trading_pair=trading_pair,
                         position_side=position_side,
-                        unrealized_pnl=unrealized_pnl,
+                        unrealized_pnl=Decimal("0"),
                         entry_price=entry_price,
                         amount=abs(position_qty),
                         leverage=leverage,
@@ -1942,10 +1971,17 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 self.logger().error("Unexpected error in user stream listener", exc_info=True)
 
     async def _process_order_event(self, event: Dict[str, Any]):
-        """Process order update event from WebSocket"""
-        data = event.get("data", {})
+        """
+        Process order update event from WebSocket.
 
-        client_order_id = data.get("client_order_id")
+        This method handles both order status updates and trade fills.
+        When executedQuantity > 0, it creates a TradeUpdate to record the fill.
+        """
+        data = event.get("data", {})
+        self.logger().info(f"Order event from websocket: {data}")
+
+        # Get client_order_id - Orderly uses camelCase in websocket
+        client_order_id = data.get("clientOrderId")
         if not client_order_id:
             return
 
@@ -1953,6 +1989,46 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         if not tracked_order:
             return
 
+        # Process trade fill if executedQuantity > 0
+        executed_quantity = Decimal(str(data.get("executedQuantity", "0")))
+        if executed_quantity > Decimal("0"):
+            # This order update contains a fill - create TradeUpdate
+            executed_price = Decimal(str(data.get("executedPrice", "0")))
+            fee_amount = Decimal(str(data.get("fee", "0")))
+            fee_asset = data.get("feeAsset", tracked_order.quote_asset)
+            is_maker = data.get("maker", False)
+
+            # Build fee object
+            fee = TradeFeeBase.new_perpetual_fee(
+                fee_schema=self.trade_fee_schema(),
+                position_action=PositionAction.OPEN,  # Default, actual action determined by order
+                percent_token=fee_asset,
+                flat_fees=[TokenAmount(amount=fee_amount, token=fee_asset)] if fee_amount > 0 else []
+            )
+
+            # Use match_id as trade_id (unique identifier for this fill)
+            # If match_id is not available, fall back to a combination of orderId and timestamp
+            trade_id = str(data.get("match_id", data.get("tradeId", "0")))
+            
+            # get current trade from connector if it is long, trade update will have positionaction as close, otherwise as open
+
+            trade_update = TradeUpdate(
+                trade_id=trade_id,
+                client_order_id=client_order_id,
+                exchange_order_id=str(data.get("orderId", "")),
+                trading_pair=tracked_order.trading_pair,
+                fill_timestamp=int(data.get("timestamp", self.current_timestamp) * 1e-3),
+                fill_price=executed_price,
+                fill_base_amount=executed_quantity,
+                fill_quote_amount=executed_price * executed_quantity,
+                fee=fee,
+                is_taker=not is_maker,
+                position_action=PositionAction.OPEN,
+            )
+
+            self._order_tracker.process_trade_update(trade_update)
+
+        # Process order state update
         new_state = CONSTANTS.ORDER_STATE.get(data.get("status"), OrderState.OPEN)
 
         order_update = OrderUpdate(
@@ -1960,20 +2036,327 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             update_timestamp=data.get("timestamp", self.current_timestamp) * 1e-3,
             new_state=new_state,
             client_order_id=client_order_id,
-            exchange_order_id=str(data.get("order_id", "")),
+            exchange_order_id=str(data.get("orderId", "")),
         )
 
         self._order_tracker.process_order_update(order_update)
 
     async def _process_position_event(self, event: Dict[str, Any]):
-        """Process position update event from WebSocket"""
-        # Trigger position update with the event data itself instead of fetching via the rest client
-        await self._update_positions()
+        """
+        Process position update event from WebSocket.
+
+        WebSocket event format:
+        {
+          "topic": "position",
+          "ts": 1684926050966,
+          "data": {
+            "positions": [
+              {
+                "symbol": "PERP_ETH_USDC",
+                "positionQty": 3.1408,
+                "averageOpenPrice": 1804.51490427,
+                "unsettledPnl": -2.79856,
+                "leverage": 10,
+                ...
+              }
+            ]
+          }
+        }
+
+        Updates the internal position state based on WebSocket data.
+        """
+        data = event.get("data", {})
+        positions = data.get("positions", [])
+
+        self.logger().info(f"[WS POSITION EVENT] ========== Received {len(positions)} position update(s) ==========")
+        self.logger().info(f"[WS POSITION EVENT] Raw event data: {event}")
+
+        for position_data in positions:
+            try:
+                symbol = position_data.get("symbol")
+                if not symbol:
+                    self.logger().warning(f"[WS POSITION] Skipping position with no symbol: {position_data}")
+                    continue
+
+                trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol)
+
+                # WebSocket uses camelCase field names
+                position_qty = Decimal(str(position_data.get("positionQty", "0")))
+
+                self.logger().info(
+                    f"[WS POSITION] Processing {symbol} -> {trading_pair}: "
+                    f"positionQty={position_qty}"
+                )
+
+                # Determine position side before checking for zero (needed for pos_key)
+                position_side = PositionSide.LONG if position_qty > 0 else PositionSide.SHORT
+                pos_key = self._perpetual_trading.position_key(trading_pair, position_side)
+
+                if position_qty == 0:
+                    # Remove current side position as well (position fully closed)
+                    self._perpetual_trading.remove_position(pos_key)
+                    self.logger().info(
+                        f"[WS POSITION] CLOSED - {trading_pair}: Removed zero position (both sides cleared)"
+                    )
+
+                    continue
+
+                # Extract position details (camelCase from WebSocket)
+                unsettled_pnl = Decimal(str(position_data.get("unsettledPnl", "0")))
+                entry_price = Decimal(str(position_data.get("averageOpenPrice", "0")))
+                leverage = Decimal(str(position_data.get("leverage", "1")))
+
+                # Get or create position
+                position = self._perpetual_trading.get_position(trading_pair, position_side)
+                if position is not None:
+                    # Update existing position
+                    position.update_position(
+                        position_side=position_side,
+                        unrealized_pnl=unsettled_pnl,
+                        entry_price=entry_price,
+                        amount=abs(position_qty),
+                    )
+                else:
+                    # Create new position
+                    _position = Position(
+                        trading_pair=trading_pair,
+                        position_side=position_side,
+                        unrealized_pnl=unsettled_pnl,
+                        entry_price=entry_price,
+                        amount=abs(position_qty),
+                        leverage=leverage,
+                    )
+                    self._perpetual_trading.set_leverage(trading_pair, int(leverage))
+                    self._perpetual_trading.set_position(pos_key, _position)
+
+            except Exception as e:
+                self.logger().exception(
+                    f"[WS POSITION] Error processing position update for {position_data.get('symbol', 'UNKNOWN')}: {e}"
+                )
+
 
     async def _process_balance_event(self, event: Dict[str, Any]):
-        """Process balance update event from WebSocket"""
-        # Trigger balance update
-        await self._update_balances()
+        """
+        Process balance update event from WebSocket.
+
+        WebSocket event format:
+        {
+          "topic": "balance",
+          "ts": 1651836695254,
+          "data": {
+            "balances": {
+              "USDC": {
+                "holding": 5555815.47398272,
+                "frozen": 0,
+                "interest": 0,
+                ...
+              }
+            }
+          }
+        }
+
+        Replaces all balances with the data from the WebSocket event.
+        """
+        data = event.get("data", {})
+        balances = data.get("balances", {})
+
+        self.logger().info(f"[WS BALANCE] Processing balance update for {len(balances)} token(s)")
+
+        # Replace all balances with the new data (as per user requirement)
+        self._account_balances.clear()
+        self._account_available_balances.clear()
+
+        for token, balance_data in balances.items():
+            try:
+                total = Decimal(str(balance_data.get("holding", "0")))
+                frozen = Decimal(str(balance_data.get("frozen", "0")))
+                available = total - frozen
+
+                self._account_balances[token] = total
+                self._account_available_balances[token] = available
+
+                self.logger().debug(
+                    f"[WS BALANCE] {token}: total={total}, frozen={frozen}, available={available}"
+                )
+
+            except Exception as e:
+                self.logger().exception(
+                    f"[WS BALANCE] Error processing balance for {token}: {e}"
+                )
+
+    # ============================================================
+    # Position History & Realized PnL
+    # ============================================================
+
+    async def _update_position_history(self, trading_pair: Optional[str] = None):
+        """
+        Fetch and log position history with realized PnL for closed trades.
+        
+        This method retrieves closed positions from Orderly and logs:
+        - Realized PnL per position
+        - Trading fees
+        - Funding fees
+        - Position details (symbol, side, entry/exit prices, etc.)
+        
+        Args:
+            trading_pair: Optional specific trading pair to fetch history for.
+                         If None, fetches history for all configured trading pairs.
+        """
+        try:
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+            url = web_utils.public_rest_url(
+                CONSTANTS.POSITION_HISTORY_URL,
+                domain=self._domain
+            )
+            
+            # Determine which trading pairs to fetch history for
+            pairs_to_fetch = [trading_pair] if trading_pair else self._trading_pairs
+            
+            if not pairs_to_fetch:
+                # If no trading pairs configured, fetch all (no symbol filter)
+                params = {"limit": 20}
+                await self._fetch_and_store_position_history(rest_assistant, url, params)
+                return
+            
+            # Fetch position history for each trading pair
+            for pair in pairs_to_fetch:
+                symbol = await self.exchange_symbol_associated_to_pair(pair)
+                params = {"limit": 20, "symbol": symbol}
+                await self._fetch_and_store_position_history(rest_assistant, url, params)
+                
+        except Exception as e:
+            self.logger().exception(f"Error fetching position history: {e}")
+
+    async def _fetch_and_store_position_history(self, rest_assistant, url: str, params: Dict[str, Any]):
+        """
+        Helper method to fetch and store position history data.
+        
+        Args:
+            rest_assistant: REST assistant instance
+            url: API URL
+            params: Query parameters (including symbol filter if specified)
+        """
+        try:
+            response = await rest_assistant.execute_request(
+                url=url,
+                throttler_limit_id=CONSTANTS.POSITION_HISTORY_URL,
+                method=RESTMethod.GET,
+                params=params,
+                is_auth_required=True,
+            )
+            
+            if not response.get("success", False):
+                self.logger().warning(f"Failed to fetch position history: {response}")
+                return
+                
+            data = response.get("data", {})
+            rows = data.get("rows", [])
+            
+            if not rows:
+                self.logger().debug("No closed positions in history")
+                return
+                
+            # Parse position data and create DataFrame with all API fields
+            position_data = []
+            total_realized_pnl = Decimal("0")
+            
+            for position in rows:
+                # Extract all fields from API response
+                position_id = position.get("position_id")
+                status = position.get("status", "")
+                position_type = position.get("type", "")
+                symbol = position.get("symbol", "")
+                side = position.get("side", "")
+                avg_open_price = Decimal(str(position.get("avg_open_price", "0")))
+                avg_close_price = Decimal(str(position.get("avg_close_price", "0")))
+                max_position_qty = Decimal(str(position.get("max_position_qty", "0")))
+                closed_position_qty = Decimal(str(position.get("closed_position_qty", "0")))
+                realized_pnl = Decimal(str(position.get("realized_pnl", "0")))
+                trading_fee = Decimal(str(position.get("trading_fee", "0")))
+                funding_fee = Decimal(str(position.get("accumulated_funding_fee", "0")))
+                insurance_fund_fee = Decimal(str(position.get("insurance_fund_fee", "0")))
+                liquidator_fee = Decimal(str(position.get("liquidator_fee", "0")))
+                liquidation_id = position.get("liquidation_id")
+                leverage = Decimal(str(position.get("leverage", "0")))
+                open_timestamp = position.get("open_timestamp", 0)
+                close_timestamp = position.get("close_timestamp", 0)
+                last_update_timestamp = position.get("last_update_timestamp", 0)
+                
+                total_realized_pnl += realized_pnl
+                
+                # Store all position data for DataFrame
+                position_data.append({
+                    "position_id": position_id,
+                    "status": status,
+                    "type": position_type,
+                    "symbol": symbol,
+                    "side": side,
+                    "avg_open_price": float(avg_open_price),
+                    "avg_close_price": float(avg_close_price),
+                    "max_position_qty": float(max_position_qty),
+                    "closed_position_qty": float(closed_position_qty),
+                    "realized_pnl": float(realized_pnl),
+                    "trading_fee": float(trading_fee),
+                    "funding_fee": float(funding_fee),
+                    "insurance_fund_fee": float(insurance_fund_fee),
+                    "liquidator_fee": float(liquidator_fee),
+                    "liquidation_id": liquidation_id,
+                    "leverage": float(leverage),
+                    "open_timestamp": open_timestamp,
+                    "close_timestamp": close_timestamp,
+                    "last_update_timestamp": last_update_timestamp,
+                })
+                
+                self.logger().info(
+                    f"[POSITION CLOSED] {symbol} {side}: "
+                    f"Qty={closed_position_qty}, "
+                    f"Entry={avg_open_price}, "
+                    f"Exit={avg_close_price}, "
+                    f"Realized PnL={realized_pnl} {CONSTANTS.CURRENCY}, "
+                    f"Trading Fee={trading_fee}, "
+                    f"Funding Fee={funding_fee}, "
+                    f"Closed={close_timestamp}"
+                )
+            
+            # Create DataFrame from new data
+            new_df = pd.DataFrame(position_data)
+            
+            # Merge with existing data and deduplicate by position_id
+            if self._position_history is not None and not self._position_history.empty:
+                # Concatenate old and new data
+                self._position_history = pd.concat([self._position_history, new_df], ignore_index=True)
+                
+                # Remove duplicates, keeping the most recent entry (last occurrence)
+                # This handles cases where the same position is returned in multiple API calls
+                self._position_history = self._position_history.drop_duplicates(
+                    subset=['position_id'], 
+                    keep='last'
+                ).reset_index(drop=True)
+                
+                # Sort by close_timestamp descending (most recent first)
+                self._position_history = self._position_history.sort_values(
+                    by='close_timestamp', 
+                    ascending=False
+                ).reset_index(drop=True)
+                
+                self.logger().debug(
+                    f"[POSITION HISTORY] Added {len(new_df)} positions, "
+                    f"total unique positions: {len(self._position_history)}"
+                )
+            else:
+                # First time initialization
+                self._position_history = new_df.sort_values(
+                    by='close_timestamp', 
+                    ascending=False
+                ).reset_index(drop=True)
+            
+            self.logger().info(
+                f"[POSITION HISTORY] Total Realized PnL from {len(rows)} closed positions: "
+                f"{total_realized_pnl} {CONSTANTS.CURRENCY}"
+            )
+            
+        except Exception as e:
+            self.logger().exception(f"Error in _fetch_and_store_position_history: {e}")
 
     # ============================================================
     # Status Polling
@@ -1985,4 +2368,5 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             self._update_order_status(),
             self._update_balances(),
             self._update_positions(),
+            self._update_position_history(),  # Add position history tracking
         )

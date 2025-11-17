@@ -1,7 +1,7 @@
 import random
 import os
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 from pydantic import Field
@@ -85,12 +85,21 @@ class MMGrid(ScriptStrategyBase):
         self._cached_inventory_ratio: Decimal = Decimal("0")
         self._mid_history: List[Decimal] = []
         self._ema_mid: Decimal = Decimal("0")
+        self._bot_start_timestamp: int = 0  # Track when bot started for filtering position history
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
 
     def start(self, clock: Clock, timestamp: float):
+        self._bot_start_timestamp = int(timestamp * 1000)  # Convert to milliseconds for comparison with API timestamps
         self.apply_initial_setting()
         super().start(clock, timestamp)
+
+    def stop(self, clock: Clock):
+        """
+        Called when bot is stopped. Export position history to CSV.
+        """
+        self._export_position_history()
+        super().stop(clock)
 
     def apply_initial_setting(self):
         n = len(self.config.order_size)
@@ -366,6 +375,207 @@ class MMGrid(ScriptStrategyBase):
         variation = random.uniform(-max_var, max_var)  # float in [-0.25, 0.25]
         return Decimal("1") + Decimal(str(variation))
 
+    def _get_filtered_position_history(self) -> Optional[pd.DataFrame]:
+        """
+        Get position history filtered by current trading pair(s) and bot start time.
+        
+        Returns:
+            DataFrame with filtered position history, or None if no data available
+        """
+        connector = self.connectors[self.config.exchange]
+        
+        # Check if connector has position_history attribute
+        if not hasattr(connector, 'position_history'):
+            return None
+            
+        history = connector.position_history
+        
+        if history is None or history.empty:
+            return None
+        
+        # Convert trading pair format (e.g., BTC-USDC -> PERP_BTC_USDC for Orderly)
+        # Note: config.trading_pair is a string for single pair strategies
+        symbol = f"PERP_{self.config.trading_pair.replace('-', '_')}"
+        
+        # Filter by symbol and timestamp
+        filtered = history[
+            (history['symbol'] == symbol) & 
+            (history['close_timestamp'] >= self._bot_start_timestamp)
+        ].copy()
+        
+        return filtered if not filtered.empty else None
+
+    def _calculate_position_metrics(self) -> Dict[str, any]:
+        """
+        Calculate aggregated metrics from position history.
+        Includes both overall metrics and per-symbol breakdown.
+        
+        Returns:
+            Dict with:
+                - total_pnl: Overall realized PnL
+                - total_fees: Overall fees
+                - total_volume: Overall volume
+                - by_symbol: Dict mapping symbol -> metrics dict
+                - num_positions: Total number of closed positions
+        """
+        filtered_history = self._get_filtered_position_history()
+        
+        if filtered_history is None:
+            return {
+                "total_pnl": Decimal("0"),
+                "total_fees": Decimal("0"),
+                "total_volume": Decimal("0"),
+                "by_symbol": {},
+                "num_positions": 0,
+            }
+        
+        # Calculate overall totals
+        total_pnl = Decimal(str(filtered_history['realized_pnl'].sum()))
+        total_fees = Decimal(str(filtered_history['trading_fee'].sum()))
+        
+        # Calculate total volume (both opening and closing trades)
+        # For LONG positions: 
+        #   - Open (BUY): avg_open_price * |qty|
+        #   - Close (SELL): avg_close_price * |qty|
+        # For SHORT positions:
+        #   - Open (SELL): avg_open_price * |qty|
+        #   - Close (BUY): avg_close_price * |qty|
+        # Total volume = sum of all opening and closing volumes
+        total_volume = Decimal("0")
+        
+        for _, row in filtered_history.iterrows():
+            qty = abs(Decimal(str(row['closed_position_qty'])))
+            open_volume = Decimal(str(row['avg_open_price'])) * qty
+            close_volume = Decimal(str(row['avg_close_price'])) * qty
+            total_volume += (open_volume + close_volume)
+        
+        # Calculate per-symbol metrics
+        by_symbol = {}
+        for symbol in filtered_history['symbol'].unique():
+            symbol_data = filtered_history[filtered_history['symbol'] == symbol]
+            
+            symbol_pnl = Decimal(str(symbol_data['realized_pnl'].sum()))
+            symbol_fees = Decimal(str(symbol_data['trading_fee'].sum()))
+            symbol_volume = Decimal("0")
+            
+            # Calculate volume for both opening and closing trades (use abs for quantity)
+            for _, row in symbol_data.iterrows():
+                qty = abs(Decimal(str(row['closed_position_qty'])))
+                open_volume = Decimal(str(row['avg_open_price'])) * qty
+                close_volume = Decimal(str(row['avg_close_price'])) * qty
+                symbol_volume += (open_volume + close_volume)
+            
+            # Convert symbol back to trading pair format (PERP_BTC_USDC -> BTC-USDC)
+            trading_pair = symbol.replace('PERP_', '').replace('_', '-')
+            
+            by_symbol[trading_pair] = {
+                "pnl": symbol_pnl,
+                "fees": symbol_fees,
+                "volume": symbol_volume,
+                "num_positions": len(symbol_data),
+                "net_pnl": symbol_pnl - symbol_fees,
+            }
+        
+        return {
+            "total_pnl": total_pnl,
+            "total_fees": total_fees,
+            "total_volume": total_volume,
+            "by_symbol": by_symbol,
+            "num_positions": len(filtered_history),
+        }
+
+    def _export_position_history(self):
+        """
+        Export position history to CSV files on bot shutdown.
+        Creates two files:
+        1. Raw data: performance/{script_config_name}/{bot_start}-{bot_end}_raw.csv
+        2. Summary by symbol: performance/{script_config_name}/{bot_start}-{bot_end}_summary.csv
+        """
+        try:
+            filtered_history = self._get_filtered_position_history()
+            
+            if filtered_history is None or filtered_history.empty:
+                self.logger().info("No position history to export")
+                return
+            
+            # Get config name from the script file name (remove .py extension)
+            config_name = self.config.script_file_name.replace('.py', '')
+            
+            # Create performance directory structure
+            perf_dir = os.path.join('performance', config_name)
+            os.makedirs(perf_dir, exist_ok=True)
+            
+            # Format timestamps for filename
+            start_time = datetime.fromtimestamp(self._bot_start_timestamp / 1000).strftime("%Y%m%d_%H%M%S")
+            end_time = datetime.fromtimestamp(self.current_timestamp).strftime("%Y%m%d_%H%M%S")
+            
+            # Export 1: Raw position history data
+            raw_filename = f"{start_time}-{end_time}_raw.csv"
+            raw_filepath = os.path.join(perf_dir, raw_filename)
+            filtered_history.to_csv(raw_filepath, index=False)
+            
+            self.logger().info(f"Raw position history exported to: {raw_filepath}")
+            self.logger().info(f"Total positions exported: {len(filtered_history)}")
+            
+            # # Export 2: Summary aggregated by symbol
+            # summary_data = []
+            # for symbol in filtered_history['symbol'].unique():
+            #     symbol_data = filtered_history[filtered_history['symbol'] == symbol]
+                
+            #     # Convert symbol to trading pair format
+            #     trading_pair = symbol.replace('PERP_', '').replace('_', '-')
+                
+            #     # Aggregate metrics
+            #     total_pnl = symbol_data['realized_pnl'].sum()
+            #     total_fees = symbol_data['trading_fee'].sum()
+            #     total_funding_fees = symbol_data['funding_fee'].sum()
+            #     num_positions = len(symbol_data)
+            #     num_long = len(symbol_data[symbol_data['side'] == 'LONG'])
+            #     num_short = len(symbol_data[symbol_data['side'] == 'SHORT'])
+                
+            #     # Calculate volume (both opening and closing trades, use abs for quantity)
+            #     total_volume = sum(
+            #         (row['avg_open_price'] * abs(row['closed_position_qty'])) + 
+            #         (row['avg_close_price'] * abs(row['closed_position_qty']))
+            #         for _, row in symbol_data.iterrows()
+            #     )
+                
+            #     # Win rate
+            #     winning_positions = len(symbol_data[symbol_data['realized_pnl'] > 0])
+            #     win_rate = (winning_positions / num_positions * 100) if num_positions > 0 else 0
+                
+            #     # Average position metrics
+            #     avg_pnl = total_pnl / num_positions if num_positions > 0 else 0
+            #     avg_position_size = symbol_data['closed_position_qty'].mean()
+                
+            #     summary_data.append({
+            #         'trading_pair': trading_pair,
+            #         'symbol': symbol,
+            #         'num_positions': num_positions,
+            #         'num_long': num_long,
+            #         'num_short': num_short,
+            #         'total_pnl': round(total_pnl, 4),
+            #         'total_fees': round(total_fees, 4),
+            #         'total_funding_fees': round(total_funding_fees, 4),
+            #         'net_pnl': round(total_pnl - total_fees, 4),
+            #         'total_volume': round(total_volume, 2),
+            #         'win_rate_pct': round(win_rate, 2),
+            #         'avg_pnl_per_position': round(avg_pnl, 4),
+            #         'avg_position_size': round(avg_position_size, 6),
+            #     })
+            
+            # # Create summary DataFrame and export
+            # summary_df = pd.DataFrame(summary_data)
+            # summary_filename = f"{start_time}-{end_time}_summary.csv"
+            # summary_filepath = os.path.join(perf_dir, summary_filename)
+            # summary_df.to_csv(summary_filepath, index=False)
+            
+            # self.logger().info(f"Summary by symbol exported to: {summary_filepath}")
+            # self.logger().info(f"Symbols in summary: {len(summary_data)}")
+            
+        except Exception as e:
+            self.logger().error(f"Error exporting position history: {e}", exc_info=True)
+
     def format_status(self) -> str:
         if not self.ready_to_trade:
             return "Market connectors are not ready."
@@ -377,6 +587,15 @@ class MMGrid(ScriptStrategyBase):
         skew_bps = (self._cached_skew_mult - Decimal("1")) * Decimal("10000")
         spread_mult = self._cached_spread_mult
         inv_ratio_pct = self._cached_inventory_ratio * Decimal("100")
+
+        # Get position metrics
+        metrics = self._calculate_position_metrics()
+        total_pnl = metrics["total_pnl"]
+        total_fees = metrics["total_fees"]
+        total_volume = metrics["total_volume"]
+        net_pnl = total_pnl - total_fees
+        num_positions = metrics["num_positions"]
+        by_symbol = metrics["by_symbol"]
 
         lines = []
         lines.append("")
@@ -402,6 +621,28 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Next Refresh:        {_fmt(self.create_timestamp)}")
         lines.append("")
         lines.append(f"    Last Trade Size:     {self._last_trade:.6f}")
+        lines.append("")
+        lines.append("  Performance (Since Bot Start)")
+        lines.append("  ----------------------------")
+        lines.append(f"    Total Positions:     {num_positions}")
+        lines.append(f"    Total PnL:           {total_pnl:+.4f} USDC")
+        lines.append(f"    Total Fees:          {total_fees:.4f} USDC")
+        lines.append(f"    Net PnL:             {net_pnl:+.4f} USDC")
+        lines.append(f"    Total Volume:        {total_volume:.2f} USDC")
+        
+        # Show per-symbol breakdown if multiple symbols
+        if by_symbol and len(by_symbol) > 0:
+            lines.append("")
+            lines.append("  Performance by Symbol")
+            lines.append("  ----------------------------")
+            for symbol, symbol_metrics in sorted(by_symbol.items()):
+                lines.append(f"    {symbol}:")
+                lines.append(f"      Positions:     {symbol_metrics['num_positions']}")
+                lines.append(f"      PnL:           {symbol_metrics['pnl']:+.4f} USDC")
+                lines.append(f"      Fees:          {symbol_metrics['fees']:.4f} USDC")
+                lines.append(f"      Net PnL:       {symbol_metrics['net_pnl']:+.4f} USDC")
+                lines.append(f"      Volume:        {symbol_metrics['volume']:.2f} USDC")
+        
         lines.append("")
 
         # Order proposals

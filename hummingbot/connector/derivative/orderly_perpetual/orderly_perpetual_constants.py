@@ -129,7 +129,7 @@ ORDER_STATE = {
 # Conservative rate limits (requests per time_interval)
 MAX_REQUESTS_PER_SECOND = 10
 TRADING_ENDPOINTS_LIMIT = 10
-PRIVATE_ENDPOINTS_LIMIT = 20
+PRIVATE_ENDPOINTS_LIMIT = 10
 PUBLIC_ENDPOINTS_LIMIT = 50
 
 ALL_ENDPOINTS_LIMIT = "All"
@@ -381,6 +381,15 @@ RATE_LIMITS = [
     ),
     RateLimit(
         limit_id=FUNDING_FEE_HISTORY_URL,
+        limit=PRIVATE_ENDPOINTS_LIMIT,
+        time_interval=1,
+        linked_limits=[
+            LinkedLimitWeightPair(PRIVATE_LIMIT_ID),
+            LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
+        ]
+    ),
+    RateLimit(
+        limit_id=POSITION_HISTORY_URL,
         limit=PRIVATE_ENDPOINTS_LIMIT,
         time_interval=1,
         linked_limits=[
