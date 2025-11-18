@@ -1978,7 +1978,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         When executedQuantity > 0, it creates a TradeUpdate to record the fill.
         """
         data = event.get("data", {})
-        self.logger().info(f"Order event from websocket: {data}")
 
         # Get client_order_id - Orderly uses camelCase in websocket
         client_order_id = data.get("clientOrderId")
@@ -1987,8 +1986,11 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if not tracked_order:
+            self.logger().debug(f"Skipping order {client_order_id} not found in order tracker with pair {data.get('symbol', data)}")
             return
-
+        
+        self.logger().info(f"Processing order {client_order_id} with pair {tracked_order.trading_pair}")
+        
         # Process trade fill if executedQuantity > 0
         executed_quantity = Decimal(str(data.get("executedQuantity", "0")))
         if executed_quantity > Decimal("0"):
@@ -2063,6 +2065,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         }
 
         Updates the internal position state based on WebSocket data.
+        Only processes positions for trading pairs configured for this bot instance.
         """
         data = event.get("data", {})
         positions = data.get("positions", [])
@@ -2078,6 +2081,14 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     continue
 
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol)
+                
+                # Filter: Only process positions for trading pairs configured for this bot instance
+                if trading_pair not in self._trading_pairs:
+                    self.logger().debug(
+                        f"[WS POSITION] Skipping position update for {symbol} -> {trading_pair} "
+                        f"(not in configured trading pairs: {self._trading_pairs})"
+                    )
+                    continue
 
                 # WebSocket uses camelCase field names
                 position_qty = Decimal(str(position_data.get("positionQty", "0")))
