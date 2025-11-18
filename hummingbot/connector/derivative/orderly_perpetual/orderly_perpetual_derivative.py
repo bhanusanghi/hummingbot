@@ -1684,10 +1684,16 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     async def _update_positions(self):
         """Fetch and update positions"""
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-        url = web_utils.public_rest_url(
-            CONSTANTS.POSITIONS_URL,
-            domain=self._domain
-        )
+        if len(self._trading_pairs) == 1:
+            url = web_utils.public_rest_url(
+                CONSTANTS.POSITION_URL.format(symbol=self._trading_pairs[0]),
+                domain=self._domain
+            )
+        else:
+            url = web_utils.public_rest_url(
+                CONSTANTS.POSITIONS_URL,
+                domain=self._domain
+            )
         response = await rest_assistant.execute_request(
             url=url,
             throttler_limit_id=CONSTANTS.POSITIONS_URL,
@@ -1705,6 +1711,9 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             try:
                 symbol = position_data["symbol"]
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol)
+                if trading_pair not in self._trading_pairs:
+                    self.logger().debug(f"Skipping position {symbol} -> {trading_pair} not in configured trading pairs {self._trading_pairs}")
+                    continue
 
                 position_qty = Decimal(str(position_data.get("position_qty", "0")))
 
