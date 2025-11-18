@@ -113,15 +113,16 @@ class MMGrid(ScriptStrategyBase):
 
     def stop(self, clock: Clock):
         """
-        Called when bot is stopped. Export position history to CSV.
+        Called when bot is stopped (by Clock, after connectors are removed).
         """
-        self._export_position_history()
         super().stop(clock)
     
     async def on_stop(self):
         """
-        Called when bot is stopped. Stop candles feed.
+        Called when bot is stopped. Export position history to CSV and stop candles feed.
+        This is called BEFORE connectors are removed, so connector data is still available.
         """
+        self._export_position_history()
         self._candles.stop()
 
     def apply_initial_setting(self):
