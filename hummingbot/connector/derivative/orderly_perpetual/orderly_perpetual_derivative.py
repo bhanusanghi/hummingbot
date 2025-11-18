@@ -2023,7 +2023,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 fill_quote_amount=executed_price * executed_quantity,
                 fee=fee,
                 is_taker=not is_maker,
-                position_action=PositionAction.OPEN,
             )
 
             self._order_tracker.process_trade_update(trade_update)

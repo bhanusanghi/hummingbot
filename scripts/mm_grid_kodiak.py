@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional
 
 import pandas as pd
+import pandas_ta as ta  # noqa: F401
 from pydantic import Field
 
 from hummingbot.client.config.config_data_types import BaseClientModel
@@ -15,6 +16,8 @@ from hummingbot.core.event.events import (
     OrderFilledEvent,
 )
 from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.core.clock import Clock
 from datetime import datetime
@@ -41,7 +44,11 @@ class MMGridConfig(BaseClientModel):
     randomization: Decimal = Field(default=Decimal("0.25"))
     leverage: int = Field(100)
     order_tag: Optional[str] = Field(default="None")
-    ema_window: int = Field(10)  # multiple of refresh rate
+    ema_window: int = Field(10)  # EMA period in candles
+    candles_connector: str = Field("binance_perpetual")  # Connector for candles data
+    candles_trading_pair: Optional[str] = Field(default="ZEC-USDT")  # Trading pair for candles (defaults to trading_pair)
+    candles_interval: str = Field("1m")  # Candle interval
+    candles_max_records: int = Field(20)  # Maximum number of candles to store
 #    target_inventory: Decimal = Field(0.0)
 
 class MMGrid(ScriptStrategyBase):
@@ -83,14 +90,24 @@ class MMGrid(ScriptStrategyBase):
         self._last_trade = Decimal("0")
         self._cached_inventory: Decimal = Decimal("0")
         self._cached_inventory_ratio: Decimal = Decimal("0")
-        self._mid_history: List[Decimal] = []
         self._ema_mid: Decimal = Decimal("0")
         self._bot_start_timestamp: int = 0  # Track when bot started for filtering position history
+        
+        # Initialize candles for EMA calculation
+        candles_trading_pair = self.config.candles_trading_pair or self.config.trading_pair
+        candles_config = CandlesConfig(
+            connector=self.config.candles_connector,
+            trading_pair=candles_trading_pair,
+            interval=self.config.candles_interval,
+            max_records=self.config.candles_max_records
+        )
+        self._candles = CandlesFactory.get_candle(candles_config)
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
 
     def start(self, clock: Clock, timestamp: float):
         self._bot_start_timestamp = int(timestamp * 1000)  # Convert to milliseconds for comparison with API timestamps
+        self._candles.start()  # Start candles feed
         self.apply_initial_setting()
         super().start(clock, timestamp)
 
@@ -100,6 +117,12 @@ class MMGrid(ScriptStrategyBase):
         """
         self._export_position_history()
         super().stop(clock)
+    
+    async def on_stop(self):
+        """
+        Called when bot is stopped. Stop candles feed.
+        """
+        self._candles.stop()
 
     def apply_initial_setting(self):
         n = len(self.config.order_size)
@@ -149,7 +172,10 @@ class MMGrid(ScriptStrategyBase):
             mid_price = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (
                         best_bid_size + best_ask_size)
 
-        ema = self._update_ema_mid(mid_price)
+        ema = self._update_ema_from_candles()
+        if (ema == 0):
+            self.logger().warning("EMA is 0, skipping proposal.")
+            return []
 
         inventory = self._detect_trade()
         inventory_ratio = self._inventory_ratio(inventory)
@@ -265,27 +291,25 @@ class MMGrid(ScriptStrategyBase):
         self._cached_inventory = inventory
         return inventory
 
-    def _update_ema_mid(self, mid: Decimal) -> Decimal:
+    def _update_ema_from_candles(self) -> Decimal:
         """
-        Update EMA of mid price using pandas.
-        Keeps at most ema_window mids in history.
+        Update EMA using candles data and pandas_ta.
         """
-        self._mid_history.append(mid)
-
-        # Keep only the last ema_window
-        max_len = self.config.ema_window
-        if len(self._mid_history) > max_len:
-            self._mid_history = self._mid_history[-max_len:]
-
-        # Use pandas to compute EMA
-        # Convert Decimals to float for pandas, then back to Decimal
-        s = pd.Series([float(m) for m in self._mid_history])
-
-        # span = ema_window is the standard EMA parameter
-        ema_val = s.ewm(span=self.config.ema_window, adjust=False).mean().iloc[-1]
-
-        self._ema_mid = Decimal(str(ema_val))
-        return self._ema_mid
+        candles_df = self._candles.candles_df
+        
+        if candles_df.empty or len(candles_df) < self.config.ema_window:
+            self.logger().warning(f"Not enough candles for EMA ({len(candles_df)}/{self.config.ema_window}).")
+            return Decimal("0")
+        
+        ema_column_name = f"EMA_{self.config.ema_window}"
+        candles_df.ta.ema(length=self.config.ema_window, append=True)
+        
+        if ema_column_name in candles_df.columns:
+            self._ema_mid = Decimal(str(candles_df[ema_column_name].iloc[-1]))
+            return self._ema_mid
+        else:
+            self.logger().warning(f"EMA calculation failed. Column {ema_column_name} not found.")
+            return self._ema_mid if self._ema_mid > 0 else Decimal("0")
 
     async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
         """

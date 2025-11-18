@@ -1,15 +1,15 @@
 exchange: orderly_perpetual
 trading_pair: ZEC-USDC
 order_size: [0.5, 0.75, 1.0, 1.25] #in ZEC
-bid_spread_levels: [0.0013, 0.0025, 0.005, 0.008] #in bps
-ask_spread_levels: [0.0013, 0.0025, 0.005, 0.008] #in bps
-order_refresh_time: 6 #in seconds
-max_inventory: 20 #in ZEC terms
-max_price_adjustment: 0.0025 #0.12% maximum skew to fair price at max inventory
 min_inventory_pct_for_adjustment: 0.05 #5% of max inventory: no adjustment
 max_spread_mult: 2.0 #spreads widen up to 100%
 randomization: 0.2 #20%
 leverage: 10
 order_cooldown: 20
-ema_window: 60
-order_tag: ""
+ema_window: 20
+order_tag: "BERIZARD"
+
+candles_connector: "binance_perpetual"
+candles_trading_pair: "ZEC-USDT"
+candles_interval: "1m"
+candles_max_records: 20
