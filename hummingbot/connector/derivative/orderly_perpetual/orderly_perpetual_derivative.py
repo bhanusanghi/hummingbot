@@ -1685,8 +1685,10 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         """Fetch and update positions"""
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
         if len(self._trading_pairs) == 1:
+            # Convert trading pair to exchange symbol format
+            symbol = await self.exchange_symbol_associated_to_pair(self._trading_pairs[0])
             url = web_utils.public_rest_url(
-                CONSTANTS.POSITION_URL.format(symbol=self._trading_pairs[0]),
+                CONSTANTS.POSITION_URL.format(symbol=symbol),
                 domain=self._domain
             )
         else:
@@ -1990,15 +1992,40 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         # Get client_order_id - Orderly uses camelCase in websocket
         client_order_id = data.get("clientOrderId")
+        symbol = data.get("symbol", "UNKNOWN")
+        
+        self.logger().debug(
+            f"[WS ORDER EVENT] Received order event: clientOrderId={client_order_id}, "
+            f"symbol={symbol}, status={data.get('status', 'UNKNOWN')}"
+        )
+        
         if not client_order_id:
+            self.logger().debug(
+                f"[WS ORDER EVENT] Skipping order event - no clientOrderId in data: {data}"
+            )
             return
 
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if not tracked_order:
-            self.logger().debug(f"Skipping order {client_order_id} not found in order tracker with pair {data.get('symbol', data)}")
+            # This is expected for orders from other bot instances or orders not tracked by this instance
+            self.logger().debug(
+                f"[WS ORDER EVENT] Skipping order {client_order_id} (symbol: {symbol}) - "
+                f"not found in order tracker (not from this bot instance)"
+            )
             return
         
-        self.logger().info(f"Processing order {client_order_id} with pair {tracked_order.trading_pair}")
+        # Verify the order belongs to a trading pair we're tracking
+        if tracked_order.trading_pair not in self._trading_pairs:
+            self.logger().warning(
+                f"[WS ORDER EVENT] Order {client_order_id} has trading pair {tracked_order.trading_pair} "
+                f"not in configured pairs {self._trading_pairs}"
+            )
+            return
+        
+        self.logger().info(
+            f"[WS ORDER EVENT] Processing order {client_order_id} with pair {tracked_order.trading_pair}, "
+            f"status={data.get('status', 'UNKNOWN')}"
+        )
         
         # Process trade fill if executedQuantity > 0
         executed_quantity = Decimal(str(data.get("executedQuantity", "0")))
@@ -2078,9 +2105,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         """
         data = event.get("data", {})
         positions = data.get("positions", [])
-
-        self.logger().info(f"[WS POSITION EVENT] ========== Received {len(positions)} position update(s) ==========")
-        self.logger().info(f"[WS POSITION EVENT] Raw event data: {event}")
 
         for position_data in positions:
             try:
