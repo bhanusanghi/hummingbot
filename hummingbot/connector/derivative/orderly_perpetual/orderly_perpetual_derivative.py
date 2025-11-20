@@ -2145,7 +2145,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                     continue
 
                 # Extract position details (camelCase from WebSocket)
-                unsettled_pnl = Decimal(str(position_data.get("unsettledPnl", "0")))
+                # unsettled_pnl = Decimal(str(position_data.get("unsettledPnl", "0")))
+                unsettled_pnl = Decimal(0)
                 entry_price = Decimal(str(position_data.get("averageOpenPrice", "0")))
                 leverage = Decimal(str(position_data.get("leverage", "1")))
 
@@ -2230,45 +2231,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     # ============================================================
     # Position History & Realized PnL
     # ============================================================
-
-    async def _update_position_history(self, trading_pair: Optional[str] = None):
-        """
-        Fetch and log position history with realized PnL for closed trades.
-        
-        This method retrieves closed positions from Orderly and logs:
-        - Realized PnL per position
-        - Trading fees
-        - Funding fees
-        - Position details (symbol, side, entry/exit prices, etc.)
-        
-        Args:
-            trading_pair: Optional specific trading pair to fetch history for.
-                         If None, fetches history for all configured trading pairs.
-        """
-        try:
-            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-            url = web_utils.public_rest_url(
-                CONSTANTS.POSITION_HISTORY_URL,
-                domain=self._domain
-            )
-            
-            # Determine which trading pairs to fetch history for
-            pairs_to_fetch = [trading_pair] if trading_pair else self._trading_pairs
-            
-            if not pairs_to_fetch:
-                # If no trading pairs configured, fetch all (no symbol filter)
-                params = {"limit": 20}
-                await self._fetch_and_store_position_history(rest_assistant, url, params)
-                return
-            
-            # Fetch position history for each trading pair
-            for pair in pairs_to_fetch:
-                symbol = await self.exchange_symbol_associated_to_pair(pair)
-                params = {"limit": 20, "symbol": symbol}
-                await self._fetch_and_store_position_history(rest_assistant, url, params)
-                
-        except Exception as e:
-            self.logger().exception(f"Error fetching position history: {e}")
 
     async def _fetch_and_store_position_history(self, rest_assistant, url: str, params: Dict[str, Any]):
         """
@@ -2411,5 +2373,4 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             self._update_order_status(),
             self._update_balances(),
             self._update_positions(),
-            self._update_position_history(),  # Add position history tracking
         )
