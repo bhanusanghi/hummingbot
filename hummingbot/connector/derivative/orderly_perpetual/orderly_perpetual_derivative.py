@@ -1365,10 +1365,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 - client_order_id: Client order ID
                 - success: Boolean indicating if cancellation succeeded
                 - error_message: Error message if failed
-
-        Raises:
-            ValueError: If more than 10 orders provided (Orderly limitation)
-            IOError: If the API request itself fails
         """
         # # Validation: Check batch size limit
         # if len(orders_to_cancel) > 10:
@@ -1380,183 +1376,72 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         if not orders_to_cancel:
             self.logger().warning("[BATCH CANCEL] No orders to cancel")
             return []
+        # filter out any orders that are not under connectors trading symbols
+        filtered_orders_to_cancel = [order for order in orders_to_cancel if order.trading_pair in self._trading_pairs]
 
-        # Collect order IDs and symbols
-        # Prefer exchange_order_id when available, fall back to client_order_id
-        exchange_order_ids = []
-        client_order_ids = []
-        use_exchange_ids = True
+        # Collect client_order_ids from filtered orders
+        client_order_ids = [order.client_order_id for order in filtered_orders_to_cancel]
 
-        # Get symbols (Orderly requires symbol parameter)
-        symbols = set()
-
-        for order in orders_to_cancel:
-            symbols.add(order.trading_pair)
-
-            if order.exchange_order_id:
-                exchange_order_ids.append(str(order.exchange_order_id))
-            else:
-                client_order_ids.append(order.client_order_id)
-                use_exchange_ids = False  # Must use client_order_id endpoint if any order lacks exchange_order_id
-
-        # If mixed IDs or no exchange IDs, use client_order_id endpoint
-        if not use_exchange_ids or not exchange_order_ids:
-            use_exchange_ids = False
-            # Collect all client_order_ids
-            client_order_ids = [order.client_order_id for order in orders_to_cancel]
-
-        # Get exchange symbols for all trading pairs
-        exchange_symbols = []
-        for trading_pair in symbols:
-            try:
-                symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-                exchange_symbols.append(symbol)
-            except Exception as e:
-                self.logger().error(
-                    f"[BATCH CANCEL] Error getting exchange symbol for {trading_pair}: {e}"
-                )
-
-        if not exchange_symbols:
-            self.logger().error("[BATCH CANCEL] No valid symbols found")
-            return [
-                {
-                    "client_order_id": order.client_order_id,
-                    "success": False,
-                    "error_message": "No valid symbols found"
-                }
-                for order in orders_to_cancel
-            ]
+        if not client_order_ids:
+            self.logger().warning("[BATCH CANCEL] No valid orders to cancel after filtering")
+            return []
 
         # Build API request
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
 
-        if use_exchange_ids:
-            # Use DELETE /v1/batch-order with exchange order_ids
-            url = web_utils.public_rest_url(
-                CONSTANTS.BATCH_CANCEL_ORDER_URL,
-                domain=self._domain
-            )
-            throttler_limit_id = CONSTANTS.BATCH_CANCEL_ORDER_URL
+        # Use DELETE /v1/client/batch-order with client_order_ids
+        url = web_utils.public_rest_url(
+            CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
+            domain=self._domain
+        )
+        throttler_limit_id = CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL
 
-            # Build comma-separated order_ids parameter
-            order_ids_str = ",".join(exchange_order_ids)
-            params = {
-                "order_ids": order_ids_str,
-                "symbol": exchange_symbols[0]  # Use first symbol (typically all orders are same symbol)
-            }
+        # Batch the orders into groups of 10 (API limit)
+        batch_size = 10
+        total_orders = len(client_order_ids)
+        batches = [client_order_ids[i:i + batch_size] for i in range(0, total_orders, batch_size)]
 
-            self.logger().info(
-                f"[BATCH CANCEL] Cancelling {len(exchange_order_ids)} orders by exchange_order_id"
-            )
+        self.logger().info(
+            f"[BATCH CANCEL] Cancelling {total_orders} orders in {len(batches)} batch(es) concurrently"
+        )
 
-        else:
-            # Use DELETE /v1/client/batch-order with client_order_ids
-            url = web_utils.public_rest_url(
-                CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
-                domain=self._domain
-            )
-            throttler_limit_id = CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL
-
-            # Build comma-separated client_order_ids parameter
-            client_order_ids_str = ",".join(client_order_ids)
+        # Create all batch cancel tasks
+        async def cancel_batch(batch: list, batch_num: int):
+            client_order_ids_str = ",".join(batch)
             params = {
                 "client_order_ids": client_order_ids_str,
-                "symbol": exchange_symbols[0]  # Use first symbol
             }
 
             self.logger().info(
-                f"[BATCH CANCEL] Cancelling {len(client_order_ids)} orders by client_order_id"
+                f"[BATCH CANCEL] Processing batch {batch_num}: {len(batch)} orders"
             )
 
-        try:
-            response = await rest_assistant.execute_request(
-                url=url,
-                throttler_limit_id=throttler_limit_id,
-                method=RESTMethod.DELETE,
-                params=params,
-                is_auth_required=True,
-            )
-        except Exception as e:
-            # Check if this is an "order not found/invalid" error - orders don't exist on exchange
-            if self._is_order_not_found_during_cancelation_error(e):
-                # Orders don't exist on exchange - mark all as cancelled locally
+            try:
+                await rest_assistant.execute_request(
+                    url=url,
+                    throttler_limit_id=throttler_limit_id,
+                    method=RESTMethod.DELETE,
+                    params=params,
+                    is_auth_required=True,
+                )
+            except Exception:
                 self.logger().warning(
-                    f"[BATCH CANCEL] Orders not found/invalid on exchange - marking all as cancelled locally"
+                    f"[BATCH CANCEL] Batch {batch_num} - Orders not found/invalid on exchange"
                 )
-                timestamp = self.current_timestamp
-                results = []
-                for order in orders_to_cancel:
-                    order_update = OrderUpdate(
-                        client_order_id=order.client_order_id,
-                        exchange_order_id=order.exchange_order_id,
-                        trading_pair=order.trading_pair,
-                        update_timestamp=timestamp,
-                        new_state=OrderState.CANCELED,
-                    )
-                    self._order_tracker.process_order_update(order_update)
-                    results.append({
-                        "client_order_id": order.client_order_id,
-                        "success": True,
-                        "error_message": "Order not found/invalid on exchange (already cancelled/filled)"
-                    })
-                return results
 
-            self.logger().error(f"[BATCH CANCEL] Error in batch cancellation: {e}", exc_info=True)
-            raise IOError(f"Batch order cancellation failed: {e}")
+        # Execute all batches concurrently
+        await asyncio.gather(*[cancel_batch(batch, i + 1) for i, batch in enumerate(batches)])
+            
+        for order in filtered_orders_to_cancel:
+            order_update = OrderUpdate(
+                client_order_id=order.client_order_id,
+                exchange_order_id=order.exchange_order_id,
+                trading_pair=order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=OrderState.CANCELED,
+            )
+            self._order_tracker.process_order_update(order_update)
 
-        success_flag = response.get("success", True)
-        data = response.get("data") or {}
-        status = data.get("status")
-
-        if success_flag and status == "CANCEL_ALL_SENT":
-            timestamp = self.current_timestamp
-            results = []
-
-            for order in orders_to_cancel:
-                order_update = OrderUpdate(
-                    client_order_id=order.client_order_id,
-                    exchange_order_id=order.exchange_order_id,
-                    trading_pair=order.trading_pair,
-                    update_timestamp=timestamp,
-                    new_state=OrderState.CANCELED,
-                )
-                self._order_tracker.process_order_update(order_update)
-                results.append({
-                    "client_order_id": order.client_order_id,
-                    "success": True,
-                    "error_message": ""
-                })
-
-            return results
-
-        self.logger().error(f"[BATCH CANCEL] Bad response in batch cancellation")
-        raise IOError(f"Batch order cancellation failed.")
-
-    # async def fetch_open_orders_from_exchange(self, trading_pair: str):
-    #     symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-    #     url = web_utils.public_rest_url(CONSTANTS.GET_ORDERS_URL, domain=self._domain)
-    #     params = {
-    #         "symbol": symbol,
-    #         "status": "INCOMPLETE",
-    #         "page": 1,
-    #         "size": 500,
-    #     }
-    #
-    #     rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-    #     resp = await rest_assistant.execute_request(
-    #         url=url,
-    #         throttler_limit_id=CONSTANTS.GET_ORDERS_URL,
-    #         method=RESTMethod.GET,
-    #         params=params,
-    #         is_auth_required=True,
-    #     )
-    #
-    #     if not resp.get("success", False):
-    #         self.logger().warning(f"[ORDERS] Failed to fetch open orders: {resp}")
-    #         return []
-    #
-    #     rows = resp.get("data", {}).get("rows", [])
-    #     return rows  # each row is an order dict
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """
