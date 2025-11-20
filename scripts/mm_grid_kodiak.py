@@ -105,17 +105,14 @@ class MMGrid(ScriptStrategyBase):
             self.account_config_set = True
 
     def on_tick(self):
-        if self.current_timestamp > self.create_timestamp:
-            proposals: List[PerpetualOrderCandidate] = self.create_proposal()
+        proposals: List[PerpetualOrderCandidate] = self.create_proposal()
+        if len(proposals) > 0:
             self._cached_proposals = proposals
-            if len(proposals) > 0:
-                safe_ensure_future(self._cancel_and_place_orders(proposals))  # Execute cancel then place sequentially to avoid order accumulation
-            self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
+            safe_ensure_future(self._cancel_and_place_orders(proposals))  # Execute cancel then place sequentially to avoid order accumulation
+        self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
 
     def create_proposal(self) -> List[PerpetualOrderCandidate]:
         connector = self.connectors[self.config.exchange]
-        # Use mark price from exchange instead of mid price
-        mark_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MarkPrice)
 
         # Get order book
         order_book = connector.get_order_book(self.config.trading_pair)
@@ -132,32 +129,38 @@ class MMGrid(ScriptStrategyBase):
         best_ask_size = Decimal(str(asks_df.iloc[0].amount))
 
         mid_price = (best_bid_price + best_ask_price) / 2
+        mark_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MarkPrice)
 
         if best_bid_size + best_ask_size > 0:
             mid_price = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (
                         best_bid_size + best_ask_size)
 
         ema = self._update_ema_mid(mid_price)
+        inventory = self._detect_trade() # this updates the cooldown timestamp
 
-        inventory = self._detect_trade()
-        inventory_ratio = self._inventory_ratio(inventory)
-        skew_factor = Decimal("1") - inventory_ratio * self.config.max_price_adjustment
-
-        bid_anchor = min(ema, mid_price, mark_price)
-        ask_anchor = max(ema, mid_price, mark_price)
-
-        # Cache values for status reporting
-        self._cached_bid_anchor = bid_anchor
-        self._cached_ask_anchor = ask_anchor
+        # Cache price info for status reporting (updated every tick)
         self._cached_mark_price = mark_price
         self._cached_mid_price = mid_price
-        self._cached_skew_mult = skew_factor
-        self._cached_inventory_ratio = inventory_ratio
 
+        if self.current_timestamp < self.create_timestamp:
+            return []
+
+        if self.current_timestamp < self._cooldown_until_timestamp:
+            return []
+
+        # Order specific updates (all calculations needed for when we do orders)
+        inventory_ratio = self._inventory_ratio(inventory)
+        bid_anchor = min(ema, mid_price, mark_price)
+        ask_anchor = max(ema, mid_price, mark_price)
+        skew_factor = Decimal("1") - inventory_ratio * self.config.max_price_adjustment
         spread_mult = Decimal("1") + abs(inventory_ratio) * (self.config.max_spread_mult - Decimal("1"))
-        self._cached_spread_mult = spread_mult
-
         random_factor = self._random_factor()
+
+        self._cached_bid_anchor = bid_anchor
+        self._cached_ask_anchor = ask_anchor
+        self._cached_inventory_ratio = inventory_ratio
+        self._cached_skew_mult = skew_factor
+        self._cached_spread_mult = spread_mult
         self._cached_random_factor = random_factor
 
         # After caching is done, check for cooldown
@@ -388,8 +391,8 @@ class MMGrid(ScriptStrategyBase):
         lines.append("")
         lines.append(f"    Inventory:           {self._cached_inventory:.4f}")
         lines.append(f"    Max Inventory:       {self.config.max_inventory:.4f}")
-        lines.append(f"    Inventory Ratio:     {inv_ratio_pct:.2f}%")
         lines.append("")
+        lines.append(f"    Inventory Ratio:     {inv_ratio_pct:.2f}%")
         lines.append(f"    Price Skew:          {skew_bps:+.2f} bps")
         lines.append(f"    Spread Multiplier:   {spread_mult:.3f}x")
         lines.append(f"    Random Factor:       {self._cached_random_factor:.4f}x")
