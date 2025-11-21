@@ -1348,7 +1348,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
     async def batch_order_cancel(
         self,
         orders_to_cancel: List[InFlightOrder]
-    ) -> List[Dict[str, Any]]:
+    ) -> None:
         """
         Cancel multiple orders in a single batch request using modular pattern.
 
@@ -1387,14 +1387,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             return []
 
         # Build API request
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
 
-        # Use DELETE /v1/client/batch-order with client_order_ids
-        url = web_utils.public_rest_url(
-            CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
-            domain=self._domain
-        )
-        throttler_limit_id = CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL
+      
 
         # Batch the orders into groups of 10 (API limit)
         batch_size = 10
@@ -1405,32 +1399,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             f"[BATCH CANCEL] Cancelling {total_orders} orders in {len(batches)} batch(es) concurrently"
         )
 
-        # Create all batch cancel tasks
-        async def cancel_batch(batch: list, batch_num: int):
-            client_order_ids_str = ",".join(batch)
-            params = {
-                "client_order_ids": client_order_ids_str,
-            }
-
-            self.logger().info(
-                f"[BATCH CANCEL] Processing batch {batch_num}: {len(batch)} orders"
-            )
-
-            try:
-                await rest_assistant.execute_request(
-                    url=url,
-                    throttler_limit_id=throttler_limit_id,
-                    method=RESTMethod.DELETE,
-                    params=params,
-                    is_auth_required=True,
-                )
-            except Exception:
-                self.logger().warning(
-                    f"[BATCH CANCEL] Batch {batch_num} - Orders not found/invalid on exchange"
-                )
-
         # Execute all batches concurrently
-        await asyncio.gather(*[cancel_batch(batch, i + 1) for i, batch in enumerate(batches)])
+        await asyncio.gather(*[self.cancel_batch(batch, i + 1) for i, batch in enumerate(batches)])
             
         for order in filtered_orders_to_cancel:
             order_update = OrderUpdate(
@@ -1441,6 +1411,35 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 new_state=OrderState.CANCELED,
             )
             self._order_tracker.process_order_update(order_update)
+
+    # Create all batch cancel tasks
+    async def cancel_batch(self, batch: list, batch_num: int):
+        client_order_ids_str = ",".join(batch)
+        params = {
+            "client_order_ids": client_order_ids_str,
+        }
+        self.logger().info(
+            f"[BATCH CANCEL] Processing batch {batch_num}: {len(batch)} orders"
+        )
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        # Use DELETE /v1/client/batch-order with client_order_ids
+        url = web_utils.public_rest_url(
+            CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
+            domain=self._domain
+        )
+        throttler_limit_id = CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL
+        try:
+            await rest_assistant.execute_request(
+                url=url,
+                throttler_limit_id=throttler_limit_id,
+                method=RESTMethod.DELETE,
+                params=params,
+                is_auth_required=True,
+            )
+        except Exception:
+            self.logger().warning(
+                f"[BATCH CANCEL] Batch {batch_num} - Orders not found/invalid on exchange"
+            )
 
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
