@@ -1,7 +1,7 @@
 import random
 import os
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from pydantic import Field
@@ -16,11 +16,6 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.core.clock import Clock
 from datetime import datetime
 
-def _fmt(ts):
-    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-
-def sign(x):
-    return (x > 0) - (x < 0)
 
 class MMGridConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
@@ -37,7 +32,7 @@ class MMGridConfig(BaseClientModel):
     max_spread_mult: Decimal = Field(default=Decimal("1.5"))
     randomization: Decimal = Field(default=Decimal("0.25"))
     leverage: int = Field(100)
-    order_tag: Optional[str] = Field(default="None")
+    order_tag: Optional[str] = Field(default=None)
     ema_window: int = Field(10)  # multiple of refresh rate
 #    target_inventory: Decimal = Field(0.0)
 
@@ -79,9 +74,10 @@ class MMGrid(ScriptStrategyBase):
         self._cooldown_until_timestamp: int = 0
         self._last_trade = Decimal("0")
         self._cached_inventory: Decimal = Decimal("0")
+        self._cached_entry_price: Decimal = Decimal("0")
         self._cached_inventory_ratio: Decimal = Decimal("0")
         self._mid_history: List[Decimal] = []
-        self._ema_mid: Decimal = Decimal("0")
+        self._cached_ema_mid: Decimal = Decimal("0")
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
 
@@ -109,7 +105,8 @@ class MMGrid(ScriptStrategyBase):
         if len(proposals) > 0:
             self._cached_proposals = proposals
             safe_ensure_future(self._cancel_and_place_orders(proposals))  # Execute cancel then place sequentially to avoid order accumulation
-        self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
+        if self.current_timestamp >= self.create_timestamp:
+            self.create_timestamp = self.create_timestamp + self.config.order_refresh_time
 
     def create_proposal(self) -> List[PerpetualOrderCandidate]:
         connector = self.connectors[self.config.exchange]
@@ -132,38 +129,41 @@ class MMGrid(ScriptStrategyBase):
         mark_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MarkPrice)
 
         if best_bid_size + best_ask_size > 0:
-            mid_price = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (
-                        best_bid_size + best_ask_size)
+            mid_price = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (best_bid_size + best_ask_size)
 
-        ema = self._update_ema_mid(mid_price)
-        inventory = self._detect_trade() # this updates the cooldown timestamp
+        self._mid_history, ema = compute_ema_mid(self._mid_history, mid_price, self.config.ema_window)
 
-        # Cache price info for status reporting (updated every tick)
-        self._cached_mark_price = mark_price
-        self._cached_mid_price = mid_price
+        position = connector._perpetual_trading.get_position(self.config.trading_pair)
+        inventory, entry_price = inventory_from_position(position)
 
-        if self.current_timestamp < self.create_timestamp:
-            return []
-
-        if self.current_timestamp < self._cooldown_until_timestamp:
-            return []
-
-        # Order specific updates (all calculations needed for when we do orders)
-        inventory_ratio = self._inventory_ratio(inventory)
+        # Calculate values
+        inventory_ratio = compute_inventory_ratio(inventory, self.config.min_inventory_pct_for_adjustment, self.config.max_inventory)
         bid_anchor = min(ema, mid_price, mark_price)
         ask_anchor = max(ema, mid_price, mark_price)
         skew_factor = Decimal("1") - inventory_ratio * self.config.max_price_adjustment
         spread_mult = Decimal("1") + abs(inventory_ratio) * (self.config.max_spread_mult - Decimal("1"))
-        random_factor = self._random_factor()
+        random_factor = compute_random_factor(self.config.randomization)
 
+        # Detect trade: update cooldown_until_timestamp and last_trade
+        # Note that cooldown timestamp is based on current timestamp and isn't affected by refresh rate
+        self._detect_trade(self._cached_inventory, inventory)
+
+        # Update all caches (for status reporting)
+        self._cached_mark_price = mark_price
+        self._cached_mid_price = mid_price
         self._cached_bid_anchor = bid_anchor
         self._cached_ask_anchor = ask_anchor
+        self._cached_inventory = inventory
+        self._cached_entry_price = entry_price
         self._cached_inventory_ratio = inventory_ratio
         self._cached_skew_mult = skew_factor
         self._cached_spread_mult = spread_mult
         self._cached_random_factor = random_factor
+        self._cached_ema_mid = ema
 
-        # After caching is done, check for cooldown
+        if self.current_timestamp < self.create_timestamp:
+            return []
+
         if self.current_timestamp < self._cooldown_until_timestamp:
             return []
 
@@ -219,25 +219,22 @@ class MMGrid(ScriptStrategyBase):
 
         return orders
 
-    # Detect trades, update order cooldown, and return current inventory
-    def _detect_trade(self) -> Decimal:
-        inventory = self._get_current_inventory()
-        last_inventory = self._cached_inventory
+    # Detect trades, update order cooldown
+    def _detect_trade(self, last_inventory, inventory) -> None:
+
+        last_trade = self._last_trade
 
         # Initialization
-        if self._last_trade == 0 and last_inventory == 0:
-            self._cached_inventory = inventory
+        if last_trade == 0 and last_inventory == 0:
             self._cooldown_until_timestamp = self.current_timestamp
-            return inventory
+            return
 
         # change in position = trade
         trade = inventory - last_inventory
 
         if trade == 0:
-            self._cached_inventory = inventory
-            return inventory
+            return
 
-        last_trade = self._last_trade
         same_direction_trade = sign(trade) == sign(last_trade)
 
         if sign(last_trade) == 0:
@@ -253,30 +250,7 @@ class MMGrid(ScriptStrategyBase):
             self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
 
         self._last_trade = trade
-        self._cached_inventory = inventory
-        return inventory
-
-    def _update_ema_mid(self, mid: Decimal) -> Decimal:
-        """
-        Update EMA of mid price using pandas.
-        Keeps at most ema_window mids in history.
-        """
-        self._mid_history.append(mid)
-
-        # Keep only the last ema_window
-        max_len = self.config.ema_window
-        if len(self._mid_history) > max_len:
-            self._mid_history = self._mid_history[-max_len:]
-
-        # Use pandas to compute EMA
-        # Convert Decimals to float for pandas, then back to Decimal
-        s = pd.Series([float(m) for m in self._mid_history])
-
-        # span = ema_window is the standard EMA parameter
-        ema_val = s.ewm(span=self.config.ema_window, adjust=False).mean().iloc[-1]
-
-        self._ema_mid = Decimal(str(ema_val))
-        return self._ema_mid
+        return
 
     async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
         """
@@ -316,62 +290,12 @@ class MMGrid(ScriptStrategyBase):
         # Call batch_order_create and wait for completion
         await connector.batch_order_create(orders_to_create)
 
-    def _get_current_inventory(self) -> Decimal:
-        """
-        Get current inventory position from the connector's actual position.
-        Returns signed position amount: positive for long, negative for short.
-
-        For perpetual futures in ONEWAY mode:
-        - Gets the actual position from the exchange via connector
-        - Converts to signed value: positive for long, negative for short
-        """
-        connector = self.connectors[self.config.exchange]
-
-        # For ONEWAY mode, get position by trading pair (no side needed)
-        position = connector._perpetual_trading.get_position(self.config.trading_pair)
-
-        if position is None:
-            return Decimal("0")
-
-        # Convert to signed inventory: positive for long, negative for short
-        if position.position_side == PositionSide.LONG:
-            return position.amount
-        elif position.position_side == PositionSide.SHORT:
-            return -position.amount
-        else:
-            return Decimal("0")
-
-    def _inventory_ratio(self, inventory: Decimal) -> Decimal:
-        """
-        Returns a factor in [0, 1] * sign(inventory).
-        """
-        if self.config.max_inventory == 0:
-            return Decimal("0")
-
-        inventory_ratio = abs(inventory) / self.config.max_inventory
-        inventory_ratio = min(inventory_ratio, Decimal("1"))
-
-        if inventory_ratio <= self.config.min_inventory_pct_for_adjustment:
-            return Decimal("0")
-
-        # factor is simply r (not rescaled)
-        return inventory_ratio * sign(inventory)
-
-    def _random_factor(self) -> Decimal:
-        """
-        Returns a multiplier in [1 - randomization, 1 + randomization].
-        E.g. randomization = 0.25 → [0.75, 1.25]
-        """
-        max_var = float(self.config.randomization)  # e.g. 0.25
-        variation = random.uniform(-max_var, max_var)  # float in [-0.25, 0.25]
-        return Decimal("1") + Decimal(str(variation))
-
     def format_status(self) -> str:
         if not self.ready_to_trade:
             return "Market connectors are not ready."
 
         mid = self._cached_mid_price
-        ema = self._ema_mid
+        ema = self._cached_ema_mid
         mark = self._cached_mark_price
 
         skew_bps = (self._cached_skew_mult - Decimal("1")) * Decimal("10000")
@@ -397,9 +321,9 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Spread Multiplier:   {spread_mult:.3f}x")
         lines.append(f"    Random Factor:       {self._cached_random_factor:.4f}x")
         lines.append("")
-        lines.append(f"    Current Time:        {_fmt(self.current_timestamp)}")
-        lines.append(f"    Cooldown Ends At:    {_fmt(self._cooldown_until_timestamp)}")
-        lines.append(f"    Next Refresh:        {_fmt(self.create_timestamp)}")
+        lines.append(f"    Current Time:        {fmt(self.current_timestamp)}")
+        lines.append(f"    Cooldown Ends At:    {fmt(self._cooldown_until_timestamp)}")
+        lines.append(f"    Next Refresh:        {fmt(self.create_timestamp)}")
         lines.append("")
         lines.append(f"    Last Trade Size:     {self._last_trade:.6f}")
         lines.append("")
@@ -440,3 +364,79 @@ class MMGrid(ScriptStrategyBase):
                 )
 
         return "\n".join(lines)
+
+def fmt(ts):
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+def sign(x):
+    return (x > 0) - (x < 0)
+
+def compute_random_factor(randomization: Decimal) -> Decimal:
+    """
+    Returns a multiplier in [1 - randomization, 1 + randomization].
+    E.g. randomization = 0.25 → [0.75, 1.25]
+    """
+    max_var = float(randomization)  # e.g. 0.25
+    variation = random.uniform(-max_var, max_var)  # float in [-0.25, 0.25]
+    return Decimal("1") + Decimal(str(variation))
+
+def inventory_from_position(position) -> Tuple[Decimal, Decimal]:
+    """
+    Pure function:
+    Takes a raw position object (or None) and returns signed inventory.
+    """
+    if position is None:
+        return Decimal("0"), Decimal("0")
+
+    if position.position_side == PositionSide.LONG:
+        inventory = position.amount
+    elif position.position_side == PositionSide.SHORT:
+        inventory = -position.amount
+    else:
+        inventory = Decimal("0")
+
+    if hasattr(position, "entry_price") and position.entry_price is not None:
+        entry_price = Decimal(str(position.entry_price))
+    else:
+        entry_price = Decimal("0")
+
+    return inventory, entry_price
+
+
+def compute_inventory_ratio(inventory: Decimal, min_inventory_pct_for_adjustment: Decimal, max_inventory: Decimal) -> Decimal:
+    """
+    Returns a factor in [0, 1] * sign(inventory).
+    """
+    if max_inventory == 0:
+        return Decimal("0")
+
+    ratio = abs(inventory) / max_inventory
+    ratio = min(ratio, Decimal("1"))
+
+    if ratio <= min_inventory_pct_for_adjustment:
+        return Decimal("0")
+
+    # factor is simply r (not rescaled)
+    return ratio * sign(inventory)
+
+def compute_ema_mid(
+    mid_history: List[Decimal],
+    new_mid: Decimal,
+    window: int
+) -> Tuple[List[Decimal], Decimal]:
+    """
+    Pure function:
+    - Accepts old history
+    - Returns (new_history, new_ema)
+    - Does NOT mutate anything
+    """
+    # Build new history
+    new_history = mid_history + [new_mid]
+    if len(new_history) > window:
+        new_history = new_history[-window:]
+
+    s = pd.Series([float(m) for m in new_history])
+    ema_val = s.ewm(span=window, adjust=False).mean().iloc[-1]
+    ema = Decimal(str(ema_val))
+
+    return new_history, ema
