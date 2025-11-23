@@ -1344,65 +1344,136 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             )
             return False
 
-
-    async def batch_order_cancel(
-        self,
-        orders_to_cancel: List[InFlightOrder]
-    ) -> None:
+    async def batch_order_cancel(self, orders_to_cancel: List[InFlightOrder]) -> bool:
         """
-        Cancel multiple orders in a single batch request using modular pattern.
+        Cancel multiple orders in batches of up to 10 client_order_ids.
 
-        This method:
-        1. Makes batch API call to cancel orders
-        2. Processes results through order tracker (creates OrderUpdate with CANCELED state)
-        3. Triggers appropriate cancellation events
+        Semantics:
+        - Each batch is cancelled via cancel_batch(), which:
+            * Calls the batch cancel endpoint
+            * Marks its own local orders as CANCELED on success
+            * Returns a bool flag for that batch
+        - This method:
+            * Runs all cancel_batch calls concurrently via safe_gather
+            * Aggregates the per-batch boolean results
+            * Returns:
+                True  -> all batches succeeded and no wrong symbols
+                False -> at least one batch failed or any wrong symbols present
 
-        Args:
-            orders_to_cancel: List of InFlightOrder objects to cancel
-
-        Returns:
-            List of cancellation result dictionaries with keys:
-                - client_order_id: Client order ID
-                - success: Boolean indicating if cancellation succeeded
-                - error_message: Error message if failed
+        Partial success:
+        - Some batches may succeed and some may fail.
+        - cancel_batch updates local state only for its successful batch.
+        - This method will still return False if any batch fails.
         """
-        # # Validation: Check batch size limit
-        # if len(orders_to_cancel) > 10:
-        #     raise ValueError(
-        #         f"Batch order cancellation limited to 10 orders per request. "
-        #         f"Received {len(orders_to_cancel)} orders."
-        #     )
-
         if not orders_to_cancel:
-            self.logger().warning("[BATCH CANCEL] No orders to cancel")
-            return []
-        # filter out any orders that are not under connectors trading symbols
-        filtered_orders_to_cancel = [order for order in orders_to_cancel if order.trading_pair in self._trading_pairs]
+            self.logger().info("[BATCH CANCEL] No in-flight orders to cancel.")
+            return True
 
-        # Collect client_order_ids from filtered orders
-        client_order_ids = [order.client_order_id for order in filtered_orders_to_cancel]
+        # Filter out any orders that are not under connector trading symbols
+        filtered_orders_to_cancel = [
+            order for order in orders_to_cancel
+            if order.trading_pair in self._trading_pairs
+        ]
 
-        if not client_order_ids:
-            self.logger().warning("[BATCH CANCEL] No valid orders to cancel after filtering")
-            return []
-
-        # Build API request
-
-      
+        if not filtered_orders_to_cancel:
+            self.logger().warning("[BATCH CANCEL] No valid orders to cancel after filtering.")
+            return False
 
         # Batch the orders into groups of 10 (API limit)
         batch_size = 10
-        total_orders = len(client_order_ids)
-        batches = [client_order_ids[i:i + batch_size] for i in range(0, total_orders, batch_size)]
+        total_orders = len(filtered_orders_to_cancel)
+        batches: List[List[InFlightOrder]] = [
+            filtered_orders_to_cancel[i:i + batch_size]
+            for i in range(0, total_orders, batch_size)
+        ]
 
         self.logger().info(
-            f"[BATCH CANCEL] Cancelling {total_orders} orders in {len(batches)} batch(es) concurrently"
+            f"[BATCH CANCEL] Cancelling {total_orders} order(s) in {len(batches)} batch(es)."
         )
 
-        # Execute all batches concurrently
-        await asyncio.gather(*[self.cancel_batch(batch, i + 1) for i, batch in enumerate(batches)])
-            
-        for order in filtered_orders_to_cancel:
+        try:
+            # cancel_batch returns bool for each batch
+            raw_results = await safe_gather(
+                *[self.cancel_batch(batch, i + 1) for i, batch in enumerate(batches)],
+                return_exceptions=False,
+            )
+        except Exception:
+            # Only fires if something global fails (not per-batch)
+            self.logger().network(
+                "[BATCH CANCEL] Unexpected error while cancelling batched orders.",
+                exc_info=True,
+                app_warning_msg="Failed to cancel batched orders. Check API key and network connection.",
+            )
+            return False
+
+        # raw_results is List[bool]
+        all_success = all(bool(res) for res in raw_results)
+
+        if not all_success:
+            self.logger().warning(
+                "[BATCH CANCEL] One or more batch cancellations failed or returned an "
+                "unexpected response. Some orders may remain active."
+            )
+
+        wrong_symbol = len(filtered_orders_to_cancel) < len(orders_to_cancel)
+        if wrong_symbol:
+            invalid_symbols = sorted({
+                o.trading_pair for o in orders_to_cancel
+                if o.trading_pair not in self._trading_pairs
+            })
+            self.logger().warning(
+                f"[BATCH CANCEL] One or more cancellations sent with wrong symbol(s): {invalid_symbols}"
+            )
+
+        return all_success and not wrong_symbol
+
+    async def cancel_batch(self, batch: List[InFlightOrder], batch_num: int) -> bool:
+        if not batch:
+            self.logger().info(f"[BATCH CANCEL] Batch {batch_num}: no orders provided.")
+            return True
+
+        client_order_ids = [o.client_order_id for o in batch]
+        params = {"client_order_ids": ",".join(client_order_ids)}
+
+        self.logger().debug(
+            f"[BATCH CANCEL] Processing batch {batch_num}: {len(batch)} order(s)"
+        )
+
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        url = web_utils.public_rest_url(
+            CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
+            domain=self._domain,
+        )
+
+        try:
+            resp = await rest_assistant.execute_request(
+                url=url,
+                throttler_limit_id=CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
+                method=RESTMethod.DELETE,
+                params=params,
+                is_auth_required=True,
+            )
+        except Exception as e:
+            self.logger().warning(
+                f"[BATCH CANCEL] Batch {batch_num} - error while cancelling orders: {e}",
+                exc_info=True,
+            )
+            return False
+
+        success_flag = resp.get("success", True)
+        data = resp.get("data") or {}
+        status = data.get("status")
+
+        if not success_flag or status != "CANCEL_ALL_SENT":
+            self.logger().warning(
+                f"[BATCH CANCEL] Batch {batch_num} - unexpected response: {resp}"
+            )
+            return False
+
+        # ---- Local state update ----
+        for order in batch:
+            if order.is_done:
+                continue
             order_update = OrderUpdate(
                 client_order_id=order.client_order_id,
                 exchange_order_id=order.exchange_order_id,
@@ -1412,34 +1483,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             )
             self._order_tracker.process_order_update(order_update)
 
-    # Create all batch cancel tasks
-    async def cancel_batch(self, batch: list, batch_num: int):
-        client_order_ids_str = ",".join(batch)
-        params = {
-            "client_order_ids": client_order_ids_str,
-        }
-        self.logger().info(
-            f"[BATCH CANCEL] Processing batch {batch_num}: {len(batch)} orders"
-        )
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-        # Use DELETE /v1/client/batch-order with client_order_ids
-        url = web_utils.public_rest_url(
-            CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
-            domain=self._domain
-        )
-        throttler_limit_id = CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL
-        try:
-            await rest_assistant.execute_request(
-                url=url,
-                throttler_limit_id=throttler_limit_id,
-                method=RESTMethod.DELETE,
-                params=params,
-                is_auth_required=True,
-            )
-        except Exception:
-            self.logger().warning(
-                f"[BATCH CANCEL] Batch {batch_num} - Orders not found/invalid on exchange"
-            )
+        return True
 
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:

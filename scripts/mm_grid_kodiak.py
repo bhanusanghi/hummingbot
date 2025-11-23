@@ -9,7 +9,7 @@ from pydantic import Field
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, PriceType, PositionAction, PositionSide, TradeType
-#from hummingbot.core.data_type.in_flight_order import InFlightOrder
+from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -258,14 +258,33 @@ class MMGrid(ScriptStrategyBase):
         This ensures old orders are cancelled before new ones are placed.
         """
         connector = self.connectors[self.config.exchange]
+        orders_to_cancel = self._get_active_orders_from_connector()
 
-        cancel_success = await connector.cancel_all_symbol(self.config.trading_pair)
+        cancel_success = await connector.batch_order_cancel(orders_to_cancel)
         if not cancel_success:
             self.logger().warning(f"Cancel all failed: Skipping new order placement this cycle.")
             return
 
         # Then place new orders
         await self._async_place_orders(proposal)
+
+    def _get_active_orders_from_connector(self) -> List[InFlightOrder]:
+        """
+        Get active orders directly from connector's order tracker.
+        This ensures we see the actual state on the exchange.
+        """
+        connector = self.connectors[self.config.exchange]
+        all_in_flight_orders = connector._order_tracker.active_orders
+
+        # Filter: only non-done orders for the current trading pair
+        active_orders = [
+            in_flight_order
+            for in_flight_order in all_in_flight_orders.values()
+            if (in_flight_order.trading_pair == self.config.trading_pair
+                and not in_flight_order.is_done)
+        ]
+
+        return active_orders
 
     async def _async_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
         """Place multiple orders using batch API and wait for completion"""
@@ -314,7 +333,9 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    EMA ({self.config.ema_window}):            {ema:.4f}")
         lines.append("")
         lines.append(f"    Inventory:           {self._cached_inventory:.4f}")
+        lines.append(f"    Target Inventory:    {self.config.target_inventory:.4f}")
         lines.append(f"    Max Inventory:       {self.config.max_inventory:.4f}")
+        lines.append(f"    Deviation:           {(self._cached_inventory - self.config.target_inventory):.4f}")
         lines.append("")
         lines.append(f"    Inventory Ratio:     {inv_ratio_pct:.2f}%")
         lines.append(f"    Price Skew:          {skew_bps:+.2f} bps")
@@ -328,40 +349,50 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Last Trade Size:     {self._last_trade:.6f}")
         lines.append("")
 
-        # Order proposals
-        proposals = self._cached_proposals
-        if proposals:
-            lines.append("  Current Proposals (Orderbook-style Sort)")
-            lines.append("        PRICE        SIDE      AMOUNT     ΔMID (bps)")
-            lines.append("    --------------------------------------------------")
+        # Get active orders from connector's order tracker
+        active_orders = self._get_active_orders_from_connector()
 
-            rows = []
+        if active_orders:
+            # Create DataFrame with order information
+            columns = ["Order ID", "Side", "Price", "Amount", "Filled", "Status", "Age"]
+            data = []
+            for order in active_orders:
+                # Calculate age
+                age_seconds = self.current_timestamp - order.creation_timestamp
+                if age_seconds <= 0:
+                    age_txt = "n/a"
+                else:
+                    age_txt = pd.Timestamp(age_seconds, unit='s').strftime('%H:%M:%S')
 
-            # append proposals
-            for p in proposals:
-                rows.append({
-                    "price": p.price,
-                    "side": p.order_side.name,
-                    "amount": p.amount,
-                    "marker": False
-                })
+                # Get filled amount
+                filled = float(order.executed_amount_base) if order.executed_amount_base else 0.0
 
-            # markers: MID + EMA (makes visual alignment)
-            rows.append({"price": mid, "side": "MID", "amount": None, "marker": True})
-            rows.append({"price": ema, "side": "EMA", "amount": None, "marker": True})
+                # Get status
+                status = order.current_state.name if hasattr(order.current_state, 'name') else str(order.current_state)
 
-            rows.sort(key=lambda r: r["price"], reverse=True)
+                data.append([
+                    order.client_order_id[:16] + "..." if len(order.client_order_id) > 16 else order.client_order_id,
+                    "buy" if order.trade_type == TradeType.BUY else "sell",
+                    float(order.price) if order.price else "N/A",
+                    float(order.amount),
+                    f"{filled:.6f}",
+                    status,
+                    age_txt
+                ])
 
-            def spread_bps(price):
-                if mid == 0:
-                    return "   n/a"
-                return f"{((float(price / mid) - 1) * 10000):>10.2f}"
+            df = pd.DataFrame(data=data, columns=columns)
+            # Sort: buy orders first, then sell orders; within each group, sort by price descending
+            df['Side_sort'] = df['Side'].map({'buy': 0, 'sell': 1})
+            df['Price_num'] = pd.to_numeric(df['Price'], errors='coerce')
+            df.sort_values(by=['Side_sort', 'Price_num'], ascending=[True, False], inplace=True)
+            df.drop(['Side_sort', 'Price_num'], axis=1, inplace=True)
 
-            for r in rows:
-                amount = "-" if r["marker"] else f"{r['amount']:.6f}"
-                lines.append(
-                    f"    {r['price']:>12.4f}   {r['side']:<6}   {amount:>10}   {spread_bps(r['price'])}"
-                )
+            lines.append("")
+            lines.append("  Open Orders:")
+            lines.extend(["    " + line for line in df.to_string(index=False).split("\n")])
+        else:
+            lines.append("")
+            lines.append("  No open orders.")
 
         return "\n".join(lines)
 
