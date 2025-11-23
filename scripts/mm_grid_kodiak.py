@@ -106,7 +106,7 @@ class MMGrid(ScriptStrategyBase):
             self._cached_proposals = proposals
             safe_ensure_future(self._cancel_and_place_orders(proposals))  # Execute cancel then place sequentially to avoid order accumulation
         if self.current_timestamp >= self.create_timestamp:
-            self.create_timestamp = self.create_timestamp + self.config.order_refresh_time
+            self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
 
     def create_proposal(self) -> List[PerpetualOrderCandidate]:
         connector = self.connectors[self.config.exchange]
