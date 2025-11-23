@@ -34,7 +34,7 @@ class MMGridConfig(BaseClientModel):
     leverage: int = Field(100)
     order_tag: Optional[str] = Field(default=None)
     ema_window: int = Field(10)  # multiple of refresh rate
-#    target_inventory: Decimal = Field(0.0)
+    target_inventory: Decimal = Field(default=Decimal("0.0"))
 
 class MMGrid(ScriptStrategyBase):
     """
@@ -137,7 +137,7 @@ class MMGrid(ScriptStrategyBase):
         inventory, entry_price = inventory_from_position(position)
 
         # Calculate values
-        inventory_ratio = compute_inventory_ratio(inventory, self.config.min_inventory_pct_for_adjustment, self.config.max_inventory)
+        inventory_ratio = compute_inventory_ratio(inventory, self.config.target_inventory, self.config.min_inventory_pct_for_adjustment, self.config.max_inventory)
         bid_anchor = min(ema, mid_price, mark_price)
         ask_anchor = max(ema, mid_price, mark_price)
         skew_factor = Decimal("1") - inventory_ratio * self.config.max_price_adjustment
@@ -403,20 +403,32 @@ def inventory_from_position(position) -> Tuple[Decimal, Decimal]:
     return inventory, entry_price
 
 
-def compute_inventory_ratio(inventory: Decimal, min_inventory_pct_for_adjustment: Decimal, max_inventory: Decimal) -> Decimal:
+def compute_inventory_ratio(inventory: Decimal, target_inventory: Decimal, min_inventory_pct_for_adjustment: Decimal, max_inventory: Decimal) -> Decimal:
     """
-    Returns a factor in [0, 1] * sign(inventory).
+    Returns a factor in [-1, 1] based on deviation from target inventory.
+
+    Positive ratio → too long relative to target → reduce bids, keep asks (favor selling)
+    Negative ratio → too short relative to target → keep bids, reduce asks (favor buying)
+
+    Examples:
+    - inventory=-0.3, target=-0.5: deviation=+0.2 → too long, need to sell more
+    - inventory=-0.7, target=-0.5: deviation=-0.2 → too short, need to buy back
+    - inventory=0.3, target=0.5: deviation=-0.2 → too short, need to buy more
+    - inventory=0.7, target=0.5: deviation=+0.2 → too long, need to sell more
     """
     if max_inventory == 0:
         return Decimal("0")
 
-    ratio = abs(inventory) / max_inventory
+    # Calculate deviation from target (not from zero!)
+    deviation = inventory - target_inventory
+
+    ratio = abs(deviation) / max_inventory
     ratio = min(ratio, Decimal("1"))
 
     if ratio <= min_inventory_pct_for_adjustment:
         return Decimal("0")
 
-    # factor is simply r (not rescaled)
+    # Apply sign based on deviation direction
     return ratio * sign(inventory)
 
 def compute_ema_mid(
