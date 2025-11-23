@@ -83,8 +83,7 @@ class MMGrid(ScriptStrategyBase):
 
     def start(self, clock: Clock, timestamp: float):
         self.apply_initial_setting()
-        self.create_timestamp = timestamp
-        self._cooldown_until_timestamp = timestamp
+        self.create_timestamp = timestamp + self.config.order_refresh_time
         super().start(clock, timestamp)
 
     def apply_initial_setting(self):
