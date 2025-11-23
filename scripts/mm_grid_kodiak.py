@@ -260,10 +260,11 @@ class MMGrid(ScriptStrategyBase):
         connector = self.connectors[self.config.exchange]
         orders_to_cancel = self._get_active_orders_from_connector()
 
-        cancel_success = await connector.batch_order_cancel(orders_to_cancel)
-        if not cancel_success:
-            self.logger().warning(f"Cancel all failed: Skipping new order placement this cycle.")
-            return
+        if orders_to_cancel:
+            cancel_success = await connector.batch_order_cancel(orders_to_cancel)
+            if not cancel_success:
+                self.logger().warning(f"Cancel all failed: Skipping new order placement this cycle.")
+                return
 
         # Then place new orders
         await self._async_place_orders(proposal)
@@ -460,7 +461,7 @@ def compute_inventory_ratio(inventory: Decimal, target_inventory: Decimal, min_i
         return Decimal("0")
 
     # Apply sign based on deviation direction
-    return ratio * sign(inventory)
+    return ratio * sign(deviation)
 
 def compute_ema_mid(
     mid_history: List[Decimal],
