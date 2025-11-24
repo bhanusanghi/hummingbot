@@ -70,7 +70,6 @@ class MMGrid(ScriptStrategyBase):
         self._cached_spread_mult: Decimal = Decimal("0")
         self._cached_random_factor: Decimal = Decimal("0")
         self._cached_skew_mult: Decimal = Decimal("0")
-        self._cached_proposals: List[PerpetualOrderCandidate] = []
         self._cooldown_until_timestamp: int = 0
         self._last_trade = Decimal("0")
         self._cached_inventory: Decimal = Decimal("0")
@@ -78,6 +77,7 @@ class MMGrid(ScriptStrategyBase):
         self._cached_inventory_ratio: Decimal = Decimal("0")
         self._mid_history: List[Decimal] = []
         self._cached_ema_mid: Decimal = Decimal("0")
+        self._ready_to_place_orders: bool = True
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
 
@@ -103,8 +103,7 @@ class MMGrid(ScriptStrategyBase):
 
     def on_tick(self):
         proposals: List[PerpetualOrderCandidate] = self.create_proposal()
-        if len(proposals) > 0:
-            self._cached_proposals = proposals
+        if len(proposals) > 0 and self._ready_to_place_orders:
             safe_ensure_future(self._cancel_and_place_orders(proposals))  # Execute cancel then place sequentially to avoid order accumulation
         if self.current_timestamp >= self.create_timestamp:
             self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
@@ -258,17 +257,46 @@ class MMGrid(ScriptStrategyBase):
         Cancel all active orders and then place new orders sequentially.
         This ensures old orders are cancelled before new ones are placed.
         """
+        self._ready_to_place_orders = False
+        try:
+            connector = self.connectors[self.config.exchange]
+            orders_to_cancel = self._get_active_orders_from_connector()
+
+            if orders_to_cancel:
+                cancel_success = await connector.batch_order_cancel(orders_to_cancel)
+                if not cancel_success:
+                    self.logger().warning(f"Cancel all failed: Skipping new order placement this cycle.")
+                    return
+
+            # Then place new orders
+            await self._async_place_orders(proposal)
+
+        finally:
+            self._ready_to_place_orders = True
+
+    async def _async_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
+        """Place multiple orders using batch API and wait for completion"""
         connector = self.connectors[self.config.exchange]
-        orders_to_cancel = self._get_active_orders_from_connector()
 
-        if orders_to_cancel:
-            cancel_success = await connector.batch_order_cancel(orders_to_cancel)
-            if not cancel_success:
-                self.logger().warning(f"Cancel all failed: Skipping new order placement this cycle.")
-                return
+        # Convert PerpetualOrderCandidate objects to order dictionaries for batch_order_create
+        orders_to_create = []
+        for order in proposal:
+            order_dict = {
+                "trading_pair": order.trading_pair,
+                "amount": order.amount,
+                "trade_type": order.order_side,
+                "order_type": order.order_type,
+                "price": order.price,
+                "position_action": PositionAction.OPEN
+            }
+            orders_to_create.append(order_dict)
 
-        # Then place new orders
-        await self._async_place_orders(proposal)
+        # Call batch_order_create and wait for completion
+        try:
+            await connector.batch_order_create(orders_to_create)
+        except Exception as e:
+            self.logger().error(f"Order placement failed: {e}")
+
 
     def _get_active_orders_from_connector(self) -> List[InFlightOrder]:
         """
@@ -287,29 +315,6 @@ class MMGrid(ScriptStrategyBase):
         ]
 
         return active_orders
-
-    async def _async_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
-        """Place multiple orders using batch API and wait for completion"""
-        if not proposal or len(proposal) == 0:
-            return
-
-        connector = self.connectors[self.config.exchange]
-
-        # Convert PerpetualOrderCandidate objects to order dictionaries for batch_order_create
-        orders_to_create = []
-        for order in proposal:
-            order_dict = {
-                "trading_pair": order.trading_pair,
-                "amount": order.amount,
-                "trade_type": order.order_side,
-                "order_type": order.order_type,
-                "price": order.price,
-                "position_action": PositionAction.OPEN
-            }
-            orders_to_create.append(order_dict)
-
-        # Call batch_order_create and wait for completion
-        await connector.batch_order_create(orders_to_create)
 
     def format_status(self) -> str:
         if not self.ready_to_trade:
