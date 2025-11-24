@@ -33,7 +33,7 @@ class MMGridConfig(BaseClientModel):
     randomization: Decimal = Field(default=Decimal("0.25"))
     leverage: int = Field(100)
     order_tag: Optional[str] = Field(default=None)
-    ema_window: int = Field(10)  # multiple of refresh rate
+    ema_window: int = Field(100) # number of ticks (i.e. seconds)
     target_inventory: Decimal = Field(default=Decimal("0.0"))
 
 class MMGrid(ScriptStrategyBase):
