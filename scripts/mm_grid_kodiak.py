@@ -274,13 +274,16 @@ class MMGrid(ScriptStrategyBase):
         finally:
             self._ready_to_place_orders = True
 
-    async def _async_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
+    async def _async_place_orders(self, proposals: List[PerpetualOrderCandidate]) -> None:
         """Place multiple orders using batch API and wait for completion"""
+        if not proposals or len(proposals) == 0:
+            return
+
         connector = self.connectors[self.config.exchange]
 
         # Convert PerpetualOrderCandidate objects to order dictionaries for batch_order_create
         orders_to_create = []
-        for order in proposal:
+        for order in proposals:
             order_dict = {
                 "trading_pair": order.trading_pair,
                 "amount": order.amount,
