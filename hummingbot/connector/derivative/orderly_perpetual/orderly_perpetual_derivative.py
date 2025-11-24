@@ -1392,7 +1392,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         if not filtered_orders_to_cancel:
             self.logger().warning("[BATCH CANCEL] No valid orders to cancel after filtering.")
-            return True
+            return False
 
         # Batch the orders into groups of 10 (API limit)
         batch_size = 10
@@ -1406,37 +1406,54 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             f"[BATCH CANCEL] Cancelling {total_orders} order(s) in {len(batches)} batch(es)."
         )
 
-        # Execute all batches concurrently and collect results
-        batch_results = await asyncio.gather(
-            *[self.cancel_batch(batch, i + 1) for i, batch in enumerate(batches)],
-            return_exceptions=True
-        )
-        # Map batch results to client_order_ids
-        for i, (batch, result) in enumerate(zip(batches, batch_results)):
-            if isinstance(result, Exception):
-                self.logger().warning(
-                    f"[BATCH CANCEL] Batch {i + 1} failed with exception: {result}"
-                )
-                return False
-            elif result is False:
-                self.logger().warning(
-                    f"[BATCH CANCEL] Batch {i + 1} failed - {len(batch)} orders NOT canceled"
-                )
-                return False
-            else:
-                self.logger().info(
-                    f"[BATCH CANCEL] Batch {i + 1} succeeded - {len(batch)} orders canceled"
-                )
-                return True
+
+        try:
+            # cancel_batch returns bool for each batch
+            raw_results = await safe_gather(
+                *[self.cancel_batch(batch, i + 1) for i, batch in enumerate(batches)],
+                return_exceptions=False,
+            )
+        except Exception:
+            # Only fires if something global fails (not per-batch)
+            self.logger().network(
+                "[BATCH CANCEL] Unexpected error while cancelling batched orders.",
+                exc_info=True,
+                app_warning_msg="Failed to cancel batched orders. Check API key and network connection.",
+            )
+            return False
+
+        # raw_results is List[bool]
+        all_success = all(bool(res) for res in raw_results)
+
+        if not all_success:
+            self.logger().warning(
+                "[BATCH CANCEL] One or more batch cancellations failed or returned an "
+                "unexpected response. Some orders may remain active."
+            )
+
+        wrong_symbol = len(filtered_orders_to_cancel) < len(orders_to_cancel)
+        if wrong_symbol:
+            invalid_symbols = sorted({
+                o.trading_pair for o in orders_to_cancel
+                if o.trading_pair not in self._trading_pairs
+            })
+            self.logger().warning(
+                f"[BATCH CANCEL] One or more cancellations sent with wrong symbol(s): {invalid_symbols}"
+            )
+
+        return all_success and not wrong_symbol
 
     # Create all batch cancel tasks
-    async def cancel_batch(self, batch: list, batch_num: int) -> bool:
-        client_order_ids_str = ",".join(batch)
-        params = {
-            "client_order_ids": client_order_ids_str,
-        }
-        self.logger().info(
-            f"[BATCH CANCEL] Processing batch {batch_num}: {len(batch)} orders"
+    async def cancel_batch(self, batch: List[InFlightOrder], batch_num: int) -> bool:
+        if not batch:
+            self.logger().info(f"[BATCH CANCEL] Batch {batch_num}: no orders provided.")
+            return True
+
+        client_order_ids = [o.client_order_id for o in batch]
+        params = {"client_order_ids": ",".join(client_order_ids)}
+
+        self.logger().debug(
+            f"[BATCH CANCEL] Processing batch {batch_num}: {len(batch)} order(s)"
         )
 
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
@@ -1446,7 +1463,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         )
 
         try:
-            response = await rest_assistant.execute_request(
+            resp = await rest_assistant.execute_request(
                 url=url,
                 throttler_limit_id=CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
                 method=RESTMethod.DELETE,
@@ -1460,13 +1477,13 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             )
             return False
 
-        success_flag = response.get("success", True)
-        data = response.get("data") or {}
+        success_flag = resp.get("success", True)
+        data = resp.get("data") or {}
         status = data.get("status")
 
         if not success_flag or status != "CANCEL_ALL_SENT":
             self.logger().warning(
-                f"[BATCH CANCEL] Batch {batch_num} - unexpected response: {response}"
+                f"[BATCH CANCEL] Batch {batch_num} - unexpected response: {resp}"
             )
             return False
 
