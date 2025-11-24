@@ -312,8 +312,8 @@ class MMGrid(ScriptStrategyBase):
             }
             orders_to_create.append(order_dict)
 
-        # Call batch_order_create and wait for completion
-        await connector.batch_order_create(orders_to_create)
+        # Call bulk_batch_order_create and wait for completion
+        await connector.bulk_batch_order_create(orders_to_create)
 
     def _get_current_inventory(self) -> Decimal:
         """

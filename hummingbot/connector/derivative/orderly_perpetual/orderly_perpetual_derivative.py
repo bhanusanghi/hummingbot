@@ -929,6 +929,21 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         if not response.get("success", False):
             raise IOError(f"Order cancellation failed: {response}")
 
+    async def bulk_batch_order_create(
+        self,
+        orders_to_create: List[Dict[str, Any]]
+    ) -> List[Tuple[str, float]]:
+        """
+        Place multiple orders when more than 10 orders are to be created by creating multiple batch requests and calling promise.all on batch_order_create
+        """
+        if len(orders_to_create) <= 10:
+            return await self.batch_order_create(orders_to_create)
+        else:
+            # Split into batches of 10
+            batches = [orders_to_create[i:i + 10] for i in range(0, len(orders_to_create), 10)]
+            results = await asyncio.gather(*[self.batch_order_create(batch) for batch in batches])
+            return [result for sublist in results for result in sublist]
+    
     async def batch_order_create(
         self,
         orders_to_create: List[Dict[str, Any]]
@@ -1388,7 +1403,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         # Build API request
 
-      
+
 
         # Batch the orders into groups of 10 (API limit)
         batch_size = 10
@@ -1399,21 +1414,52 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             f"[BATCH CANCEL] Cancelling {total_orders} orders in {len(batches)} batch(es) concurrently"
         )
 
-        # Execute all batches concurrently
-        await asyncio.gather(*[self.cancel_batch(batch, i + 1) for i, batch in enumerate(batches)])
-            
+        # Execute all batches concurrently and collect results
+        batch_results = await asyncio.gather(
+            *[self.cancel_batch(batch, i + 1) for i, batch in enumerate(batches)],
+            return_exceptions=True
+        )
+
+        # Map batch results to client_order_ids
+        successful_order_ids = set()
+        for i, (batch, result) in enumerate(zip(batches, batch_results)):
+            if isinstance(result, Exception):
+                self.logger().warning(
+                    f"[BATCH CANCEL] Batch {i + 1} failed with exception: {result}"
+                )
+            elif result is True:
+                # Batch succeeded - mark all orders in this batch as successful
+                successful_order_ids.update(batch)
+                self.logger().info(
+                    f"[BATCH CANCEL] Batch {i + 1} succeeded - {len(batch)} orders canceled"
+                )
+            else:
+                # Batch failed (result is False)
+                self.logger().warning(
+                    f"[BATCH CANCEL] Batch {i + 1} failed - {len(batch)} orders NOT canceled"
+                )
+
+        # Only mark orders as CANCELED if their batch succeeded
         for order in filtered_orders_to_cancel:
-            order_update = OrderUpdate(
-                client_order_id=order.client_order_id,
-                exchange_order_id=order.exchange_order_id,
-                trading_pair=order.trading_pair,
-                update_timestamp=self.current_timestamp,
-                new_state=OrderState.CANCELED,
-            )
-            self._order_tracker.process_order_update(order_update)
+            if order.client_order_id in successful_order_ids:
+                order_update = OrderUpdate(
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=order.exchange_order_id,
+                    trading_pair=order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.CANCELED,
+                )
+                self._order_tracker.process_order_update(order_update)
+                self.logger().debug(
+                    f"[BATCH CANCEL] Marked order {order.client_order_id} as CANCELED"
+                )
+            else:
+                self.logger().warning(
+                    f"[BATCH CANCEL] Order {order.client_order_id} NOT marked as canceled (batch failed)"
+                )
 
     # Create all batch cancel tasks
-    async def cancel_batch(self, batch: list, batch_num: int):
+    async def cancel_batch(self, batch: list, batch_num: int) -> bool:
         client_order_ids_str = ",".join(batch)
         params = {
             "client_order_ids": client_order_ids_str,
@@ -1429,13 +1475,18 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         )
         throttler_limit_id = CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL
         try:
-            await rest_assistant.execute_request(
+            response = await rest_assistant.execute_request(
                 url=url,
                 throttler_limit_id=throttler_limit_id,
                 method=RESTMethod.DELETE,
                 params=params,
                 is_auth_required=True,
             )
+            if not response.get("success", False):
+                return False
+            if not response.get("data", {}).get("success", False):
+                return False
+            return True
         except Exception:
             self.logger().warning(
                 f"[BATCH CANCEL] Batch {batch_num} - Orders not found/invalid on exchange"
