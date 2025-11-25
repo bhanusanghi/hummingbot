@@ -96,3 +96,4 @@ coverage.xml
 .env
 
 **/.claude/settings.local.json
+hummingbot/connector/hummingbot.code-workspace

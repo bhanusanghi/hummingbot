@@ -1,7 +1,7 @@
 import random
 import os
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from pydantic import Field
@@ -13,6 +13,7 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.connector.utils import get_new_client_order_id
 from hummingbot.core.clock import Clock
 from datetime import datetime
 
@@ -83,6 +84,9 @@ class MMGrid(ScriptStrategyBase):
         self._mid_history: List[Decimal] = []
         self._ema_mid: Decimal = Decimal("0")
         self._initialized: bool = False  # Track initialization state
+        self._pending_cancel_and_replace: bool = True  # Start with cancel+place to initialize orders
+        # Track order IDs by spread level: key = (side, spread_level), value = client_order_id
+        self._spread_level_orders: Dict[Tuple[str, int], str] = {}
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
 
@@ -109,7 +113,13 @@ class MMGrid(ScriptStrategyBase):
         proposals: List[PerpetualOrderCandidate] = self.create_proposal()
         if len(proposals) > 0:
             self._cached_proposals = proposals
-            safe_ensure_future(self.edit_cancel_and_place_orders(proposals))  # Execute cancel then place sequentially to avoid order accumulation
+            if self._pending_cancel_and_replace:
+                # After trade/cooldown or first run: cancel all and place new orders
+                safe_ensure_future(self._cancel_and_place_orders(proposals))
+                self._pending_cancel_and_replace = False
+            else:
+                # No trade, just refresh: edit existing orders with new prices
+                safe_ensure_future(self._edit_orders(proposals))
             self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
 
     def create_proposal(self) -> List[PerpetualOrderCandidate]:
@@ -169,6 +179,9 @@ class MMGrid(ScriptStrategyBase):
             return []
 
         orders = []
+        # Track spread level for each order: (side, spread_level)
+        self._proposal_spread_levels: List[Tuple[str, int]] = []
+        
         for idx, bid_spread in enumerate(self.config.bid_spread_levels):
             ask_spread = self.config.ask_spread_levels[idx]
 
@@ -205,6 +218,7 @@ class MMGrid(ScriptStrategyBase):
                     leverage=Decimal(self.config.leverage)
                 )
                 orders.extend([bid_order])
+                self._proposal_spread_levels.append(("BUY", idx))
 
             if ask_amount > 0:
                 ask_order = PerpetualOrderCandidate(
@@ -217,6 +231,7 @@ class MMGrid(ScriptStrategyBase):
                     leverage=Decimal(self.config.leverage)
                 )
                 orders.extend([ask_order])
+                self._proposal_spread_levels.append(("SELL", idx))
 
         return orders
 
@@ -238,6 +253,9 @@ class MMGrid(ScriptStrategyBase):
         if trade == 0:
             self._cached_inventory = inventory
             return inventory
+
+        # Trade detected - mark for cancel+replace after cooldown
+        self._pending_cancel_and_replace = True
 
         last_trade = self._last_trade
         same_direction_trade = sign(trade) == sign(last_trade)
@@ -280,10 +298,8 @@ class MMGrid(ScriptStrategyBase):
         self._ema_mid = Decimal(str(ema_val))
         return self._ema_mid
 
-    async def edit_cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
+    async def _cancel_and_place_orders(self, proposal: List[PerpetualOrderCandidate]) -> None:
         """
-        Edit all active orders
-        Assumes that no orders have been filled in the last tick.
         Cancel all active orders and then place new orders sequentially.
         This ensures old orders are cancelled before new ones are placed.
         """
@@ -292,6 +308,9 @@ class MMGrid(ScriptStrategyBase):
         
         if orders_to_cancel:
             await connector.batch_order_cancel(orders_to_cancel)
+        
+        # Clear spread level order tracking before placing new orders
+        self._spread_level_orders.clear()
         
         # Then place new orders
         await self._async_place_orders(proposal)
@@ -305,8 +324,22 @@ class MMGrid(ScriptStrategyBase):
 
         # Convert PerpetualOrderCandidate objects to order dictionaries for batch_order_create
         orders_to_create = []
-        for order in proposal:
+        for i, order in enumerate(proposal):
+            # Generate client_order_id
+            order_id = get_new_client_order_id(
+                is_buy=order.order_side == TradeType.BUY,
+                trading_pair=order.trading_pair,
+                hbot_order_id_prefix=f"kodiak{i}",
+                max_id_len=36,
+            )
+            
+            # Store order_id by spread level if we have spread level info
+            if hasattr(self, '_proposal_spread_levels') and i < len(self._proposal_spread_levels):
+                side, level = self._proposal_spread_levels[i]
+                self._spread_level_orders[(side, level)] = order_id
+            
             order_dict = {
+                "order_id": order_id,
                 "trading_pair": order.trading_pair,
                 "amount": order.amount,
                 "trade_type": order.order_side,
@@ -315,9 +348,114 @@ class MMGrid(ScriptStrategyBase):
                 "position_action": PositionAction.OPEN
             }
             orders_to_create.append(order_dict)
+        
         self.logger().info(f"Placing {len(orders_to_create)} orders")
         # Call bulk_batch_order_create and wait for completion
         await connector.batch_order_create(orders_to_create)
+
+    async def _edit_orders(self, proposals: List[PerpetualOrderCandidate]) -> None:
+        """
+        Edit existing orders with new prices from proposals.
+        Falls back to cancel+place if edit is not possible.
+        
+        Matching logic:
+        - Use stored spread level order IDs to find orders
+        - Match proposals by spread level (from _proposal_spread_levels)
+        - Verify each order is still valid (unfilled/pending) in order tracker
+        - Edit only valid orders with new prices
+        """
+        connector = self.connectors[self.config.exchange]
+        
+        # Check if we have spread level tracking info
+        if not hasattr(self, '_proposal_spread_levels') or not self._proposal_spread_levels:
+            self.logger().info("No spread level info available, falling back to cancel+place")
+            await self._cancel_and_place_orders(proposals)
+            return
+        
+        if not self._spread_level_orders:
+            self.logger().info("No stored order IDs, falling back to cancel+place")
+            await self._cancel_and_place_orders(proposals)
+            return
+        
+        # Check if proposal count matches spread level count
+        if len(proposals) != len(self._proposal_spread_levels):
+            self.logger().info(
+                f"Proposal count mismatch ({len(proposals)} vs {len(self._proposal_spread_levels)}), "
+                f"falling back to cancel+place"
+            )
+            await self._cancel_and_place_orders(proposals)
+            return
+        
+        # Get all tracked orders from order tracker
+        all_tracked_orders = connector._order_tracker.active_orders
+        
+        # Build list of orders to edit with their new prices
+        orders_to_edit = []
+        new_prices = []
+        invalid_orders = []
+        
+        for i, proposal in enumerate(proposals):
+            side, level = self._proposal_spread_levels[i]
+            
+            # Get stored client_order_id for this spread level
+            client_order_id = self._spread_level_orders.get((side, level))
+            
+            if not client_order_id:
+                self.logger().warning(f"No stored order_id for {side} level {level}")
+                invalid_orders.append((side, level))
+                continue
+            
+            # Find the order in the order tracker
+            tracked_order = all_tracked_orders.get(client_order_id)
+            
+            if not tracked_order:
+                self.logger().warning(f"Order {client_order_id} not found in order tracker")
+                invalid_orders.append((side, level))
+                continue
+            
+            # Verify order is still valid (not done/filled)
+            if tracked_order.is_done:
+                self.logger().warning(
+                    f"Order {client_order_id} is done (state: {tracked_order.current_state}), skipping"
+                )
+                invalid_orders.append((side, level))
+                continue
+            
+            # Verify order side matches proposal side
+            expected_side = "BUY" if tracked_order.trade_type == TradeType.BUY else "SELL"
+            if expected_side != side:
+                self.logger().warning(
+                    f"Order {client_order_id} side mismatch: expected {side}, got {expected_side}"
+                )
+                invalid_orders.append((side, level))
+                continue
+            
+            # Order is valid, add to edit list
+            orders_to_edit.append(tracked_order)
+            new_prices.append(proposal.price)
+        
+        # If any orders are invalid, fall back to cancel+place
+        if invalid_orders:
+            self.logger().info(
+                f"Found {len(invalid_orders)} invalid orders: {invalid_orders}, "
+                f"falling back to cancel+place"
+            )
+            await self._cancel_and_place_orders(proposals)
+            return
+        
+        if not orders_to_edit:
+            self.logger().info("No valid orders to edit, falling back to cancel+place")
+            await self._cancel_and_place_orders(proposals)
+            return
+        
+        # Edit orders (only price, no size changes)
+        self.logger().info(f"Editing {len(orders_to_edit)} orders with new prices")
+        new_sizes = [None] * len(orders_to_edit)
+        success = await connector.bulk_edit_order(orders_to_edit, new_prices, new_sizes)
+        
+        if not success:
+            self.logger().warning("Edit failed, falling back to cancel+place")
+            await self._cancel_and_place_orders(proposals)
 
     def _get_current_inventory(self) -> Decimal:
         """

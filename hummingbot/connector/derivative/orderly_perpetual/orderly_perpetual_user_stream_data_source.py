@@ -163,14 +163,6 @@ class OrderlyPerpetualUserStreamDataSource(UserStreamTrackerDataSource):
             # Generate authentication payload
             auth_payload = await self._auth.get_ws_auth_payload()
             
-            self.logger().info(
-                f"[WEBSOCKET AUTH] Generated auth payload - id: {auth_payload.get('id')}, "
-                f"event: {auth_payload.get('event')}, timestamp: {auth_payload.get('params', {}).get('timestamp')}"
-            )
-            self.logger().debug(
-                f"[WEBSOCKET AUTH] Full auth payload: {auth_payload}"
-            )
-
             # Send authentication message
             auth_request = WSJSONRequest(payload=auth_payload)
             await ws.send(auth_request)
