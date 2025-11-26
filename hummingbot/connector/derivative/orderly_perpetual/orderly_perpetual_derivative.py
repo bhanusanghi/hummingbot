@@ -1592,12 +1592,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
             elif order.order_type == OrderType.LIMIT_MAKER:
                 orderly_order_type = "POST_ONLY"
             
-            self.logger().debug(
-                f"[EDIT ORDER] Order {order.client_order_id}: "
-                f"original_order_type={order.order_type}, mapped_order_type={orderly_order_type}, "
-                f"trade_type={order.trade_type}"
-            )
-            
             # Map trade type to side
             side = "BUY" if order.trade_type == TradeType.BUY else "SELL"
             
@@ -1607,8 +1601,11 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 "symbol": symbol,
                 "order_type": orderly_order_type,
                 "side": side,
+                "client_order_id": order.client_order_id,
             }
             
+            if (self._order_tag):
+                order_params["order_tag"] = self._order_tag
             # Add price if provided (quantize it)
             if new_price is not None and not new_price.is_nan():
                 order_params["order_price"] = float(
@@ -1620,6 +1617,8 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 order_params["order_quantity"] = float(
                     self.quantize_order_amount(order.trading_pair, new_size)
                 )
+            else: # use existing size 
+                order_params["order_quantity"] = float(order.amount)
             
             # Validate that at least one of price or quantity is provided
             if "order_price" not in order_params and "order_quantity" not in order_params:
@@ -1635,23 +1634,6 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 domain=self._domain
             )
             
-            # Log the exact HTTP request being sent
-            import json
-            self.logger().info(
-                f"[EDIT ORDER] HTTP REQUEST DETAILS for order {order.client_order_id}:\n"
-                f"  Method: PUT\n"
-                f"  URL: {url}\n"
-                f"  Endpoint: {CONSTANTS.EDIT_ORDER_URL}\n"
-                f"  Domain: {self._domain}\n"
-                f"  Request Body (JSON):\n{json.dumps(order_params, indent=2)}\n"
-                f"  Order Details:\n"
-                f"    - Original Order Type: {order.order_type}\n"
-                f"    - Mapped Order Type: {orderly_order_type}\n"
-                f"    - Trade Type: {side}\n"
-                f"    - Exchange Order ID: {exchange_order_id}\n"
-                f"    - Symbol: {symbol}"
-            )
-            
             response = await rest_assistant.execute_request(
                 url=url,
                 throttler_limit_id=CONSTANTS.EDIT_ORDER_LIMIT_ID,
@@ -1660,13 +1642,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 is_auth_required=True,
             )
             
-            # Log the response
-            self.logger().info(
-                f"[EDIT ORDER] HTTP RESPONSE for order {order.client_order_id}:\n"
-                f"  Status: {response.get('success', False)}\n"
-                f"  Response Body:\n{json.dumps(response, indent=2)}"
-            )
-            
+         
             if not response.get("success", False):
                 self.logger().error(
                     f"[EDIT ORDER] Failed to edit order {order.client_order_id}"
