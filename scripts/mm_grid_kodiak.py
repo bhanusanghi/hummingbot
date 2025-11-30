@@ -436,7 +436,7 @@ class MMGrid(ScriptStrategyBase):
                 })
             if entry is not None:
                 rows.append({
-                    "price": float(ema),
+                    "price": float(entry),
                     "side": "ENTRY",
                     "amount": None,
                     "age": "-",
