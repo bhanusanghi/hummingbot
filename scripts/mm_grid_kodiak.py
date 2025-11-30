@@ -359,91 +359,86 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Last Trade Size:     {self._last_trade:.6f}")
         lines.append("")
 
-        # Get active orders from connector's order tracker
+        # Open orders, formatted like proposals with MID/EMA markers and AGE at far right
         active_orders = self._get_active_orders_from_connector()
 
         if active_orders:
-            # Use cached mid if you already store it; otherwise set mid = 0 or compute it
-            mid = getattr(self, "_cached_mid_price", 0) or 0
+            mid = self._cached_mid_price
+            ema = getattr(self, "_cached_ema_mid_price", None)
 
-            def delta_mid_bps(price: float) -> str:
-                if not mid:
-                    return "   n/a"
-                return f"{((price / float(mid)) - 1) * 10000:>8.2f}"
+            lines.append("")
+            lines.append("  Open Orders (Orderbook-style Sort)")
+            lines.append("        PRICE        SIDE      AMOUNT     ΔMID (bps)        AGE")
+            lines.append("    ---------------------------------------------------------------------")
 
-            # Collect rows for custom formatting
             rows = []
+
+            # Append active orders
             for order in active_orders:
-                # Side
+                price = float(order.price) if order.price is not None else 0.0
+                amount = float(order.amount)
                 side = "BUY" if order.trade_type == TradeType.BUY else "SELL"
 
-                # Price
-                price = float(order.price) if order.price is not None else 0.0
-
-                # Amount
-                amount = float(order.amount)
-
-                # Filled amount
-                filled = float(order.executed_amount_base) if order.executed_amount_base else 0.0
-
-                # Status
-                status = order.current_state.name if hasattr(order.current_state, "name") else str(order.current_state)
-
-                # Age
+                # Compute age
                 age_seconds = self.current_timestamp - order.creation_timestamp
                 if age_seconds <= 0:
                     age_txt = "n/a"
                 else:
-                    # HH:MM:SS
-                    age_txt = pd.Timestamp(age_seconds, unit="s").strftime("%H:%M:%S")
-
-                # Shortened order id
-                if len(order.client_order_id) > 16:
-                    oid = order.client_order_id[:16] + "..."
-                else:
-                    oid = order.client_order_id
+                    age_txt = pd.Timestamp(age_seconds, unit='s').strftime('%H:%M:%S')
 
                 rows.append({
                     "price": price,
                     "side": side,
                     "amount": amount,
-                    "filled": filled,
-                    "status": status,
                     "age": age_txt,
-                    "oid": oid,
+                    "marker": False,
                 })
 
-            # Sort: buy first then sell; within each, price desc (orderbook-style)
-            def side_sort_val(s: str) -> int:
-                return 0 if s.upper() == "BUY" else 1
+            # MID / EMA markers
+            if mid is not None:
+                rows.append({
+                    "price": float(mid),
+                    "side": "MID",
+                    "amount": None,
+                    "age": "-",
+                    "marker": True
+                })
+            if ema is not None:
+                rows.append({
+                    "price": float(ema),
+                    "side": "EMA",
+                    "amount": None,
+                    "age": "-",
+                    "marker": True
+                })
 
-            rows.sort(key=lambda r: (side_sort_val(r["side"]), -r["price"]))
+            # Orderbook sort: descending by price
+            rows.sort(key=lambda r: r["price"], reverse=True)
 
-            # Header
-            lines.append("")
-            lines.append("  Open Orders (Orderbook-style):")
-            lines.append("    -------------------------------------------------------------------------------------")
-            lines.append("      PRICE     SIDE     AMOUNT     FILLED     ΔMID(bps)   STATUS        AGE     ORDER ID")
-            lines.append("    -------------------------------------------------------------------------------------")
+            def spread_bps(price: float) -> str:
+                if not mid:
+                    return "   n/a"
+                return f"{((float(price) / float(mid)) - 1) * 10000:>10.2f}"
 
-            # Body
+            # Render rows
             for r in rows:
+                amount_str = "-" if r["marker"] else f"{r['amount']:.6f}"
+                delta_str = spread_bps(r["price"])
+                age_str = r["age"]
+
                 lines.append(
-                    "    "
-                    f"{r['price']:>8.4f}   "
-                    f"{r['side']:<4}   "
-                    f"{r['amount']:>9.6f}   "
-                    f"{r['filled']:>9.6f}   "
-                    f"{delta_mid_bps(r['price'])}   "
-                    f"{r['status']:<10.10}   "
-                    f"{r['age']:>8}   "
-                    f"{r['oid']}"
+                    f"    {r['price']:>12.4f}   "
+                    f"{r['side']:<6}   "
+                    f"{amount_str:>10}   "
+                    f"{delta_str}   "
+                    f"{age_str:>10}"
                 )
         else:
             lines.append("")
             lines.append("  No open orders.")
 
         return "\n".join(lines)
+
 
 def fmt(ts):
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
