@@ -15,7 +15,6 @@ https://orderly.network/docs/build-on-omnichain/evm-api/introduction
 """
 
 import asyncio
-import json
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from async_timeout import timeout
@@ -865,7 +864,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         self.logger().info(f"Order params: {order_params}")
         response = await rest_assistant.execute_request(
             url=url,
-            throttler_limit_id=CONSTANTS.CREATE_ORDER_URL,
+            throttler_limit_id=CONSTANTS.CREATE_ORDER_LIMIT_ID,
             method=RESTMethod.POST,
             data=order_params,
             is_auth_required=True,
@@ -903,7 +902,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 CONSTANTS.CANCEL_ORDER_URL,
                 domain=self._domain
             )
-            throttler_limit_id = CONSTANTS.CANCEL_ORDER_URL
+            throttler_limit_id = CONSTANTS.CANCEL_ORDER_LIMIT_ID
         else:
             # Cancel by client_order_id
             params = {
@@ -914,7 +913,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 CONSTANTS.CANCEL_ORDER_BY_CLIENT_ID_URL,
                 domain=self._domain
             )
-            throttler_limit_id = CONSTANTS.CANCEL_ORDER_BY_CLIENT_ID_URL
+            throttler_limit_id = CONSTANTS.CANCEL_ORDER_BY_CLIENT_ID_LIMIT_ID
         
         # Make API call
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
@@ -929,7 +928,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         if not response.get("success", False):
             raise IOError(f"Order cancellation failed: {response}")
 
-    async def bulk_batch_order_create(
+    async def batch_order_create(
         self,
         orders_to_create: List[Dict[str, Any]]
     ) -> List[Tuple[str, float]]:
@@ -937,14 +936,20 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         Place multiple orders when more than 10 orders are to be created by creating multiple batch requests and calling promise.all on batch_order_create
         """
         if len(orders_to_create) <= 10:
-            return await self.batch_order_create(orders_to_create)
+            return await self.create_batch(orders_to_create)
         else:
             # Split into batches of 10
             batches = [orders_to_create[i:i + 10] for i in range(0, len(orders_to_create), 10)]
-            results = await asyncio.gather(*[self.batch_order_create(batch) for batch in batches])
-            return [result for sublist in results for result in sublist]
+            self.logger().info(f"Placing {len(batches)} batches of {len(batches[0])} orders")
+            # Execute all batches in parallel and collect results
+            batch_results: List[List[Tuple[str, float]]] = await asyncio.gather(*[self.batch_order_create(batch) for batch in batches])
+            # Flatten the nested list: List[List[Tuple[str, float]]] -> List[Tuple[str, float]]
+            flattened_results: List[Tuple[str, float]] = []
+            for batch_result in batch_results:
+                flattened_results.extend(batch_result)
+            return flattened_results
     
-    async def batch_order_create(
+    async def create_batch(
         self,
         orders_to_create: List[Dict[str, Any]]
     ) -> List[Tuple[str, float]]:
@@ -991,11 +996,11 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         inflight_orders_to_create = []
         order_id_map = {}  # Map index to order_id for result matching
 
-        for i, order_data in enumerate(orders_to_create):
+        for i, order_data in enumerate[Dict[str, Any]](orders_to_create):
             try:
                 # Extract order parameters
                 order_id = order_data.get("order_id")
-
+            
                 # Generate client_order_id if not provided
                 if not order_id:
                     order_id = get_new_client_order_id(
@@ -1097,11 +1102,12 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         request_data = {"orders": batch_orders}
 
         self.logger().info(f"[BATCH ORDER] Submitting batch of {len(batch_orders)} orders")
+        self.logger().info(f"[BATCH ORDER DEBUG] throttler_limit_id={CONSTANTS.BATCH_CREATE_ORDER_LIMIT_ID}, throttler={self._throttler}")
 
         try:
             response = await rest_assistant.execute_request(
                 url=url,
-                throttler_limit_id=CONSTANTS.BATCH_CREATE_ORDER_URL,
+                throttler_limit_id=CONSTANTS.BATCH_CREATE_ORDER_LIMIT_ID,
                 method=RESTMethod.POST,
                 data=request_data,
                 is_auth_required=True,
@@ -1465,7 +1471,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         try:
             resp = await rest_assistant.execute_request(
                 url=url,
-                throttler_limit_id=CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
+                throttler_limit_id=CONSTANTS.BATCH_CANCEL_ORDER_BY_CLIENT_ID_LIMIT_ID,
                 method=RESTMethod.DELETE,
                 params=params,
                 is_auth_required=True,
@@ -1481,7 +1487,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         data = resp.get("data") or {}
         status = data.get("status")
 
-        if not success_flag or status != "CANCEL_ALL_SENT":
+        if not success_flag or not (status == "CANCEL_SENT" or status == "CANCEL_ALL_SENT"):
             self.logger().warning(
                 f"[BATCH CANCEL] Batch {batch_num} - unexpected response: {resp}"
             )
@@ -1502,6 +1508,174 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         return True
 
+    async def bulk_edit_order(self, orders: List[InFlightOrder], new_prices: List[Decimal], new_sizes: List[Optional[Decimal]]) -> bool:
+        """
+        Edit multiple orders concurrently.
+        
+        Args:
+            orders: List of InFlightOrder objects to edit
+            new_prices: List of new prices (must match orders length)
+            new_sizes: List of new sizes (must match orders length, can contain None for optional sizes)
+        
+        Returns:
+            True if all edits succeeded, False if any failed
+        """
+        if len(orders) != len(new_prices) or len(orders) != len(new_sizes):
+            self.logger().error(
+                f"[BULK EDIT] Length mismatch: orders={len(orders)}, prices={len(new_prices)}, sizes={len(new_sizes)}"
+            )
+            return False
+
+        # Create list of edit coroutines
+        edit_tasks = [
+            self.edit_order(order, new_price, new_size)
+            for order, new_price, new_size in zip(orders, new_prices, new_sizes)
+        ]
+        
+        # Execute all edits concurrently
+        try:
+            results = await asyncio.gather(*edit_tasks, return_exceptions=True)
+            
+            # Check if any failed
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    self.logger().error(
+                        f"[BULK EDIT] Order {orders[i].client_order_id} failed with exception: {result}",
+                        exc_info=True
+                    )
+                    return False
+                elif result is False:
+                    self.logger().warning(
+                        f"[BULK EDIT] Order {orders[i].client_order_id} edit failed"
+                    )
+                    return False
+            
+            self.logger().info(f"[BULK EDIT] Successfully edited {len(orders)} orders")
+            return True
+            
+        except Exception as e:
+            self.logger().error(f"[BULK EDIT] Unexpected error: {e}", exc_info=True)
+            return False
+    
+    async def edit_order(self, order: InFlightOrder, new_price: Decimal, new_size: Optional[Decimal] = None) -> bool:
+        """
+        Edit an existing order on the exchange.
+        
+        According to Orderly API:
+        - PUT /v1/order
+        - Only order_price or order_quantity can be amended
+        - Requires: order_id, symbol, order_type, side
+        
+        Args:
+            order: InFlightOrder to edit
+            new_price: New price for the order
+            new_size: Optional new size for the order (if None, only price is updated)
+        
+        Returns:
+            True if edit succeeded, False otherwise
+        """
+        try:
+            # Get exchange order ID
+            exchange_order_id = await order.get_exchange_order_id()
+            if not exchange_order_id:
+                self.logger().error(
+                    f"[EDIT ORDER] Order {order.client_order_id} has no exchange_order_id"
+                )
+                return False
+            
+            # Get exchange symbol
+            symbol = await self.exchange_symbol_associated_to_pair(order.trading_pair)
+            
+            orderly_order_type = "MARKET"
+            if order.order_type == OrderType.LIMIT:
+                orderly_order_type = "LIMIT"
+            elif order.order_type == OrderType.LIMIT_MAKER:
+                orderly_order_type = "POST_ONLY"
+            
+            # Map trade type to side
+            side = "BUY" if order.trade_type == TradeType.BUY else "SELL"
+            
+            # Build request payload
+            order_params = {
+                "order_id": str(exchange_order_id),
+                "symbol": symbol,
+                "order_type": orderly_order_type,
+                "side": side,
+                "client_order_id": order.client_order_id,
+            }
+            
+            if (self._order_tag):
+                order_params["order_tag"] = self._order_tag
+            # Add price if provided (quantize it)
+            if new_price is not None and not new_price.is_nan():
+                order_params["order_price"] = float(
+                    self.quantize_order_price(order.trading_pair, new_price)
+                )
+            
+            # Add quantity if provided (quantize it)
+            if new_size is not None and not new_size.is_nan():
+                order_params["order_quantity"] = float(
+                    self.quantize_order_amount(order.trading_pair, new_size)
+                )
+            else: # use existing size 
+                order_params["order_quantity"] = float(order.amount)
+            
+            # Validate that at least one of price or quantity is provided
+            if "order_price" not in order_params and "order_quantity" not in order_params:
+                self.logger().error(
+                    f"[EDIT ORDER] Must provide either new_price or new_size for order {order.client_order_id}"
+                )
+                return False
+            
+            # Make API call
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+            url = web_utils.public_rest_url(
+                CONSTANTS.EDIT_ORDER_URL,
+                domain=self._domain
+            )
+            
+            response = await rest_assistant.execute_request(
+                url=url,
+                throttler_limit_id=CONSTANTS.EDIT_ORDER_LIMIT_ID,
+                method=RESTMethod.PUT,
+                data=order_params,
+                is_auth_required=True,
+            )
+            
+         
+            if not response.get("success", False):
+                self.logger().error(
+                    f"[EDIT ORDER] Failed to edit order {order.client_order_id}"
+                )
+                return False
+            
+            # Check response status
+            data = response.get("data", {})
+            status = data.get("status", "")
+            
+            if status == "EDIT_SENT":
+                self.logger().info(
+                    f"[EDIT ORDER] Successfully edited order {order.client_order_id}"
+                )
+                return True
+            else:
+                self.logger().warning(
+                    f"[EDIT ORDER] Unexpected status '{status}' for order {order.client_order_id}: {response}"
+                )
+                return False
+                
+        except asyncio.TimeoutError:
+            self.logger().error(
+                f"[EDIT ORDER] Timeout waiting for exchange_order_id for order {order.client_order_id}"
+            )
+            return False
+        except Exception as e:
+            self.logger().error(
+                f"[EDIT ORDER] Error editing order {order.client_order_id}: {e}",
+                exc_info=True
+            )
+            return False
+        
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """
@@ -1941,7 +2115,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         
         self.logger().debug(
             f"[WS ORDER EVENT] Received order event: clientOrderId={client_order_id}, "
-            f"symbol={symbol}, status={data.get('status', 'UNKNOWN')}"
+            f"symbol={symbol}, status={data.get('status', 'UNKNOWN')}, order_type={data.get('type', 'UNKNOWN')}"
         )
         
         if not client_order_id:
