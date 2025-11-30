@@ -331,16 +331,16 @@ class MMGrid(ScriptStrategyBase):
         spread_mult = self._cached_spread_mult
         inv_ratio_pct = self._cached_inventory_ratio * Decimal("100")
 
-        lines = []
+        lines: List[str] = []
         lines.append("")
         lines.append("  Strategy Status")
         lines.append("  ----------------------------")
         lines.append(f"    Exchange:            {self.config.exchange}")
         lines.append(f"    Trading Pair:        {self.config.trading_pair}")
         lines.append("")
-        lines.append(f"    Mark Price:          {mark:.4f}")
-        lines.append(f"    Mid Price:           {mid:.4f}")
-        lines.append(f"    EMA:                 {ema:.4f} ({self.config.ema_window})")
+        lines.append(f"    Mark Price:          {mark:.5f}")
+        lines.append(f"    Mid Price:           {mid:.5f}")
+        lines.append(f"    EMA:                 {ema:.5f} ({self.config.ema_window})")
         lines.append("")
         lines.append(f"    Inventory:           {self._cached_inventory:.4f}")
         lines.append(f"    Target Inventory:    {self.config.target_inventory:.4f}")
@@ -363,10 +363,21 @@ class MMGrid(ScriptStrategyBase):
         active_orders = self._get_active_orders_from_connector()
 
         if active_orders:
+            indent = "    "
+
             lines.append("")
             lines.append("  Open Orders (Orderbook-style Sort)")
-            lines.append("        PRICE        SIDE      AMOUNT     ΔMID (bps)        AGE")
-            lines.append("    ---------------------------------------------------------------------")
+
+            # Header built with same widths as row formatting
+            header = (
+                f"{indent}{'PRICE':>12}   "
+                f"{'SIDE':<6}   "
+                f"{'AMOUNT':>10}   "
+                f"{'ΔMID (bps)':>10}   "
+                f"{'AGE':>10}"
+            )
+            lines.append(header)
+            lines.append(indent + "-" * (len(header) - len(indent)))
 
             rows = []
 
@@ -381,7 +392,7 @@ class MMGrid(ScriptStrategyBase):
                 if age_seconds <= 0:
                     age_txt = "n/a"
                 else:
-                    age_txt = pd.Timestamp(age_seconds, unit='s').strftime('%H:%M:%S')
+                    age_txt = pd.Timestamp(age_seconds, unit="s").strftime("%H:%M:%S")
 
                 rows.append({
                     "price": price,
@@ -398,7 +409,7 @@ class MMGrid(ScriptStrategyBase):
                     "side": "MID",
                     "amount": None,
                     "age": "-",
-                    "marker": True
+                    "marker": True,
                 })
             if ema is not None:
                 rows.append({
@@ -406,25 +417,26 @@ class MMGrid(ScriptStrategyBase):
                     "side": "EMA",
                     "amount": None,
                     "age": "-",
-                    "marker": True
+                    "marker": True,
                 })
 
             # Orderbook sort: descending by price
             rows.sort(key=lambda r: r["price"], reverse=True)
 
             def spread_bps(price: float) -> str:
-                if not mid:
-                    return "   n/a"
-                return f"{((float(price) / float(mid)) - 1) * 10000:>10.2f}"
+                if mid is None or mid == 0:
+                    return f"{'n/a':>10}"
+                value = (float(price) / float(mid) - 1) * 10000
+                return f"{value:>10.2f}"
 
             # Render rows
             for r in rows:
-                amount_str = "-" if r["marker"] else f"{r['amount']:.6f}"
+                amount_str = "-" if r["marker"] else f"{r['amount']:.3f}"
                 delta_str = spread_bps(r["price"])
                 age_str = r["age"]
 
                 lines.append(
-                    f"    {r['price']:>12.5f}   "
+                    f"{indent}{r['price']:>12.5f}   "
                     f"{r['side']:<6}   "
                     f"{amount_str:>10}   "
                     f"{delta_str}   "
@@ -435,7 +447,6 @@ class MMGrid(ScriptStrategyBase):
             lines.append("  No open orders.")
 
         return "\n".join(lines)
-
 
 def fmt(ts):
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
