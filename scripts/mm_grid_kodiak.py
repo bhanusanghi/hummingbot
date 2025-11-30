@@ -363,9 +363,6 @@ class MMGrid(ScriptStrategyBase):
         active_orders = self._get_active_orders_from_connector()
 
         if active_orders:
-            mid = self._cached_mid_price
-            ema = getattr(self, "_cached_ema_mid_price", None)
-
             lines.append("")
             lines.append("  Open Orders (Orderbook-style Sort)")
             lines.append("        PRICE        SIDE      AMOUNT     ΔMID (bps)        AGE")
