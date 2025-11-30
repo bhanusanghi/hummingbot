@@ -424,7 +424,7 @@ class MMGrid(ScriptStrategyBase):
                 age_str = r["age"]
 
                 lines.append(
-                    f"    {r['price']:>12.4f}   "
+                    f"    {r['price']:>12.5f}   "
                     f"{r['side']:<6}   "
                     f"{amount_str:>10}   "
                     f"{delta_str}   "
