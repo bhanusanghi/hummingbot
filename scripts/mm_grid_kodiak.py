@@ -340,7 +340,7 @@ class MMGrid(ScriptStrategyBase):
         lines.append("")
         lines.append(f"    Mark Price:          {mark:.4f}")
         lines.append(f"    Mid Price:           {mid:.4f}")
-        lines.append(f"    EMA ({self.config.ema_window}):            {ema:.4f}")
+        lines.append(f"    EMA:                 {ema:.4f} ({self.config.ema_window})")
         lines.append("")
         lines.append(f"    Inventory:           {self._cached_inventory:.4f}")
         lines.append(f"    Target Inventory:    {self.config.target_inventory:.4f}")
@@ -363,43 +363,82 @@ class MMGrid(ScriptStrategyBase):
         active_orders = self._get_active_orders_from_connector()
 
         if active_orders:
-            # Create DataFrame with order information
-            columns = ["Order ID", "Side", "Price", "Amount", "Filled", "Status", "Age"]
-            data = []
+            # Use cached mid if you already store it; otherwise set mid = 0 or compute it
+            mid = getattr(self, "_cached_mid_price", 0) or 0
+
+            def delta_mid_bps(price: float) -> str:
+                if not mid:
+                    return "   n/a"
+                return f"{((price / float(mid)) - 1) * 10000:>8.2f}"
+
+            # Collect rows for custom formatting
+            rows = []
             for order in active_orders:
-                # Calculate age
+                # Side
+                side = "BUY" if order.trade_type == TradeType.BUY else "SELL"
+
+                # Price
+                price = float(order.price) if order.price is not None else 0.0
+
+                # Amount
+                amount = float(order.amount)
+
+                # Filled amount
+                filled = float(order.executed_amount_base) if order.executed_amount_base else 0.0
+
+                # Status
+                status = order.current_state.name if hasattr(order.current_state, "name") else str(order.current_state)
+
+                # Age
                 age_seconds = self.current_timestamp - order.creation_timestamp
                 if age_seconds <= 0:
                     age_txt = "n/a"
                 else:
-                    age_txt = pd.Timestamp(age_seconds, unit='s').strftime('%H:%M:%S')
+                    # HH:MM:SS
+                    age_txt = pd.Timestamp(age_seconds, unit="s").strftime("%H:%M:%S")
 
-                # Get filled amount
-                filled = float(order.executed_amount_base) if order.executed_amount_base else 0.0
+                # Shortened order id
+                if len(order.client_order_id) > 16:
+                    oid = order.client_order_id[:16] + "..."
+                else:
+                    oid = order.client_order_id
 
-                # Get status
-                status = order.current_state.name if hasattr(order.current_state, 'name') else str(order.current_state)
+                rows.append({
+                    "price": price,
+                    "side": side,
+                    "amount": amount,
+                    "filled": filled,
+                    "status": status,
+                    "age": age_txt,
+                    "oid": oid,
+                })
 
-                data.append([
-                    order.client_order_id[:16] + "..." if len(order.client_order_id) > 16 else order.client_order_id,
-                    "buy" if order.trade_type == TradeType.BUY else "sell",
-                    float(order.price) if order.price else "N/A",
-                    float(order.amount),
-                    f"{filled:.6f}",
-                    status,
-                    age_txt
-                ])
+            # Sort: buy first then sell; within each, price desc (orderbook-style)
+            def side_sort_val(s: str) -> int:
+                return 0 if s.upper() == "BUY" else 1
 
-            df = pd.DataFrame(data=data, columns=columns)
-            # Sort: buy orders first, then sell orders; within each group, sort by price descending
-            df['Side_sort'] = df['Side'].map({'buy': 0, 'sell': 1})
-            df['Price_num'] = pd.to_numeric(df['Price'], errors='coerce')
-            df.sort_values(by=['Side_sort', 'Price_num'], ascending=[True, False], inplace=True)
-            df.drop(['Side_sort', 'Price_num'], axis=1, inplace=True)
+            rows.sort(key=lambda r: (side_sort_val(r["side"]), -r["price"]))
 
+            # Header
             lines.append("")
-            lines.append("  Open Orders:")
-            lines.extend(["    " + line for line in df.to_string(index=False).split("\n")])
+            lines.append("  Open Orders (Orderbook-style):")
+            lines.append("    -------------------------------------------------------------------------------------")
+            lines.append("      PRICE     SIDE     AMOUNT     FILLED     ΔMID(bps)   STATUS        AGE     ORDER ID")
+            lines.append("    -------------------------------------------------------------------------------------")
+
+            # Body
+            for r in rows:
+                lines.append(
+                    "    "
+                    f"{r['price']:>8.4f}   "
+                    f"{r['side']:<4}   "
+                    f"{r['amount']:>9.6f}   "
+                    f"{r['filled']:>9.6f}   "
+                    f"{delta_mid_bps(r['price'])}   "
+                    f"{r['status']:<10.10}   "
+                    f"{r['age']:>8}   "
+                    f"{r['oid']}"
+                )
         else:
             lines.append("")
             lines.append("  No open orders.")
