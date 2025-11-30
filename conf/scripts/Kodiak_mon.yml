@@ -1,6 +1,6 @@
 exchange: orderly_perpetual
 trading_pair: MON-USDC
-order_size: [0.25, 0.5, 0.75, 1] #in MON
+order_size: [25000, 50000, 100000] #in MON
 bid_spread_levels: [0.001, 0.002, 0.003] #in bps
 ask_spread_levels: [0.001, 0.002, 0.003] #in bps
 order_refresh_time: 10 #in seconds
