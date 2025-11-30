@@ -260,10 +260,10 @@ class MMGrid(ScriptStrategyBase):
         self._ready_to_place_orders = False
         try:
             connector = self.connectors[self.config.exchange]
-            orders_to_cancel = self._get_active_orders_from_connector()
+            # orders_to_cancel = self._get_active_orders_from_connector()
 
-            if orders_to_cancel:
-                cancel_success = await connector.batch_order_cancel(orders_to_cancel)
+            if True:
+                cancel_success = await connector.cancel_all_symbol(self.config.trading_pair)
                 if not cancel_success:
                     self.logger().warning(f"Cancel all failed: Skipping new order placement this cycle.")
                     return
