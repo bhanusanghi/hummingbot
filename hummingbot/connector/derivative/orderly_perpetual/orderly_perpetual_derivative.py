@@ -1102,7 +1102,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
         request_data = {"orders": batch_orders}
 
         self.logger().info(f"[BATCH ORDER] Submitting batch of {len(batch_orders)} orders")
-        self.logger().info(f"[BATCH ORDER DEBUG] throttler_limit_id={CONSTANTS.BATCH_CREATE_ORDER_LIMIT_ID}, throttler={self._throttler}")
+        self.logger().debug(f"[BATCH ORDER DEBUG] throttler_limit_id={CONSTANTS.BATCH_CREATE_ORDER_LIMIT_ID}, throttler={self._throttler}")
 
         try:
             response = await rest_assistant.execute_request(

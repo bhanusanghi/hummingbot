@@ -428,15 +428,15 @@ class ClientOrderTracker:
 
         if tracked_order.is_cancelled:
             self._trigger_cancelled_event(tracked_order)
-            # self.logger().info(f"Successfully canceled order {tracked_order.client_order_id}.")
+            self.logger().info(f"Successfully canceled order {tracked_order.client_order_id}.")
 
         elif tracked_order.is_filled:
             self._trigger_completed_event(tracked_order)
-            # self.logger().info(f"{tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} completely filled.")
+            self.logger().info(f"{tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} completely filled.")
 
         elif tracked_order.is_failure:
             self._trigger_failure_event(tracked_order, order_update)
-            # self.logger().info(f"Order {tracked_order.client_order_id} has failed. Order Update: {order_update}")
+            self.logger().info(f"Order {tracked_order.client_order_id} has failed. Order Update: {order_update}")
 
         self.stop_tracking_order(tracked_order.client_order_id)
 
