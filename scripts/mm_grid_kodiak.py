@@ -144,6 +144,19 @@ class MMGrid(ScriptStrategyBase):
         spread_mult = Decimal("1") + abs(inventory_ratio) * (self.config.max_spread_mult - Decimal("1"))
         random_factor = compute_random_factor(self.config.randomization)
 
+
+        # Entry_price bias
+        if self.config.target_inventory == 0 and inventory != 0 and entry_price > 0 and ema > 0:
+            if abs(entry_price/ema-1) <= Decimal("0.1"): #Magic number, if price is off by 10%, assume it's wrong and do nothing
+                avg = (entry_price + ema) / 2
+
+                if inventory > 0 and ema < entry_price:
+                    # Long and underwater → push asks toward average
+                    ask_anchor = max(ask_anchor, avg)
+                elif inventory < 0 and ema > entry_price:
+                    # Short and underwater → push bids toward average
+                    bid_anchor = min(bid_anchor, avg)
+
         # Detect trade: update cooldown_until_timestamp and last_trade
         # Note that cooldown timestamp is based on current timestamp and isn't affected by refresh rate
         self._detect_trade(self._cached_inventory, inventory)
@@ -326,6 +339,7 @@ class MMGrid(ScriptStrategyBase):
         mid = self._cached_mid_price
         ema = self._cached_ema_mid
         mark = self._cached_mark_price
+        entry = self._cached_entry_price
 
         skew_bps = (self._cached_skew_mult - Decimal("1")) * Decimal("10000")
         spread_mult = self._cached_spread_mult
@@ -341,6 +355,7 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Mark Price:          {mark:.5f}")
         lines.append(f"    Mid Price:           {mid:.5f}")
         lines.append(f"    EMA:                 {ema:.5f} ({self.config.ema_window})")
+        lines.append(f"    Entry Price:         {entry:.5f}")
         lines.append("")
         lines.append(f"    Inventory:           {self._cached_inventory:.4f}")
         lines.append(f"    Target Inventory:    {self.config.target_inventory:.4f}")
@@ -415,6 +430,14 @@ class MMGrid(ScriptStrategyBase):
                 rows.append({
                     "price": float(ema),
                     "side": "EMA",
+                    "amount": None,
+                    "age": "-",
+                    "marker": True,
+                })
+            if entry is not None:
+                rows.append({
+                    "price": float(ema),
+                    "side": "ENTRY",
                     "amount": None,
                     "age": "-",
                     "marker": True,
