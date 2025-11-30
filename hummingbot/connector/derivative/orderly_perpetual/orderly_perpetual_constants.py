@@ -137,6 +137,17 @@ TRADING_LIMIT_ID = "Trading"
 PRIVATE_LIMIT_ID = "Private"
 PUBLIC_LIMIT_ID = "Public"
 
+# Throttler Limit IDs (method-scoped to avoid collisions on same path)
+# Using method-scoped IDs prevents POST/PUT/DELETE on the same path from overriding each other's limits.
+CREATE_ORDER_LIMIT_ID = "POST /v1/order"
+EDIT_ORDER_LIMIT_ID = "PUT /v1/order"
+CANCEL_ORDER_LIMIT_ID = "DELETE /v1/order"
+
+BATCH_CREATE_ORDER_LIMIT_ID = "POST /v1/batch-order"
+BATCH_CANCEL_ORDER_LIMIT_ID = "DELETE /v1/batch-order"
+BATCH_CANCEL_ORDER_BY_CLIENT_ID_LIMIT_ID = "DELETE /v1/client/batch-order"
+CANCEL_ORDER_BY_CLIENT_ID_LIMIT_ID = "DELETE /v1/client/order"
+
 RATE_LIMITS = [
     # Global limits
     RateLimit(ALL_ENDPOINTS_LIMIT, limit=100, time_interval=10),
@@ -146,7 +157,7 @@ RATE_LIMITS = [
 
     # Trading endpoints (10 req/sec limit)
     RateLimit(
-        limit_id=CREATE_ORDER_URL,
+        limit_id=CREATE_ORDER_LIMIT_ID,
         limit=TRADING_ENDPOINTS_LIMIT,
         time_interval=1,
         linked_limits=[
@@ -156,7 +167,7 @@ RATE_LIMITS = [
     ),
     # Batch Create Order: 1 req/sec per swagger docs
     RateLimit(
-        limit_id=BATCH_CREATE_ORDER_URL,
+        limit_id=BATCH_CREATE_ORDER_LIMIT_ID,
         limit=1,
         time_interval=1,
         linked_limits=[
@@ -165,7 +176,7 @@ RATE_LIMITS = [
         ]
     ),
     RateLimit(
-        limit_id=CANCEL_ORDER_URL,
+        limit_id=CANCEL_ORDER_LIMIT_ID,
         limit=TRADING_ENDPOINTS_LIMIT,
         time_interval=1,
         linked_limits=[
@@ -175,7 +186,7 @@ RATE_LIMITS = [
     ),
     # Batch Cancel Order: 10 req/sec per swagger docs (both variants)
     RateLimit(
-        limit_id=BATCH_CANCEL_ORDER_URL,
+        limit_id=BATCH_CANCEL_ORDER_LIMIT_ID,
         limit=TRADING_ENDPOINTS_LIMIT,
         time_interval=1,
         linked_limits=[
@@ -184,7 +195,7 @@ RATE_LIMITS = [
         ]
     ),
     RateLimit(
-        limit_id=BATCH_CANCEL_ORDER_BY_CLIENT_ID_URL,
+        limit_id=BATCH_CANCEL_ORDER_BY_CLIENT_ID_LIMIT_ID,
         limit=TRADING_ENDPOINTS_LIMIT,
         time_interval=1,
         linked_limits=[
@@ -193,7 +204,16 @@ RATE_LIMITS = [
         ]
     ),
     RateLimit(
-        limit_id=EDIT_ORDER_URL,
+        limit_id=EDIT_ORDER_LIMIT_ID,
+        limit=TRADING_ENDPOINTS_LIMIT,
+        time_interval=1,
+        linked_limits=[
+            LinkedLimitWeightPair(TRADING_LIMIT_ID),
+            LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)
+        ]
+    ),
+    RateLimit(
+        limit_id=CANCEL_ORDER_BY_CLIENT_ID_LIMIT_ID,
         limit=TRADING_ENDPOINTS_LIMIT,
         time_interval=1,
         linked_limits=[
