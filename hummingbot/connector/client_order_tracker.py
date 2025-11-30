@@ -396,7 +396,7 @@ class ClientOrderTracker:
         if (previous_state == OrderState.PENDING_CREATE and
                 previous_state != new_state and
                 new_state not in [OrderState.CANCELED, OrderState.FAILED, OrderState.PENDING_CANCEL]):
-            self.logger().info(tracked_order.build_order_created_message())
+            self.logger().debug(tracked_order.build_order_created_message())
             self._trigger_created_event(tracked_order)
 
     def _trigger_order_fills(self,
@@ -428,15 +428,15 @@ class ClientOrderTracker:
 
         if tracked_order.is_cancelled:
             self._trigger_cancelled_event(tracked_order)
-            self.logger().info(f"Successfully canceled order {tracked_order.client_order_id}.")
+            self.logger().debug(f"Successfully canceled order {tracked_order.client_order_id}.")
 
         elif tracked_order.is_filled:
             self._trigger_completed_event(tracked_order)
-            self.logger().info(f"{tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} completely filled.")
+            self.logger().debug(f"{tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} completely filled.")
 
         elif tracked_order.is_failure:
             self._trigger_failure_event(tracked_order, order_update)
-            self.logger().info(f"Order {tracked_order.client_order_id} has failed. Order Update: {order_update}")
+            self.logger().debug(f"Order {tracked_order.client_order_id} has failed. Order Update: {order_update}")
 
         self.stop_tracking_order(tracked_order.client_order_id)
 
