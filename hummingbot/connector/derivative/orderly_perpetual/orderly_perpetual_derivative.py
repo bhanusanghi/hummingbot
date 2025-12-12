@@ -2174,7 +2174,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
                 client_order_id=client_order_id,
                 exchange_order_id=str(data.get("orderId", "")),
                 trading_pair=tracked_order.trading_pair,
-                fill_timestamp=int(data.get("timestamp", self.current_timestamp) * 1e-3),
+                fill_timestamp=int(data.get("timestamp", self.current_timestamp * 1000) * 1e-3),
                 fill_price=executed_price,
                 fill_base_amount=executed_quantity,
                 fill_quote_amount=executed_price * executed_quantity,
