@@ -2189,7 +2189,7 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         order_update = OrderUpdate(
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=data.get("timestamp", self.current_timestamp) * 1e-3,
+            update_timestamp=data.get("timestamp", self.current_timestamp * 1000) * 1e-3,
             new_state=new_state,
             client_order_id=client_order_id,
             exchange_order_id=str(data.get("orderId", "")),

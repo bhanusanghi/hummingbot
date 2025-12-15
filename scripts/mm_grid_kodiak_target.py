@@ -18,6 +18,7 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.core.clock import Clock
 from datetime import datetime
 
+from scripts.backtester.data_types import TickData
 
 def _fmt(ts):
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
@@ -71,7 +72,18 @@ class MMGrid(ScriptStrategyBase):
         super().__init__(connectors)
         self.config = config
         self.account_config_set = False
-        self.create_timestamp = 0
+
+        # Timing state (used by process_tick_data to build TickData)
+        self._last_order_created_timestamp: int = 0
+        self._last_fill_timestamp: int = 0
+        self._last_fill_direction: int = 0  # -1 sell, 0 none, 1 buy
+        self._is_last_fill_in_same_direction: bool = False
+
+        # EMA state (managed by process_tick_data)
+        self._mid_history: List[Decimal] = []
+        self._ema_mid: Decimal = Decimal("0")
+
+        # Cached values for status display (updated in on_tick after create_proposal)
         self._cached_mark_price: Decimal = Decimal("0")
         self._cached_mid_price: Decimal = Decimal("0")
         self._cached_bid_anchor: Decimal = Decimal("0")
@@ -80,13 +92,10 @@ class MMGrid(ScriptStrategyBase):
         self._cached_random_factor: Decimal = Decimal("0")
         self._cached_skew_mult: Decimal = Decimal("0")
         self._cached_proposals: List[PerpetualOrderCandidate] = []
-        self._cooldown_until_timestamp: int = 0
-        self._last_trade = Decimal("0")
         self._cached_inventory: Decimal = Decimal("0")
         self._cached_inventory_ratio: Decimal = Decimal("0")
-        self._mid_history: List[Decimal] = []
-        self._ema_mid: Decimal = Decimal("0")
-        self._initialized: bool = False  # Track initialization state
+
+        self._initialized: bool = False
 
     # Built-in event handler methods (called automatically by ScriptStrategyBase)
 
@@ -111,89 +120,162 @@ class MMGrid(ScriptStrategyBase):
 
     def did_fill_order(self, order_filled_event: OrderFilledEvent):
         """
-        Handle fill events from the connector - updates cooldown and inventory tracking.
-        Overrides StrategyPyBase hook to use explicit fill events instead of position inference.
+        Handle fill events from the connector - updates timing state for cooldowns.
+        Overrides StrategyPyBase hook.
         """
-        self.logger().info(f"Script Order Fill Callback: {order_filled_event.trade_type.name} {order_filled_event.amount} @ {order_filled_event.price}")
+        self.logger().info(f"Fill: {order_filled_event.trade_type.name} {order_filled_event.amount} @ {order_filled_event.price}")
+
         # Only process fills for our trading pair
         if order_filled_event.trading_pair != self.config.trading_pair:
             return
-        
-        trade_amount = order_filled_event.amount
-        if order_filled_event.trade_type == TradeType.SELL:
-            trade_amount = -trade_amount
-        
-        # Update cooldown based on trade direction (same logic as _detect_trade)
-        same_direction = sign(trade_amount) == sign(self._last_trade)
-        
-        if sign(self._last_trade) == 0:
-            self.logger().info(f"First trade: {trade_amount:.4f}. Starting cooldown")
-            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
-        elif same_direction:
-            self.logger().info(f"Same-direction trade: {trade_amount:.4f}. Add half cooldown")
-            self._cooldown_until_timestamp = max(self.current_timestamp, self._cooldown_until_timestamp) + self.config.order_cooldown / 2
-        else:
-            self.logger().info(f"Opposite-direction trade: {trade_amount:.4f}. Starting cooldown")
-            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
-        
-        self._last_trade = trade_amount
+        fill_direction = 1 if order_filled_event.trade_type == TradeType.BUY else -1
+        # Update fill timestamp and direction (used in TickData for cooldown checks)
+        self._last_fill_timestamp = int(self.current_timestamp)
+        self._is_last_fill_in_same_direction = sign(fill_direction) == sign(self._last_fill_direction)
+        self._last_fill_direction = fill_direction
         # Update cached inventory from connector
         self._cached_inventory = self._get_current_inventory()
-        self.logger().info(f"Fill: {order_filled_event.trade_type.name} {order_filled_event.amount} @ {order_filled_event.price}")
 
     def on_tick(self):
-        proposals: List[PerpetualOrderCandidate] = self.create_proposal()
+        """
+        Main tick handler - builds TickData and calls create_proposal.
+        """
+        # Build TickData from connector (live mode)
+        tick_data = self.process_tick_data()
+
+        # Update cached values for status display
+        self._cached_mark_price = tick_data.mark_price
+        self._cached_mid_price = tick_data.mid_price
+        self._cached_inventory = tick_data.position
+
+        # Get proposals from pure function
+        proposals = self.create_proposal(tick_data)
+
         if len(proposals) > 0:
             self._cached_proposals = proposals
-            safe_ensure_future(self.edit_cancel_and_place_orders(proposals))  # Execute cancel then place sequentially to avoid order accumulation
-            self.create_timestamp = self.current_timestamp + self.config.order_refresh_time
+            safe_ensure_future(self.edit_cancel_and_place_orders(proposals))
+            # Update last order created timestamp
+            self._last_order_created_timestamp = int(self.current_timestamp)
 
-    def create_proposal(self) -> List[PerpetualOrderCandidate]:
+    def process_tick_data(self) -> TickData:
+        """
+        Build TickData from connector (live mode).
+
+        This method:
+        - Fetches order book and prices from connector
+        - Updates EMA history and calculates current EMA
+        - Packages everything into TickData
+
+        Returns:
+            TickData: Pre-compiled data for create_proposal
+        """
         connector = self.connectors[self.config.exchange]
 
         # Get order book
         order_book = connector.get_order_book(self.config.trading_pair)
         bids_df, asks_df = order_book.snapshot
-        
-        if bids_df.empty or asks_df.empty:
-            self.logger().warning("Order book snapshot is empty, skipping proposal.")
-            return []
 
-        # Get best bid/ask prices and sizes
+        # if bids_df.empty or asks_df.empty:
+        #     # Return minimal TickData with empty order book
+        #     return TickData(
+        #         timestamp=int(self.current_timestamp),
+        #         best_bid_price=Decimal("0"),
+        #         best_bid_size=Decimal("0"),
+        #         best_ask_price=Decimal("0"),
+        #         best_ask_size=Decimal("0"),
+        #         bids_df=bids_df,
+        #         asks_df=asks_df,
+        #         mid_price=Decimal("0"),
+        #         mark_price=Decimal("0"),
+        #         ema_mid=Decimal("0"),
+        #         position=Decimal("0"),
+        #         last_order_created_timestamp=self._last_order_created_timestamp,
+        #         last_fill_timestamp=self._last_fill_timestamp,
+        #         last_fill_direction=self._last_fill_direction,
+        #         order_refresh_time=self.config.order_refresh_time,
+        #         order_cooldown=self.config.order_cooldown,
+        #     )
+
+        # Extract best bid/ask
         best_bid_price = Decimal(str(bids_df.iloc[0].price))
         best_bid_size = Decimal(str(bids_df.iloc[0].amount))
         best_ask_price = Decimal(str(asks_df.iloc[0].price))
         best_ask_size = Decimal(str(asks_df.iloc[0].amount))
 
+        # Calculate mid price (weighted by size)
         mid_price = (best_bid_price + best_ask_price) / 2
-        mark_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MarkPrice)
-
         if best_bid_size + best_ask_size > 0:
             mid_price = ((best_bid_price * best_ask_size) + (best_bid_size * best_ask_price)) / (
-                        best_bid_size + best_ask_size)
+                best_bid_size + best_ask_size)
 
-        ema = self._update_ema_mid(mid_price)
-        # Get inventory directly - fills are now handled via did_fill_order() hook
+        # Get mark price from connector
+        mark_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MarkPrice)
+
+        # Update EMA (state managed here in live mode)
+        ema_mid = self._update_ema_mid(mid_price)
+
+        # Get current inventory
         inventory = self._get_current_inventory()
-        
-        # Initialize on first call if needed
-        if not self._initialized:
-            self._cached_inventory = inventory
-            self._cooldown_until_timestamp = self.current_timestamp
-            self._initialized = True
 
-        # Cache price info for status reporting (updated every tick)
-        self._cached_mark_price = mark_price
-        self._cached_mid_price = mid_price
-        self._cached_inventory = inventory
+        return TickData(
+            timestamp=int(self.current_timestamp),
+            best_bid_price=best_bid_price,
+            best_bid_size=best_bid_size,
+            best_ask_price=best_ask_price,
+            best_ask_size=best_ask_size,
+            bids_df=bids_df,
+            asks_df=asks_df,
+            mid_price=mid_price,
+            mark_price=mark_price,
+            ema_mid=ema_mid,
+            position=inventory,
+            last_order_created_timestamp=self._last_order_created_timestamp,
+            last_fill_timestamp=self._last_fill_timestamp,
+            last_fill_direction=self._last_fill_direction,
+            is_last_fill_in_same_direction=self._is_last_fill_in_same_direction,
+            order_refresh_time=self.config.order_refresh_time,
+            order_cooldown=self.config.order_cooldown,
+        )
 
-        if self.current_timestamp < self.create_timestamp:
+    def create_proposal(self, tick_data: TickData) -> List[PerpetualOrderCandidate]:
+        """
+        Create order proposals based on pre-compiled tick data.
+
+        This is a PURE FUNCTION - no connector calls, no side effects.
+        All data comes from tick_data, all config from self.config.
+
+        Args:
+            tick_data: Pre-compiled market data
+
+        Returns:
+            List of PerpetualOrderCandidate (empty list if no orders should be placed)
+        """
+        # Early exit if order book is empty
+        if tick_data.bids_df.empty or tick_data.asks_df.empty:
             return []
 
-        if self.current_timestamp < self._cooldown_until_timestamp:
+        # Check refresh timer: time since last order creation
+        time_since_last_order = tick_data.timestamp - tick_data.last_order_created_timestamp
+        if time_since_last_order < tick_data.order_refresh_time:
             return []
 
-        # Order specific updates (all calculations needed for when we do orders)
+        # Check cooldown timer: time since last fill
+        if tick_data.last_fill_direction != 0:  # There was a fill
+            time_since_fill = tick_data.timestamp - tick_data.last_fill_timestamp
+            # If the last fill was in the same direction, reduce the cooldown by half
+            order_cooldown = tick_data.order_cooldown / 2 if tick_data.is_last_fill_in_same_direction else tick_data.order_cooldown 
+            if time_since_fill < order_cooldown:
+                return []
+
+        # Extract values from tick_data
+        bids_df = tick_data.bids_df
+        asks_df = tick_data.asks_df
+        mid_price = tick_data.mid_price
+        mark_price = tick_data.mark_price
+        ema = tick_data.ema_mid
+        inventory = tick_data.position
+
+        # Calculate adjustments
         inventory_ratio = self._inventory_ratio(inventory)
         bid_anchor = min(ema, mid_price, mark_price)
         ask_anchor = max(ema, mid_price, mark_price)
@@ -201,6 +283,7 @@ class MMGrid(ScriptStrategyBase):
         spread_mult = Decimal("1") + abs(inventory_ratio) * (self.config.max_spread_mult - Decimal("1"))
         random_factor = self._random_factor()
 
+        # Cache for status display
         self._cached_bid_anchor = bid_anchor
         self._cached_ask_anchor = ask_anchor
         self._cached_inventory_ratio = inventory_ratio
@@ -208,21 +291,16 @@ class MMGrid(ScriptStrategyBase):
         self._cached_spread_mult = spread_mult
         self._cached_random_factor = random_factor
 
-        # After caching is done, check for cooldown
-        if self.current_timestamp < self._cooldown_until_timestamp:
-            return []
-
+        # Build orders
         orders = []
         for idx, bid_spread in enumerate(self.config.bid_spread_levels):
             ask_spread = self.config.ask_spread_levels[idx]
 
-            # Spreads relative to top of book
+            # Calculate prices
             bid_price = bid_anchor * skew_factor * (Decimal("1") - bid_spread * spread_mult)
             ask_price = ask_anchor * skew_factor * (Decimal("1") + ask_spread * spread_mult)
 
-            # To make sure the limit maker orders are not immediately taken
-            # Only the offending side is adjusted, and placed at top of book
-
+            # Adjust to stay on maker side (use order book depth)
             bid_index = min(idx * 2, len(bids_df) - 1)
             ask_index = min(idx * 2, len(asks_df) - 1)
 
@@ -234,97 +312,38 @@ class MMGrid(ScriptStrategyBase):
 
             size = self.config.order_size[idx] * random_factor
 
-            # Adjust bid and ask size for inventory. Note: at max inventory, amount is zero
-            bid_amount = size * (Decimal("1") - max(inventory_ratio, Decimal("0"))) # reduce bids if long
-            ask_amount = size * (Decimal("1") - max(-inventory_ratio, Decimal("0"))) # reduce asks if short
+            # Adjust size for inventory
+            bid_amount = size * (Decimal("1") - max(inventory_ratio, Decimal("0")))  # reduce bids if long
+            ask_amount = size * (Decimal("1") - max(-inventory_ratio, Decimal("0")))  # reduce asks if short
 
             if bid_amount > 0:
-                bid_order = PerpetualOrderCandidate(
+                orders.append(PerpetualOrderCandidate(
                     trading_pair=self.config.trading_pair,
                     is_maker=True,
                     order_type=OrderType.LIMIT_MAKER,
                     order_side=TradeType.BUY,
                     amount=bid_amount,
                     price=bid_price,
-                    leverage=Decimal(self.config.leverage)
-                )
-                orders.extend([bid_order])
+                    leverage=Decimal(self.config.leverage),
+                ))
 
             if ask_amount > 0:
-                ask_order = PerpetualOrderCandidate(
+                orders.append(PerpetualOrderCandidate(
                     trading_pair=self.config.trading_pair,
                     is_maker=True,
                     order_type=OrderType.LIMIT_MAKER,
                     order_side=TradeType.SELL,
                     amount=ask_amount,
                     price=ask_price,
-                    leverage=Decimal(self.config.leverage)
-                )
-                orders.extend([ask_order])
+                    leverage=Decimal(self.config.leverage),
+                ))
 
         return orders
 
-    # def preprocess_data(self, kline_data: List[Dict], orderbook_data: OrderBook) -> List[Dict]:
-    #     """
-    #     Preprocess the data for the strategy.
-    #     """
-    #     self.preprocessed_data
-    
     @property
     def pending_orders(self) -> List[PerpetualOrderCandidate]:
         """Returns the most recent proposals for backtest fill simulation"""
         return self._cached_proposals
-
-    def reset_state(self):
-        """Reset strategy state for backtesting - call before each backtest run"""
-        self.create_timestamp = 0
-        self._cooldown_until_timestamp = 0
-        self._last_trade = Decimal("0")
-        self._cached_inventory = Decimal("0")
-        self._mid_history = []
-        self._ema_mid = Decimal("0")
-        self._initialized = False
-        self._cached_proposals = []
-
-    # Detect trades, update order cooldown, and return current inventory
-    # NOTE: This method is kept for backward compatibility but is no longer used in create_proposal()
-    # Fills are now handled via did_fill_order() hook
-    def _detect_trade(self) -> Decimal:
-        inventory = self._get_current_inventory()
-        last_inventory = self._cached_inventory
-
-        # Initialization - only run once
-        if not self._initialized:
-            self._cached_inventory = inventory
-            self._cooldown_until_timestamp = self.current_timestamp
-            self._initialized = True
-            return inventory
-
-        # change in position = trade
-        trade = inventory - last_inventory
-
-        if trade == 0:
-            self._cached_inventory = inventory
-            return inventory
-
-        last_trade = self._last_trade
-        same_direction_trade = sign(trade) == sign(last_trade)
-
-        if sign(last_trade) == 0:
-            self.logger().info(f"First trade: {trade:.4f}. Starting cooldown")
-            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
-
-        elif same_direction_trade:
-            self.logger().info(f"Same-direction trade: {trade:.4f}. Add half cooldown")
-            self._cooldown_until_timestamp = max(self.current_timestamp, self._cooldown_until_timestamp) + self.config.order_cooldown / 2
-
-        else:
-            self.logger().info(f"Opposite-direction trade: {trade:.4f}. Starting cooldown")
-            self._cooldown_until_timestamp = self.current_timestamp + self.config.order_cooldown
-
-        self._last_trade = trade
-        self._cached_inventory = inventory
-        return inventory
 
     def _update_ema_mid(self, mid: Decimal) -> Decimal:
         """
@@ -357,10 +376,10 @@ class MMGrid(ScriptStrategyBase):
         """
         connector = self.connectors[self.config.exchange]
         orders_to_cancel = self._get_active_orders_from_connector()
-        
+
         if orders_to_cancel:
             await connector.batch_order_cancel(orders_to_cancel)
-        
+
         # Then place new orders
         await self._async_place_orders(proposal)
 
@@ -456,15 +475,15 @@ class MMGrid(ScriptStrategyBase):
         """
         connector = self.connectors[self.config.exchange]
         all_in_flight_orders = connector._order_tracker.active_orders
-        
+
         # Filter: only non-done orders for the current trading pair
         active_orders = [
             in_flight_order
             for in_flight_order in all_in_flight_orders.values()
-            if (in_flight_order.trading_pair == self.config.trading_pair 
+            if (in_flight_order.trading_pair == self.config.trading_pair
                 and not in_flight_order.is_done)
         ]
-        
+
         return active_orders
 
     def format_status(self) -> str:
@@ -501,78 +520,78 @@ class MMGrid(ScriptStrategyBase):
         lines.append(f"    Random Factor:       {self._cached_random_factor:.4f}x")
         lines.append("")
         lines.append(f"    Current Time:        {_fmt(self.current_timestamp)}")
-        lines.append(f"    Cooldown Ends At:    {_fmt(self._cooldown_until_timestamp)}")
-        lines.append(f"    Next Refresh:        {_fmt(self.create_timestamp)}")
-        lines.append("")
-        lines.append(f"    Last Trade Size:     {self._last_trade:.6f}")
+        lines.append(f"    Last Order Created:  {_fmt(self._last_order_created_timestamp)}")
+        lines.append(f"    Last Fill:           {_fmt(self._last_fill_timestamp)}")
+        fill_dir_str = {-1: "SELL", 0: "NONE", 1: "BUY"}.get(self._last_fill_direction, "UNKNOWN")
+        lines.append(f"    Last Fill Direction: {fill_dir_str}")
         lines.append("")
 
         # Get active orders from connector's order tracker
         active_orders = self._get_active_orders_from_connector()
-        
+
         if active_orders and mid > 0:
             # Separate bids and asks
             bids = []
             asks = []
-            
+
             for order in active_orders:
                 if order.price is None or order.exchange_order_id is None:
                     continue
-                    
+
                 order_price = Decimal(str(order.price))
                 order_amount = Decimal(str(order.amount))
                 filled_amount = order.executed_amount_base if order.executed_amount_base else Decimal("0")
                 remaining_amount = order_amount - filled_amount
-                
+
                 # Calculate spread vs mid price in basis points
                 if mid > 0:
                     spread_bps = ((order_price - mid) / mid) * Decimal("10000")
                 else:
                     spread_bps = Decimal("0")
-                
+
                 order_info = {
                     'price': order_price,
                     'amount': remaining_amount,
                     'spread_bps': spread_bps,
                     'order_id': order.client_order_id[:8] + "..." if len(order.client_order_id) > 8 else order.client_order_id
                 }
-                
+
                 if order.trade_type == TradeType.BUY:
                     bids.append(order_info)
                 else:
                     asks.append(order_info)
-            
+
             # Sort bids descending (highest first), asks ascending (lowest first)
             bids.sort(key=lambda x: x['price'], reverse=True)
             asks.sort(key=lambda x: x['price'])
-            
+
             lines.append("")
             lines.append("  Open Orders (Order Book Style):")
             lines.append("  " + "-" * 70)
             lines.append(f"  {'Bids (BUY)':<35} | {'Asks (SELL)':<35}")
             lines.append(f"  {'Price':<12} {'Amount':<10} {'Spread':<10} | {'Price':<12} {'Amount':<10} {'Spread':<10}")
             lines.append("  " + "-" * 70)
-            
+
             # Display side by side
             max_rows = max(len(bids), len(asks))
             for i in range(max_rows):
                 bid_line = ""
                 ask_line = ""
-                
+
                 if i < len(bids):
                     bid = bids[i]
                     bid_line = f"{bid['price']:<12.4f} {bid['amount']:<10.6f} {bid['spread_bps']:>+9.2f}bps"
                 else:
                     bid_line = " " * 35
-                
+
                 if i < len(asks):
                     ask = asks[i]
                     ask_line = f"{ask['price']:<12.4f} {ask['amount']:<10.6f} {ask['spread_bps']:>+9.2f}bps"
                 else:
                     ask_line = " " * 35
-                
+
                 lines.append(f"  {bid_line} | {ask_line}")
-            
+
             lines.append("  " + "-" * 70)
             lines.append(f"  Total Bids: {len(bids)}, Total Asks: {len(asks)}")
         else:
