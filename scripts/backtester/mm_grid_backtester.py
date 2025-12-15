@@ -6,13 +6,14 @@ It pre-computes all data into TickData and calls the SAME strategy.create_propos
 method used in live trading.
 
 Key design:
-- Connector only used for quantization rules (price/size tick)
+- Uses MarketDataProvider to fetch historical candles and trading rules
 - All market data pre-compiled into TickData
 - Strategy's create_proposal() is a PURE FUNCTION of TickData + config
-- Engine handles: fills, position tracking, PnL, timing state
+- Engine handles: fills, position tracking, PnL, timing state, quantization
 - Same create_proposal() works for both live and backtest
 """
 
+import asyncio
 import logging
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -23,6 +24,8 @@ import pandas as pd
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
+from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.data_feed.market_data_provider import MarketDataProvider
 
 from scripts.backtester.data_types import (
     BacktestConfig,
@@ -65,8 +68,12 @@ class MMGridBacktester:
         self.strategy_config = strategy_config
         self.config = backtest_config
 
-        # Load candle data
-        self.candles = self._load_candles()
+        # Initialize MarketDataProvider for fetching candles and trading rules
+        self.market_data_provider = MarketDataProvider(connectors={})
+
+        # Fetch trading rules and candles (done in separate async method)
+        self.trading_rule: Optional[TradingRule] = None
+        self.candles: Optional[pd.DataFrame] = None
 
         # Engine state - position and PnL
         self.position: Decimal = backtest_config.initial_position
@@ -92,28 +99,37 @@ class MMGridBacktester:
         self._mid_history: List[Decimal] = []
         self._ema_mid: Decimal = Decimal("0")
 
-    def _load_candles(self) -> pd.DataFrame:
-        """Load and prepare candle data"""
-        df = pd.read_csv(self.config.candles_path)
+    async def initialize_data(self):
+        """
+        Fetch historical candles and trading rules from exchange via MarketDataProvider.
 
-        # Ensure required columns
-        required = ["timestamp", "open", "high", "low", "close", "volume"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(f"Missing columns in candles CSV: {missing}")
+        This must be called before run() since it fetches data asynchronously.
+        """
+        logger.info(f"Fetching historical candles for {self.config.trading_pair} "
+                   f"from {self.config.connector_name}...")
 
-        # Convert timestamp to int if needed
-        df["timestamp"] = df["timestamp"].astype(int)
+        # Fetch historical candles
+        self.candles = await self.market_data_provider.get_historical_candles_df(
+            connector_name=self.config.connector_name,
+            trading_pair=self.config.trading_pair,
+            interval=self.config.candle_interval,
+            start_time=self.config.start_timestamp,
+            end_time=self.config.end_timestamp,
+        )
 
-        # Filter by time range if specified
-        if self.config.start_timestamp:
-            df = df[df["timestamp"] >= self.config.start_timestamp]
-        if self.config.end_timestamp:
-            df = df[df["timestamp"] <= self.config.end_timestamp]
+        if self.candles is None or len(self.candles) == 0:
+            raise ValueError(f"No candles fetched for {self.config.trading_pair}")
 
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        logger.info(f"Loaded {len(df)} candles from {self.config.candles_path}")
-        return df
+        logger.info(f"Fetched {len(self.candles)} candles")
+
+        # Fetch trading rules
+        logger.info(f"Fetching trading rules for {self.config.trading_pair}...")
+        self.trading_rule = self.market_data_provider.get_trading_rules(
+            self.config.connector_name,
+            self.config.trading_pair
+        )
+        logger.info(f"Trading rules: min_order_size={self.trading_rule.min_order_size}, "
+                   f"min_price_increment={self.trading_rule.min_price_increment}")
 
     def _create_synthetic_orderbook(
         self, best_price: Decimal, side: str
@@ -201,6 +217,30 @@ class MMGridBacktester:
         ema_val = s.ewm(span=self.strategy_config.ema_window, adjust=False).mean().iloc[-1]
         self._ema_mid = Decimal(str(ema_val))
         return self._ema_mid
+
+    def _quantize_order_price(self, price: Decimal) -> Decimal:
+        """Quantize order price according to exchange trading rules"""
+        if not self.trading_rule:
+            return price
+
+        # Round to the nearest tick
+        tick_size = self.trading_rule.min_price_increment
+        return (price // tick_size) * tick_size
+
+    def _quantize_order_amount(self, amount: Decimal) -> Decimal:
+        """Quantize order amount according to exchange trading rules"""
+        if not self.trading_rule:
+            return amount
+
+        # Round down to the nearest increment
+        increment = self.trading_rule.min_base_amount_increment
+        quantized = (amount // increment) * increment
+
+        # Ensure it meets minimum order size
+        if quantized < self.trading_rule.min_order_size:
+            return Decimal("0")  # Order too small, will be filtered out
+
+        return quantized
 
     def simulate_fills(self, candle: pd.Series) -> List[Tuple[SimulatedOrder, Decimal]]:
         """
@@ -320,14 +360,23 @@ class MMGridBacktester:
         self, proposals: List[PerpetualOrderCandidate], timestamp: int
     ) -> None:
         """
-        Convert strategy proposals into simulated orders.
+        Convert strategy proposals into simulated orders with quantization.
         Cancel all existing orders first (like real strategy does).
         """
         # Cancel all existing orders (strategy does cancel-all before placing)
         self.orders.clear()
 
-        # Create new orders from proposals
+        # Create new orders from proposals with quantization
         for proposal in proposals:
+            # Quantize price and amount according to trading rules
+            quantized_price = self._quantize_order_price(proposal.price)
+            quantized_amount = self._quantize_order_amount(proposal.amount)
+
+            # Skip orders that don't meet minimum requirements
+            if quantized_amount == 0:
+                logger.debug(f"Skipping order: amount {proposal.amount} too small after quantization")
+                continue
+
             order_id = f"bt_{self._order_counter}"
             self._order_counter += 1
 
@@ -335,17 +384,17 @@ class MMGridBacktester:
                 id=order_id,
                 trading_pair=proposal.trading_pair,
                 side=proposal.order_side,  # PerpetualOrderCandidate uses order_side
-                price=proposal.price,
-                amount=proposal.amount,
+                price=quantized_price,
+                amount=quantized_amount,
                 order_type=proposal.order_type,
                 created_at=timestamp,
             )
             self.orders[order_id] = order
 
-        if proposals:
+        if self.orders:
             # Update timing state (passed to TickData for strategy to check refresh)
             self._last_order_created_timestamp = timestamp
-            logger.debug(f"Placed {len(proposals)} orders at {timestamp}")
+            logger.debug(f"Placed {len(self.orders)} quantized orders at {timestamp}")
 
     def _record_equity(self, candle: pd.Series, timestamp: int) -> None:
         """Record equity curve point"""
@@ -374,7 +423,7 @@ class MMGridBacktester:
         """
         Execute the backtest.
 
-        For each candle:
+        For each tick (based on backtest_resolution):
         1. Simulate fills from price action
         2. Update EMA (engine manages this state)
         3. Calculate TickData (includes EMA)
@@ -382,35 +431,58 @@ class MMGridBacktester:
         5. Process proposals into orders
         6. Record equity
         """
-        logger.info(f"Starting backtest with {len(self.candles)} candles")
+        if self.candles is None:
+            raise RuntimeError("Must call initialize_data() before run()")
 
+        logger.info(f"Starting backtest with {len(self.candles)} candles, "
+                   f"resolution={self.config.backtest_resolution}s")
+
+        # Build tick schedule based on backtest_resolution
+        # We process the strategy tick every N seconds, but check fills against all candles
+        tick_timestamps = []
+        current_tick = self.config.start_timestamp
+        while current_tick <= self.config.end_timestamp:
+            tick_timestamps.append(current_tick)
+            current_tick += self.config.backtest_resolution
+
+        logger.info(f"Generated {len(tick_timestamps)} tick timestamps")
+
+        # Create a mapping of timestamp -> candle for fast lookup
+        candles_dict = {}
         for idx, candle in self.candles.iterrows():
-            timestamp = int(candle["timestamp"])
+            ts = int(candle["timestamp"])
+            candles_dict[ts] = candle
+
+        # Process each tick
+        for tick_idx, tick_timestamp in enumerate(tick_timestamps):
+            # Find the closest candle for this tick
+            closest_ts = min(candles_dict.keys(), key=lambda t: abs(t - tick_timestamp))
+            candle = candles_dict[closest_ts]
 
             # 1. Simulate fills from this candle's price action
             fills = self.simulate_fills(candle)
             for order, fill_price in fills:
-                self.process_fill(order, fill_price, timestamp)
+                self.process_fill(order, fill_price, tick_timestamp)
 
             # 2. Update EMA (engine manages this state for backtest)
             mid = Decimal(str(candle["close"]))
             self._update_ema(mid)
 
             # 3. Calculate TickData (includes EMA, timing state)
-            tick_data = self.calculate_tick_data(candle, timestamp)
+            tick_data = self.calculate_tick_data(candle, tick_timestamp)
 
             # 4. Call strategy's create_proposal - SAME method used in live trading!
             proposals = self.strategy.create_proposal(tick_data)
 
             # 5. Process proposals if any
             if proposals:
-                self.process_proposals(proposals, timestamp)
+                self.process_proposals(proposals, tick_timestamp)
 
             # 6. Record equity curve
-            self._record_equity(candle, timestamp)
+            self._record_equity(candle, tick_timestamp)
 
-            if idx % 10000 == 0:
-                logger.info(f"Processed {idx}/{len(self.candles)} candles")
+            if tick_idx % 10000 == 0:
+                logger.info(f"Processed {tick_idx}/{len(tick_timestamps)} ticks")
 
         logger.info("Backtest complete")
         return self._calculate_results()

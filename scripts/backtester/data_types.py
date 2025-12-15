@@ -104,11 +104,17 @@ class TickData:
 @dataclass
 class BacktestConfig:
     """Configuration for the backtester"""
-    # Data source
-    candles_path: str  # Path to CSV with OHLCV data
+    # Data source - fetch from exchange via MarketDataProvider
+    connector_name: str  # e.g., "orderly_perpetual"
+    trading_pair: str  # e.g., "BTC-USDC"
+    candle_interval: str  # e.g., "1m", "5m", "1h"
+    backtest_resolution: int  # e.g., 1, 5, 15, 30, 60 (seconds)
+
+    # Time range for historical data
+    start_timestamp: int  # Unix timestamp in seconds
+    end_timestamp: int  # Unix timestamp in seconds
 
     # Market simulation
-    trading_pair: str
     spread_bps: Decimal = Decimal("5")  # Simulated spread for order book
     trade_fee_bps: Decimal = Decimal("4")  # Fee per trade in bps
 
@@ -120,11 +126,6 @@ class BacktestConfig:
     # Initial state
     initial_position: Decimal = Decimal("0")
     initial_capital: Decimal = Decimal("10000")
-
-    # Time
-    start_timestamp: Optional[int] = None  # Filter candles after this
-    end_timestamp: Optional[int] = None    # Filter candles before this
-
 
 @dataclass
 class BacktestResult:
