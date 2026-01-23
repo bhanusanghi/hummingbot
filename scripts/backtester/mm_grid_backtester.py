@@ -13,7 +13,6 @@ Key design:
 - Same create_proposal() works for both live and backtest
 """
 
-import asyncio
 import logging
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -21,7 +20,7 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
 from hummingbot.connector.trading_rule import TradingRule
@@ -69,6 +68,7 @@ class MMGridBacktester:
         self.config = backtest_config
 
         # Initialize MarketDataProvider for fetching candles and trading rules
+        # berizard - why is this not using backtesting data provider with correct connector?
         self.market_data_provider = MarketDataProvider(connectors={})
 
         # Fetch trading rules and candles (done in separate async method)
@@ -77,7 +77,7 @@ class MMGridBacktester:
 
         # Engine state - position and PnL
         self.position: Decimal = backtest_config.initial_position
-        self.entry_price: Optional[Decimal] = None
+        self.entry_price: Optional[Decimal] = None # TODO - We will have muliple entries and exits. this is shit
         self.realized_pnl: Decimal = Decimal("0")
         self.initial_capital: Decimal = backtest_config.initial_capital
 
@@ -85,20 +85,23 @@ class MMGridBacktester:
         self.orders: Dict[str, SimulatedOrder] = {}
         self._order_counter: int = 0
 
+        # berizard - why is this outside tick data at all
         # Engine state - timing (passed to TickData for strategy to check)
         self._last_order_created_timestamp: int = 0
         self._last_fill_timestamp: int = 0
         self._last_fill_direction: int = 0  # -1 (sell), 0 (none), 1 (buy)
         self._is_last_fill_in_same_direction: bool = False
+        
+        # EMA state (engine manages this for backtest)
+        self._mid_history: List[Decimal] = []
+        self._ema_mid: Decimal = Decimal("0")
+
 
         # Results tracking
         self.fills: List[Fill] = []
         self.equity_curve: List[Dict] = []
 
-        # EMA state (engine manages this for backtest)
-        self._mid_history: List[Decimal] = []
-        self._ema_mid: Decimal = Decimal("0")
-
+      
     async def initialize_data(self):
         """
         Fetch historical candles and trading rules from exchange via MarketDataProvider.
@@ -108,10 +111,17 @@ class MMGridBacktester:
         logger.info(f"Fetching historical candles for {self.config.trading_pair} "
                    f"from {self.config.connector_name}...")
 
+        # Fetch trading rules (async to ensure they're loaded)
+        logger.info(f"Fetching trading rules for {self.config.trading_pair}...")
+        self.trading_rule = await self.market_data_provider.get_trading_rules_async(
+            self.strategy_config.exchange,
+            self.config.trading_pair
+        )
+
         # Fetch historical candles
         self.candles = await self.market_data_provider.get_historical_candles_df(
             connector_name=self.config.connector_name,
-            trading_pair=self.config.trading_pair,
+            trading_pair=self.config.candle_pair,
             interval=self.config.candle_interval,
             start_time=self.config.start_timestamp,
             end_time=self.config.end_timestamp,
@@ -122,12 +132,6 @@ class MMGridBacktester:
 
         logger.info(f"Fetched {len(self.candles)} candles")
 
-        # Fetch trading rules
-        logger.info(f"Fetching trading rules for {self.config.trading_pair}...")
-        self.trading_rule = self.market_data_provider.get_trading_rules(
-            self.config.connector_name,
-            self.config.trading_pair
-        )
         logger.info(f"Trading rules: min_order_size={self.trading_rule.min_order_size}, "
                    f"min_price_increment={self.trading_rule.min_price_increment}")
 
@@ -396,28 +400,28 @@ class MMGridBacktester:
             self._last_order_created_timestamp = timestamp
             logger.debug(f"Placed {len(self.orders)} quantized orders at {timestamp}")
 
-    def _record_equity(self, candle: pd.Series, timestamp: int) -> None:
-        """Record equity curve point"""
-        close = Decimal(str(candle["close"]))
+    # def _record_equity(self, candle: pd.Series, timestamp: int) -> None:
+    #     """Record equity curve point"""
+    #     close = Decimal(str(candle["close"]))
 
-        # Calculate unrealized PnL
-        unrealized_pnl = Decimal("0")
-        if self.position != 0 and self.entry_price:
-            if self.position > 0:
-                unrealized_pnl = (close - self.entry_price) * self.position
-            else:
-                unrealized_pnl = (self.entry_price - close) * abs(self.position)
+    #     # Calculate unrealized PnL
+    #     unrealized_pnl = Decimal("0")
+    #     if self.position != 0 and self.entry_price:
+    #         if self.position > 0:
+    #             unrealized_pnl = (close - self.entry_price) * self.position
+    #         else:
+    #             unrealized_pnl = (self.entry_price - close) * abs(self.position)
 
-        equity = self.initial_capital + self.realized_pnl + unrealized_pnl
+    #     equity = self.initial_capital + self.realized_pnl + unrealized_pnl
 
-        self.equity_curve.append({
-            "timestamp": timestamp,
-            "equity": float(equity),
-            "position": float(self.position),
-            "realized_pnl": float(self.realized_pnl),
-            "unrealized_pnl": float(unrealized_pnl),
-            "close": float(close),
-        })
+    #     self.equity_curve.append({
+    #         "timestamp": timestamp,
+    #         "equity": float(equity),
+    #         "position": float(self.position),
+    #         "realized_pnl": float(self.realized_pnl),
+    #         "unrealized_pnl": float(unrealized_pnl),
+    #         "close": float(close),
+    #     })
 
     def run(self) -> BacktestResult:
         """
@@ -478,9 +482,6 @@ class MMGridBacktester:
             if proposals:
                 self.process_proposals(proposals, tick_timestamp)
 
-            # 6. Record equity curve
-            self._record_equity(candle, tick_timestamp)
-
             if tick_idx % 10000 == 0:
                 logger.info(f"Processed {tick_idx}/{len(tick_timestamps)} ticks")
 
@@ -497,12 +498,12 @@ class MMGridBacktester:
                 total_pnl_pct=Decimal("0"),
                 total_trades=0,
                 total_volume=Decimal("0"),
-                win_rate=Decimal("0"),
+                # win_rate=Decimal("0"),
                 profit_factor=Decimal("0"),
-                max_drawdown=Decimal("0"),
-                max_drawdown_pct=Decimal("0"),
-                sharpe_ratio=0.0,
-                equity_curve=equity_df,
+                # max_drawdown=Decimal("0"),
+                # max_drawdown_pct=Decimal("0"),
+                # sharpe_ratio=0.0,
+                # equity_curve=equity_df,
                 fills=self.fills,
                 final_position=self.position,
                 final_equity=self.initial_capital,
@@ -517,37 +518,37 @@ class MMGridBacktester:
         total_trades = len(self.fills)
         total_volume = sum(f.amount * f.price for f in self.fills)
 
-        # Win rate
-        winning_trades = [f for f in self.fills if f.realized_pnl > 0]
-        win_rate = Decimal(len(winning_trades)) / Decimal(total_trades) if total_trades > 0 else Decimal("0")
+        # # Win rate
+        # winning_trades = [f for f in self.fills if f.realized_pnl > 0]
+        # win_rate = Decimal(len(winning_trades)) / Decimal(total_trades) if total_trades > 0 else Decimal("0")
 
         # Profit factor
         gross_profit = sum(f.realized_pnl for f in self.fills if f.realized_pnl > 0)
         gross_loss = abs(sum(f.realized_pnl for f in self.fills if f.realized_pnl < 0))
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else Decimal("999")
 
-        # Drawdown
-        equity_series = equity_df["equity"]
-        peak = equity_series.expanding().max()
-        drawdown = equity_series - peak
-        max_drawdown = Decimal(str(abs(drawdown.min())))
-        max_drawdown_pct = max_drawdown / self.initial_capital * 100
+        # # Drawdown
+        # equity_series = equity_df["equity"]
+        # peak = equity_series.expanding().max()
+        # drawdown = equity_series - peak
+        # max_drawdown = Decimal(str(abs(drawdown.min())))
+        # max_drawdown_pct = max_drawdown / self.initial_capital * 100
 
-        # Sharpe ratio (simplified - daily returns assumed)
-        returns = equity_df["equity"].pct_change().dropna()
-        sharpe_ratio = float(returns.mean() / returns.std() * np.sqrt(252)) if len(returns) > 1 and returns.std() > 0 else 0.0
+        # # Sharpe ratio (simplified - daily returns assumed)
+        # returns = equity_df["equity"].pct_change().dropna()
+        # sharpe_ratio = float(returns.mean() / returns.std() * np.sqrt(252)) if len(returns) > 1 and returns.std() > 0 else 0.0
 
         return BacktestResult(
             total_pnl=total_pnl,
             total_pnl_pct=total_pnl_pct,
             total_trades=total_trades,
             total_volume=total_volume,
-            win_rate=win_rate,
+            # win_rate=win_rate,
             profit_factor=profit_factor,
-            max_drawdown=max_drawdown,
-            max_drawdown_pct=max_drawdown_pct,
-            sharpe_ratio=sharpe_ratio,
-            equity_curve=equity_df,
+            # max_drawdown=max_drawdown,
+            # max_drawdown_pct=max_drawdown_pct,
+            # sharpe_ratio=sharpe_ratio,
+            # equity_curve=equity_df,
             fills=self.fills,
             final_position=self.position,
             final_equity=final_equity,

@@ -476,6 +476,21 @@ class OrderlyPerpetualDerivative(PerpetualDerivativePyBase):
 
         return trading_rules
 
+    async def _update_trading_rules(self):
+        """
+        Update trading rules and initialize symbol map.
+
+        This method is called by the base class during initialization to fetch
+        and cache trading rules. It also initializes the trading pair symbol map
+        to ensure both trading rules and symbol mappings are available together.
+        """
+        exchange_info = await self._make_trading_rules_request()
+        trading_rules_list = await self._format_trading_rules(exchange_info)
+        self._trading_rules.clear()
+        for trading_rule in trading_rules_list:
+            self._trading_rules[trading_rule.trading_pair] = trading_rule
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
+
     # ============================================================
     # Network & Connectivity
     # ============================================================

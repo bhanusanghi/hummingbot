@@ -68,6 +68,17 @@ class MMGrid(ScriptStrategyBase):
     def init_markets(cls, config: MMGridConfig):
         cls.markets = {config.exchange: {config.trading_pair}}
 
+    # TODO: Berizard- either this or we init with a mock connector.
+    @classmethod
+    def create_for_backtest(cls, config: MMGridConfig) -> "MMGrid":
+        """
+        Create a strategy instance for backtesting.
+
+        Bypasses connector initialization by passing an empty connectors dict.
+        The strategy's create_proposal() method is a pure function and doesn't use connectors.
+        """
+        return cls(connectors={}, config=config)
+
     def __init__(self, connectors: Dict[str, ConnectorBase], config: MMGridConfig):
         super().__init__(connectors)
         self.config = config

@@ -107,6 +107,7 @@ class BacktestConfig:
     # Data source - fetch from exchange via MarketDataProvider
     connector_name: str  # e.g., "orderly_perpetual"
     trading_pair: str  # e.g., "BTC-USDC"
+    candle_pair: str  # e.g., "BTC-USDC"
     candle_interval: str  # e.g., "1m", "5m", "1h"
     backtest_resolution: int  # e.g., 1, 5, 15, 30, 60 (seconds)
 
@@ -135,14 +136,14 @@ class BacktestResult:
     total_pnl_pct: Decimal
     total_trades: int
     total_volume: Decimal
-    win_rate: Decimal
+    # win_rate: Decimal
     profit_factor: Decimal
-    max_drawdown: Decimal
-    max_drawdown_pct: Decimal
-    sharpe_ratio: float
+    # max_drawdown: Decimal
+    # max_drawdown_pct: Decimal
+    # sharpe_ratio: float
 
     # Time series
-    equity_curve: pd.DataFrame  # timestamp, equity, position, pnl
+    # equity_curve: pd.DataFrame  # timestamp, equity, position, pnl
 
     # Trade history
     fills: List[Fill]

@@ -1,112 +1,31 @@
 #!/usr/bin/env python
 """
-Entry point script for running backtests on market making strategies.
+Entry point script for running backtests on MMGrid strategy.
 
-Configure all backtest parameters in the BacktestConfig instance within the main() function.
+Configure all backtest parameters in the main() function.
 
-Supports two data sources:
-    1. CSV file with kline data (set kline_path)
-    2. On-demand fetching from Binance spot (set start_time and end_time)
-
-Example configuration:
-    config = BacktestConfig(
-        kline_path="data/sample_btc_usdc_1m.csv",
-        fill_mode="high_low",
-        trading_pair="BTC-USDC",
-        order_size=Decimal("0.1"),
-        ...
-    )
-
-Or for on-demand data:
-    config = BacktestConfig(
-        start_time=1704067200,
-        end_time=1704070800,
-        ...
-    )
+Example:
+    python scripts/backtester/run_backtest.py
 """
 
-import sys
-from dataclasses import dataclass
-from decimal import Decimal
-from pathlib import Path
+import asyncio
+import logging
 from datetime import datetime
-from typing import Optional
+from decimal import Decimal
 
-from scripts.backtester.engine import BacktestEngine
-from scripts.mm_grid_kodiak_target import MMGridConfig
+import pandas as pd
+
+from scripts.backtester.mm_grid_backtester import MMGridBacktester
+from scripts.backtester.data_types import BacktestConfig
+from scripts.mm_grid_kodiak_target import MMGrid, MMGridConfig
 
 
-@dataclass
-class BacktestConfig:
-    """Consolidated runtime configuration for backtesting"""
-    # Data source configuration
-    kline_path: Optional[str] = None
-    start_time: Optional[int] = None
-    end_time: Optional[int] = None
-
-    # Backtest execution parameters
-    fill_mode: str = "high_low"  # "close_only" or "high_low"
-    backtest_resolution: int = 1  # Seconds between ticks
-    output_path: Optional[str] = None
-
-    # Strategy parameters (MMGridConfig)
-    trading_pair: str = "BTC-USDC"
-    exchange: str = "orderly_perpetual"
-    order_size: Decimal = Decimal("0.1")
-    bid_spread: Decimal = Decimal("0.001")
-    ask_spread: Decimal = Decimal("0.001")
-    order_refresh_time: int = 10
-    order_cooldown: int = 30
-    max_inventory: Decimal = Decimal("0.01")
-    min_inventory_pct_for_adjustment: Decimal = Decimal("0.25")
-    max_price_adjustment: Decimal = Decimal("0.001")
-    max_spread_mult: Decimal = Decimal("1.5")
-    randomization: Decimal = Decimal("0")
-    leverage: int = 100
-    ema_window: int = 10
-    target_inventory: Decimal = Decimal("0.0")
-
-    def to_strategy_config(self) -> MMGridConfig:
-        """Convert BacktestConfig to MMGridConfig for strategy initialization"""
-        return MMGridConfig(
-            exchange=self.exchange,
-            trading_pair=self.trading_pair,
-            order_size=[self.order_size],
-            bid_spread_levels=[self.bid_spread],
-            ask_spread_levels=[self.ask_spread],
-            order_refresh_time=self.order_refresh_time,
-            order_cooldown=self.order_cooldown,
-            max_inventory=self.max_inventory,
-            min_inventory_pct_for_adjustment=self.min_inventory_pct_for_adjustment,
-            max_price_adjustment=self.max_price_adjustment,
-            max_spread_mult=self.max_spread_mult,
-            randomization=self.randomization,
-            leverage=self.leverage,
-            ema_window=self.ema_window,
-            target_inventory=self.target_inventory,
-        )
-
-    def get_output_path(self) -> str:
-        """Get output path for results, using default if not specified"""
-        if self.output_path:
-            return self.output_path
-
-        if self.kline_path:
-            return str(Path(self.kline_path).parent / f"{Path(self.kline_path).stem}_results.csv")
-        else:
-            return f"backtest_results_{self.start_time}_{self.end_time}.csv"
-
-    def validate(self) -> None:
-        """Validate configuration"""
-        if self.kline_path:
-            path = Path(self.kline_path)
-            if not path.exists():
-                raise FileNotFoundError(f"Kline file not found: {self.kline_path}")
-        else:
-            if self.start_time is None or self.end_time is None:
-                raise ValueError("start_time and end_time are required when kline_path is not provided")
-            if self.start_time >= self.end_time:
-                raise ValueError("start_time must be less than end_time")
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def parse_datetime(dt_str: str) -> int:
@@ -120,68 +39,133 @@ def parse_datetime(dt_str: str) -> int:
     except ValueError:
         raise ValueError(f"Invalid datetime format: {dt_str}. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
 
-def main():
-    # Create BacktestConfig with all runtime parameters
-    config = BacktestConfig(
-        # Data source: use either kline_path OR (start_time and end_time)
-        kline_path=None,  # e.g., "data/sample_btc_usdc_1m.csv"
-        start_time=1704067200,  # Unix timestamp, or use parse_datetime("2024-01-01 00:00:00")
-        end_time=1704070800,    # Unix timestamp, or use parse_datetime("2024-01-01 01:00:00")
 
-        # Backtest execution parameters
-        fill_mode="close_only",   # "close_only" or "high_low"
-        backtest_resolution=1,        # Seconds between ticks
-        output_path=None,       # Auto-generated if None
+async def main():
+    """Run backtest"""
 
-        # Strategy parameters
-        trading_pair="ZEC-USDC",
-        order_size=Decimal("0.15"),
-        bid_spread=Decimal("0.0005"),
-        ask_spread=Decimal("0.0005"),
+    # Configure strategy parameters
+    strategy_config = MMGridConfig(
+        exchange="orderly_perpetual",
+        trading_pair="ZEC-USD",
+        order_size=[Decimal("0.15")],
+        bid_spread_levels=[Decimal("0.0005")],
+        ask_spread_levels=[Decimal("0.0005")],
         order_refresh_time=6,
         order_cooldown=20,
+        max_inventory=Decimal("0.5"),
+        min_inventory_pct_for_adjustment=Decimal("0.25"),
+        max_price_adjustment=Decimal("0.001"),
+        max_spread_mult=Decimal("1.5"),
+        randomization=Decimal("0"),
+        leverage=100,
+        ema_window=10,
+        target_inventory=Decimal("0.0"),
     )
 
-    # Validate configuration
-    try:
-        config.validate()
-    except (FileNotFoundError, ValueError) as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    # Configure backtest parameters
+    backtest_config = BacktestConfig(
+        # Data source
+        connector_name="binance",
+        trading_pair="ZEC-USDC",
+        candle_pair="ZEC-USDC",
+        candle_interval="1s",
+        backtest_resolution=1,  # Process strategy every N seconds.
 
-    # Print backtest configuration
-    if config.kline_path:
-        print(f"Running backtest on CSV file: {config.kline_path}")
+        # Time range (Unix timestamps)
+        start_timestamp=1769062392,
+        end_timestamp=1769069592,
+        # Or use: start_timestamp=parse_datetime("2024-01-01 00:00:00"),
+
+        # Market simulation
+        spread_bps=Decimal("5"),
+        trade_fee_bps=Decimal("4"),
+
+        # Order book simulation
+        orderbook_levels=10,
+        level_spacing_bps=Decimal("2"),
+        level_size=Decimal("100"),
+
+        # Initial state
+        initial_position=Decimal("0"),
+        initial_capital=Decimal("10000"),
+    )
+
+    # Print configuration
+    logger.info("=" * 60)
+    logger.info("BACKTEST CONFIGURATION")
+    logger.info("=" * 60)
+    logger.info(f"Trading pair: {strategy_config.trading_pair}")
+    logger.info(f"Connector: {backtest_config.connector_name}")
+    logger.info(f"Time range: {datetime.fromtimestamp(backtest_config.start_timestamp)} to {datetime.fromtimestamp(backtest_config.end_timestamp)}")
+    logger.info(f"Candle interval: {backtest_config.candle_interval}")
+    logger.info(f"Backtest resolution: {backtest_config.backtest_resolution}s")
+    logger.info(f"Order size: {strategy_config.order_size[0]}")
+    logger.info(f"Spreads: bid={strategy_config.bid_spread_levels[0]}, ask={strategy_config.ask_spread_levels[0]}")
+    logger.info(f"Refresh time: {strategy_config.order_refresh_time}s, Cooldown: {strategy_config.order_cooldown}s")
+    logger.info(f"Initial capital: {backtest_config.initial_capital}")
+    logger.info("=" * 60)
+
+    # Create strategy instance for backtest (bypasses connector initialization)
+    strategy = MMGrid.create_for_backtest(strategy_config)
+
+    # Create backtester
+    backtester = MMGridBacktester(
+        strategy=strategy,
+        strategy_config=strategy_config,
+        backtest_config=backtest_config
+    )
+
+    # Initialize data (fetch candles and trading rules)
+    logger.info("\nInitializing data...")
+    await backtester.initialize_data()
+
+    # Run backtest
+    logger.info("\nRunning backtest...")
+    result = backtester.run()
+
+    # Print results
+    logger.info("\n" + "=" * 60)
+    logger.info("BACKTEST RESULTS")
+    logger.info("=" * 60)
+    logger.info(f"Total PnL: {result.total_pnl:.4f} ({result.total_pnl_pct:.2f}%)")
+    logger.info(f"Total Trades: {result.total_trades}")
+    logger.info(f"Total Volume: {result.total_volume:.2f}")
+    logger.info(f"Profit Factor: {result.profit_factor:.2f}")
+    logger.info(f"Final Position: {result.final_position}")
+    logger.info(f"Final Equity: {result.final_equity:.2f}")
+    logger.info("=" * 60)
+
+    # Save results (optional)
+    # result.equity_curve.to_csv("backtest_equity_curve.csv", index=False)
+    # logger.info("\nEquity curve saved to backtest_equity_curve.csv")
+
+    # return result
+
+    # Create CSV of fills
+    if result.fills:
+        fills_data = []
+        for fill in result.fills:
+            fills_data.append({
+                "timestamp": fill.timestamp,
+                "datetime": datetime.fromtimestamp(fill.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+                "order_id": fill.order_id,
+                "trading_pair": fill.trading_pair,
+                "side": fill.side.name,  # Convert TradeType enum to string
+                "price": float(fill.price),
+                "amount": float(fill.amount),
+                "fee": float(fill.fee),
+                "position_after": float(fill.position_after),
+                "realized_pnl": float(fill.realized_pnl),
+                "cumulative_pnl": float(fill.cumulative_pnl),
+            })
+        fills_df = pd.DataFrame(fills_data)
+        fills_df.to_csv("backtest_fills.csv", index=False)
+        logger.info("\nFills saved to backtest_fills.csv")
     else:
-        print(f"Running backtest with on-demand data fetching from Binance spot")
-        print(f"Time range: {datetime.fromtimestamp(config.start_time)} to {datetime.fromtimestamp(config.end_time)}")
-    print(f"Fill mode: {config.fill_mode}")
-    print(f"Trading pair: {config.trading_pair}")
-    print(f"Order size: {config.order_size}")
-    print(f"Spreads: bid={config.bid_spread}, ask={config.ask_spread}")
-    print(f"Refresh time: {config.order_refresh_time}s, Cooldown: {config.order_cooldown}s")
-    print()
-
-    # Run backtest with strategy config from BacktestConfig
-    engine = BacktestEngine(
-        config=config.to_strategy_config(),
-        kline_path=config.kline_path,
-        start_time=config.start_time,
-        end_time=config.end_time,
-        tick_interval=config.backtest_resolution,
-        fill_mode=config.fill_mode
-    )
-    report = engine.run()
-
-    # Print summary
-    report.print_summary()
-
-    # Save results
-    output_path = config.get_output_path()
-    report.save(output_path)
-    print(f"\nResults saved to: {output_path}")
+        logger.info("\nNo fills to save")
+    
+    
 
 
 if __name__ == "__main__":
-    main()
-
+    asyncio.run(main())

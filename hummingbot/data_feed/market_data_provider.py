@@ -477,11 +477,37 @@ class MarketDataProvider:
 
     def get_trading_rules(self, connector_name: str, trading_pair: str):
         """
-        Retrieves the trading rules from the specified connector.
+        Retrieves the trading rules from the specified connector (synchronous).
+
+        WARNING: This method assumes trading rules are already loaded.
+        For non-trading connectors, use get_trading_rules_async() instead.
+
         :param connector_name: str
+        :param trading_pair: str
         :return: Trading rules.
         """
         connector = self.get_connector_with_fallback(connector_name)
+        return connector.trading_rules[trading_pair]
+
+    async def get_trading_rules_async(self, connector_name: str, trading_pair: str):
+        """
+        Retrieves the trading rules from the specified connector (async).
+
+        This method ensures trading rules are fetched if not already available.
+        Use this for non-trading connectors that haven't been started.
+
+        :param connector_name: str
+        :param trading_pair: str
+        :return: Trading rules.
+        """
+        connector = self.get_connector_with_fallback(connector_name)
+
+        # If trading rules are empty, fetch them
+        if not connector.trading_rules:
+            self.logger().info(f"Trading rules not loaded for {connector_name}, fetching...")
+            await connector._update_trading_rules()
+            self.logger().info(f"Fetched {len(connector.trading_rules)} trading rules")
+
         return connector.trading_rules[trading_pair]
 
     def quantize_order_price(self, connector_name: str, trading_pair: str, price: Decimal):
