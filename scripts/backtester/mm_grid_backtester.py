@@ -13,8 +13,11 @@ Key design:
 - Same create_proposal() works for both live and backtest
 """
 
+import json
 import logging
+import os
 from decimal import Decimal
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -56,6 +59,9 @@ class MMGridBacktester:
         backtester = MMGridBacktester(strategy, strategy_config, config)
         result = backtester.run()
     """
+
+    # Cache directory for storing candlestick data
+    CACHE_DIR = Path("backtest_cache")
 
     def __init__(
         self,
@@ -101,15 +107,132 @@ class MMGridBacktester:
         self.fills: List[Fill] = []
         self.equity_curve: List[Dict] = []
 
-      
+        # PnL tracking without fees
+        self.realized_pnl_before_fees: Decimal = Decimal("0")
+
+    def _get_cache_filepath(self) -> Path:
+        """
+        Generate cache filepath based on connector, trading_pair, and interval.
+
+        Format: connector_tradingpair_interval.json
+        Example: binance_BTCUSDC_1s.json
+        """
+        # Create cache directory if it doesn't exist
+        self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Remove hyphens and make lowercase for filename
+        trading_pair_clean = self.config.candle_pair.replace("-", "")
+        connector_clean = self.config.connector_name.replace("_", "")
+        interval_clean = self.config.candle_interval
+
+        filename = f"{connector_clean}_{trading_pair_clean}_{interval_clean}.json"
+        return self.CACHE_DIR / filename
+
+    def _load_cached_candles(self) -> Optional[Dict]:
+        """
+        Load cached candles from JSON file.
+
+        Returns:
+            Dict with 'metadata' and 'data' keys, or None if cache doesn't exist
+        """
+        cache_file = self._get_cache_filepath()
+
+        if not cache_file.exists():
+            logger.info(f"No cache file found at {cache_file}")
+            return None
+
+        try:
+            with open(cache_file, 'r') as f:
+                cache_data = json.load(f)
+
+            logger.info(f"Loaded cache from {cache_file}")
+            logger.info(f"Cache range: {cache_data['metadata']['from']} to {cache_data['metadata']['to']}")
+
+            return cache_data
+        except Exception as e:
+            logger.warning(f"Failed to load cache from {cache_file}: {e}")
+            return None
+
+    def _save_candles_to_cache(self, candles_df: pd.DataFrame) -> None:
+        """
+        Save or append candles to cache file.
+
+        Args:
+            candles_df: DataFrame with candle data including 'timestamp' column
+        """
+        if candles_df is None or len(candles_df) == 0:
+            logger.warning("No candles to cache")
+            return
+
+        cache_file = self._get_cache_filepath()
+
+        # Convert DataFrame to dict format for JSON storage
+        # data structure: {timestamp: {candle_data}}
+        new_data = {}
+        for idx, row in candles_df.iterrows():
+            timestamp = int(row['timestamp'])
+            candle_data = {
+                'open': float(row['open']),
+                'high': float(row['high']),
+                'low': float(row['low']),
+                'close': float(row['close']),
+                'volume': float(row['volume']),
+            }
+            new_data[str(timestamp)] = candle_data
+
+        # Load existing cache or create new
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    cache = json.load(f)
+
+                # Merge new data with existing
+                cache['data'].update(new_data)
+
+                # Update metadata timestamps
+                all_timestamps = [int(ts) for ts in cache['data'].keys()]
+                cache['metadata']['from'] = min(all_timestamps)
+                cache['metadata']['to'] = max(all_timestamps)
+
+                logger.info(f"Appended {len(new_data)} candles to existing cache")
+            except Exception as e:
+                logger.warning(f"Failed to load existing cache, creating new: {e}")
+                cache = {
+                    'metadata': {
+                        'from': int(candles_df['timestamp'].min()),
+                        'to': int(candles_df['timestamp'].max()),
+                    },
+                    'data': new_data
+                }
+        else:
+            # Create new cache
+            cache = {
+                'metadata': {
+                    'from': int(candles_df['timestamp'].min()),
+                    'to': int(candles_df['timestamp'].max()),
+                },
+                'data': new_data
+            }
+            logger.info(f"Created new cache with {len(new_data)} candles")
+
+        # Save to file
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(cache, f, indent=2)
+            logger.info(f"Saved cache to {cache_file}")
+            logger.info(f"Total cached candles: {len(cache['data'])}")
+        except Exception as e:
+            logger.error(f"Failed to save cache to {cache_file}: {e}")
+
+
     async def initialize_data(self):
         """
         Fetch historical candles and trading rules from exchange via MarketDataProvider.
 
+        Uses caching to store candles and only fetches missing data.
         This must be called before run() since it fetches data asynchronously.
         """
-        logger.info(f"Fetching historical candles for {self.config.trading_pair} "
-                   f"from {self.config.connector_name}...")
+        logger.info(f"Initializing data for {self.config.trading_pair} from {self.config.connector_name}...")
 
         # Fetch trading rules (async to ensure they're loaded)
         logger.info(f"Fetching trading rules for {self.config.trading_pair}...")
@@ -118,20 +241,99 @@ class MMGridBacktester:
             self.config.trading_pair
         )
 
-        # Fetch historical candles
-        self.candles = await self.market_data_provider.get_historical_candles_df(
-            connector_name=self.config.connector_name,
-            trading_pair=self.config.candle_pair,
-            interval=self.config.candle_interval,
-            start_time=self.config.start_timestamp,
-            end_time=self.config.end_timestamp,
-        )
+        # Load cached candles
+        cache = self._load_cached_candles()
 
-        if self.candles is None or len(self.candles) == 0:
-            raise ValueError(f"No candles fetched for {self.config.trading_pair}")
+        all_candles = []
 
-        logger.info(f"Fetched {len(self.candles)} candles")
+        if cache is not None:
+            # Convert cache data back to DataFrame
+            cached_data = []
+            for timestamp_str, candle_data in cache['data'].items():
+                candle_data['timestamp'] = int(timestamp_str)
+                cached_data.append(candle_data)
 
+            if cached_data:
+                cached_df = pd.DataFrame(cached_data)
+                logger.info(f"Loaded {len(cached_df)} candles from cache")
+
+                # Determine what ranges we need to fetch
+                cache_start = cache['metadata']['from']
+                cache_end = cache['metadata']['to']
+
+                fetch_ranges = []
+
+                # Need data before cache?
+                if self.config.start_timestamp < cache_start:
+                    fetch_ranges.append((self.config.start_timestamp, cache_start - 1))
+                    logger.info(f"Need to fetch candles before cache: {self.config.start_timestamp} to {cache_start - 1}")
+
+                # Need data after cache?
+                if self.config.end_timestamp > cache_end:
+                    fetch_ranges.append((cache_end + 1, self.config.end_timestamp))
+                    logger.info(f"Need to fetch candles after cache: {cache_end + 1} to {self.config.end_timestamp}")
+
+                # Fetch missing ranges
+                for start, end in fetch_ranges:
+                    logger.info(f"Fetching candles from {start} to {end}...")
+                    new_candles = await self.market_data_provider.get_historical_candles_df(
+                        connector_name=self.config.connector_name,
+                        trading_pair=self.config.candle_pair,
+                        interval=self.config.candle_interval,
+                        start_time=start,
+                        end_time=end,
+                    )
+
+                    if new_candles is not None and len(new_candles) > 0:
+                        logger.info(f"Fetched {len(new_candles)} new candles")
+                        all_candles.append(new_candles)
+                        # Save new candles to cache
+                        self._save_candles_to_cache(new_candles)
+
+                # Add cached candles to the list
+                all_candles.append(cached_df)
+        else:
+            # No cache, fetch all data
+            logger.info(f"No cache found, fetching all candles from {self.config.start_timestamp} to {self.config.end_timestamp}...")
+            new_candles = await self.market_data_provider.get_historical_candles_df(
+                connector_name=self.config.connector_name,
+                trading_pair=self.config.candle_pair,
+                interval=self.config.candle_interval,
+                start_time=self.config.start_timestamp,
+                end_time=self.config.end_timestamp,
+            )
+
+            if new_candles is not None and len(new_candles) > 0:
+                logger.info(f"Fetched {len(new_candles)} candles")
+                all_candles.append(new_candles)
+                # Save to cache
+                self._save_candles_to_cache(new_candles)
+
+        # Merge all candles if we have multiple DataFrames
+        if len(all_candles) == 0:
+            raise ValueError(f"No candles available for {self.config.trading_pair}")
+
+        if len(all_candles) == 1:
+            self.candles = all_candles[0]
+        else:
+            # Concatenate and remove duplicates
+            self.candles = pd.concat(all_candles, ignore_index=True)
+            # Remove duplicate timestamps, keeping first occurrence
+            self.candles = self.candles.drop_duplicates(subset=['timestamp'], keep='first')
+            # Sort by timestamp
+            self.candles = self.candles.sort_values('timestamp').reset_index(drop=True)
+            logger.info(f"Merged candles, total: {len(self.candles)}")
+
+        # Filter to requested range
+        self.candles = self.candles[
+            (self.candles['timestamp'] >= self.config.start_timestamp) &
+            (self.candles['timestamp'] <= self.config.end_timestamp)
+        ].reset_index(drop=True)
+
+        if len(self.candles) == 0:
+            raise ValueError(f"No candles in requested time range for {self.config.trading_pair}")
+
+        logger.info(f"Final candle count: {len(self.candles)}")
         logger.info(f"Trading rules: min_order_size={self.trading_rule.min_order_size}, "
                    f"min_price_increment={self.trading_rule.min_price_increment}")
 
@@ -323,7 +525,8 @@ class MMGridBacktester:
                 if self.position <= 0:
                     self.entry_price = fill_price if self.position < 0 else None
 
-        # Update realized PnL (subtract fee)
+        # Update realized PnL before and after fees
+        self.realized_pnl_before_fees += trade_pnl
         self.realized_pnl += trade_pnl - fee
 
         # Update order status
@@ -350,6 +553,8 @@ class MMGridBacktester:
             position_after=self.position,
             realized_pnl=trade_pnl - fee,
             cumulative_pnl=self.realized_pnl,
+            pnl_before_fees=trade_pnl,
+            cumulative_pnl_before_fees=self.realized_pnl_before_fees,
         )
         self.fills.append(fill)
 
@@ -400,28 +605,6 @@ class MMGridBacktester:
             self._last_order_created_timestamp = timestamp
             logger.debug(f"Placed {len(self.orders)} quantized orders at {timestamp}")
 
-    # def _record_equity(self, candle: pd.Series, timestamp: int) -> None:
-    #     """Record equity curve point"""
-    #     close = Decimal(str(candle["close"]))
-
-    #     # Calculate unrealized PnL
-    #     unrealized_pnl = Decimal("0")
-    #     if self.position != 0 and self.entry_price:
-    #         if self.position > 0:
-    #             unrealized_pnl = (close - self.entry_price) * self.position
-    #         else:
-    #             unrealized_pnl = (self.entry_price - close) * abs(self.position)
-
-    #     equity = self.initial_capital + self.realized_pnl + unrealized_pnl
-
-    #     self.equity_curve.append({
-    #         "timestamp": timestamp,
-    #         "equity": float(equity),
-    #         "position": float(self.position),
-    #         "realized_pnl": float(self.realized_pnl),
-    #         "unrealized_pnl": float(unrealized_pnl),
-    #         "close": float(close),
-    #     })
 
     def run(self) -> BacktestResult:
         """

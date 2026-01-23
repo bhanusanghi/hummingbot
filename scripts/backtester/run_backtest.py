@@ -157,6 +157,8 @@ async def main():
                 "position_after": float(fill.position_after),
                 "realized_pnl": float(fill.realized_pnl),
                 "cumulative_pnl": float(fill.cumulative_pnl),
+                "pnl_before_fees": float(fill.pnl_before_fees),
+                "cumulative_pnl_before_fees": float(fill.cumulative_pnl_before_fees),
             })
         fills_df = pd.DataFrame(fills_data)
         fills_df.to_csv("backtest_fills.csv", index=False)

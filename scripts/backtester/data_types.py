@@ -55,8 +55,10 @@ class Fill:
     amount: Decimal
     fee: Decimal
     position_after: Decimal
-    realized_pnl: Decimal
-    cumulative_pnl: Decimal
+    realized_pnl: Decimal  # PnL after fees
+    cumulative_pnl: Decimal  # Cumulative PnL after fees
+    pnl_before_fees: Decimal  # PnL before deducting fees
+    cumulative_pnl_before_fees: Decimal  # Cumulative PnL before fees
 
 
 @dataclass
