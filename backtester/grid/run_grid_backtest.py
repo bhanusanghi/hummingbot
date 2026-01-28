@@ -200,8 +200,8 @@ async def main():
     controller_config = create_sample_controller_config()
     backtest_config = create_backtest_config()
 
-    # Create backtester
-    backtester = GridControllerBacktester(controller_config, backtest_config)
+    # Create backtester (debug_cycles=10 logs first 10 candles in detail)
+    backtester = GridControllerBacktester(controller_config, backtest_config, debug_cycles=10)
 
     # Initialize data
     logger.info("Initializing data...")

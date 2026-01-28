@@ -270,7 +270,7 @@ class BacktestingMockConnector:
             trade_type=TradeType.BUY,
             amount=amount,
             price=price,
-            creation_timestamp=self.current_timestamp / 1000.0,
+            creation_timestamp=float(self.current_timestamp),
             initial_state=OrderState.OPEN,
         )
         self._in_flight_orders[order_id] = in_flight_order
@@ -279,13 +279,13 @@ class BacktestingMockConnector:
         self.trigger_event(
             MarketEvent.BuyOrderCreated,
             BuyOrderCreatedEvent(
-                timestamp=self.current_timestamp / 1000.0,
+                timestamp=float(self.current_timestamp),
                 type=order_type,
                 trading_pair=trading_pair,
                 amount=amount,
                 price=price,
                 order_id=order_id,
-                creation_timestamp=self.current_timestamp / 1000.0,
+                creation_timestamp=float(self.current_timestamp),
                 exchange_order_id=order_id,
             )
         )
@@ -328,7 +328,7 @@ class BacktestingMockConnector:
             trade_type=TradeType.SELL,
             amount=amount,
             price=price,
-            creation_timestamp=self.current_timestamp / 1000.0,
+            creation_timestamp=float(self.current_timestamp),
             initial_state=OrderState.OPEN,
         )
         self._in_flight_orders[order_id] = in_flight_order
@@ -337,13 +337,13 @@ class BacktestingMockConnector:
         self.trigger_event(
             MarketEvent.SellOrderCreated,
             SellOrderCreatedEvent(
-                timestamp=self.current_timestamp / 1000.0,
+                timestamp=float(self.current_timestamp),
                 type=order_type,
                 trading_pair=trading_pair,
                 amount=amount,
                 price=price,
                 order_id=order_id,
-                creation_timestamp=self.current_timestamp / 1000.0,
+                creation_timestamp=float(self.current_timestamp),
                 exchange_order_id=order_id,
             )
         )
@@ -359,7 +359,7 @@ class BacktestingMockConnector:
         if order_id in self.orders:
             # Emit OrderCancelled event
             event = OrderCancelledEvent(
-                timestamp=self.current_timestamp / 1000.0,
+                timestamp=float(self.current_timestamp),
                 order_id=order_id,
                 exchange_order_id=order_id,
             )
@@ -444,7 +444,7 @@ class BacktestingMockConnector:
                         client_order_id=order.id,
                         exchange_order_id=order.id,
                         trading_pair=order.trading_pair,
-                        fill_timestamp=self.current_timestamp / 1000.0,
+                        fill_timestamp=float(self.current_timestamp),
                         fill_price=fill_price,
                         fill_base_amount=order.amount,
                         fill_quote_amount=order.amount * fill_price,
@@ -455,7 +455,7 @@ class BacktestingMockConnector:
                     # Apply order update (mark as FILLED)
                     order_update = OrderUpdate(
                         trading_pair=order.trading_pair,
-                        update_timestamp=self.current_timestamp / 1000.0,
+                        update_timestamp=float(self.current_timestamp),
                         new_state=OrderState.FILLED,
                         client_order_id=order.id,
                         exchange_order_id=order.id,
@@ -464,7 +464,7 @@ class BacktestingMockConnector:
 
                     # Emit OrderFilled event (executors listen to this)
                     order_filled_event = OrderFilledEvent(
-                        timestamp=self.current_timestamp / 1000.0,
+                        timestamp=float(self.current_timestamp),
                         order_id=order.id,
                         trading_pair=order.trading_pair,
                         trade_type=order.side,
@@ -481,7 +481,7 @@ class BacktestingMockConnector:
                     base_asset, quote_asset = order.trading_pair.split("-")
                     if order.side == TradeType.BUY:
                         completed_event = BuyOrderCompletedEvent(
-                            timestamp=self.current_timestamp / 1000.0,
+                            timestamp=float(self.current_timestamp),
                             order_id=order.id,
                             base_asset=base_asset,
                             quote_asset=quote_asset,
@@ -493,7 +493,7 @@ class BacktestingMockConnector:
                         self.trigger_event(MarketEvent.BuyOrderCompleted, completed_event)
                     else:
                         completed_event = SellOrderCompletedEvent(
-                            timestamp=self.current_timestamp / 1000.0,
+                            timestamp=float(self.current_timestamp),
                             order_id=order.id,
                             base_asset=base_asset,
                             quote_asset=quote_asset,

@@ -51,9 +51,11 @@ class GridControllerBacktester:
         self,
         controller_config: MultiGridStrikeConfig,
         backtest_config: GridBacktestConfig,
+        debug_cycles: int = 0,
     ):
         self.controller_config = controller_config
         self.backtest_config = backtest_config
+        self.debug_cycles = debug_cycles
 
         # Market data provider (for fetching rules and candles)
         self.market_data_provider = MarketDataProvider(connectors={})
@@ -82,6 +84,11 @@ class GridControllerBacktester:
         # Capital tracking
         self.initial_capital = controller_config.total_amount_quote
         self.total_fees = Decimal("0")
+
+    def _dbg(self, msg: str):
+        """Print debug message directly to stdout (bypasses hummingbot logger config)."""
+        if self.debug_cycles > 0:
+            print(f"[DBG] {msg}")
 
     async def initialize_data(self):
         """
@@ -187,6 +194,9 @@ class GridControllerBacktester:
         6. Orchestrator executes actions (creates/stops executors)
         7. Record equity
         """
+        orders_before_tick = {}  # snapshot to detect new orders placed by executors
+        cycle = 0
+
         for idx, row in self.candles.iterrows():
             timestamp = int(row['timestamp'])
             self.current_timestamp = timestamp
@@ -199,17 +209,94 @@ class GridControllerBacktester:
                 'volume': float(row['volume']),
             }
 
+            debug = cycle < self.debug_cycles
+
             # 1. Update market state
             self.mock_connector.update_market_state(candle, timestamp)
-            self.mock_strategy.current_timestamp = timestamp / 1000.0
-            self.bt_market_data_provider._current_time = timestamp / 1000.0
+            self.mock_strategy.current_timestamp = float(timestamp)
+            self.bt_market_data_provider._current_time = float(timestamp)
+
+            if debug:
+                self._dbg(
+                    f"\n{'='*80}\n"
+                    f"CYCLE {cycle} | ts={timestamp}"
+                    f"  Candle: O={candle['open']:.2f} H={candle['high']:.2f} "
+                    f"L={candle['low']:.2f} C={candle['close']:.2f} V={candle['volume']:.2f}\n"
+                    f"  Mid={float(self.mock_connector.mid_price):.2f} "
+                    f"Bid={float(self.mock_connector.best_bid):.2f} "
+                    f"Ask={float(self.mock_connector.best_ask):.2f}"
+                )
+
+            # Snapshot open orders BEFORE fill simulation
+            open_orders_pre_fill = {
+                oid: (o.side.name, float(o.price), float(o.amount), o.order_type.name)
+                for oid, o in self.mock_connector.orders.items()
+            }
+
+            if debug and open_orders_pre_fill:
+                self._dbg(f"  Open orders before fill check ({len(open_orders_pre_fill)}):")
+                for oid, (side, price, amt, otype) in open_orders_pre_fill.items():
+                    would_fill = False
+                    if side == "BUY" and candle['low'] <= price:
+                        would_fill = True
+                    elif side == "SELL" and candle['high'] >= price:
+                        would_fill = True
+                    marker = " --> SHOULD FILL" if would_fill else ""
+                    self._dbg(
+                        f"    {oid}: {side} {otype} {amt:.8f} @ {price:.2f}{marker}"
+                    )
 
             # 2. Simulate fills and emit events (executors receive via PubSub)
             fills = self.mock_connector.simulate_fills_and_emit_events(candle)
             self._record_fills(fills)
 
+            if debug and fills:
+                self._dbg(f"  Fills this cycle ({len(fills)}):")
+                for f in fills:
+                    fee_amt = float(f.amount * f.price * f.fee_percent)
+                    self._dbg(
+                        f"    FILLED {f.side.name} {float(f.amount):.8f} @ {float(f.price):.2f} "
+                        f"| notional={float(f.amount * f.price):.2f} | fee={fee_amt:.4f} "
+                        f"| order={f.order_id}"
+                    )
+            elif debug:
+                self._dbg(f"  Fills this cycle: none")
+
+            # Snapshot orders before executor tick (to detect new placements)
+            orders_before_tick = set(self.mock_connector.orders.keys())
+
             # 3. Tick all executors (manual control_task)
             await self.orchestrator.tick_all_executors()
+
+            # Detect new orders placed by executors during tick
+            orders_after_tick = set(self.mock_connector.orders.keys())
+            new_orders = orders_after_tick - orders_before_tick
+            cancelled_orders = orders_before_tick - orders_after_tick
+
+            if debug:
+                # Log executor grid level states
+                for cid, execs in self.orchestrator.active_executors.items():
+                    for ex in execs:
+                        state_counts = {
+                            s.name: len(levels)
+                            for s, levels in ex.levels_by_state.items()
+                            if len(levels) > 0
+                        }
+                        self._dbg(
+                            f"  Executor {ex.config.id[:12]}.. | side={ex.config.side.name} "
+                            f"| levels={len(ex.grid_levels)} | states={state_counts}"
+                        )
+
+                if new_orders:
+                    self._dbg(f"  New orders placed by executors ({len(new_orders)}):")
+                    for oid in new_orders:
+                        o = self.mock_connector.orders[oid]
+                        self._dbg(
+                            f"    {oid}: {o.side.name} {o.order_type.name} "
+                            f"{float(o.amount):.8f} @ {float(o.price):.2f}"
+                        )
+                if cancelled_orders:
+                    self._dbg(f"  Orders cancelled ({len(cancelled_orders)}): {cancelled_orders}")
 
             # 4. Push reports to controller (mirrors StrategyV2Base.update_executors_info)
             reports = self.orchestrator.get_all_reports()
@@ -222,15 +309,29 @@ class GridControllerBacktester:
             await self.controller.update_processed_data()
             actions = self.controller.determine_executor_actions()
 
+            if debug and actions:
+                self._dbg(f"  Controller actions ({len(actions)}):")
+                for a in actions:
+                    self._dbg(f"    {type(a).__name__}: {a}")
+
             # 6. Orchestrator executes actions (creates/stops executors)
             self.orchestrator.execute_actions(actions)
 
             # 7. Record equity using orchestrator's performance report
             self._record_equity(timestamp, controller_id)
 
+            if debug:
+                eq = self.equity_curve[-1]
+                self._dbg(
+                    f"  Equity={eq['equity']:.4f} | PnL={eq['pnl']:.4f} "
+                    f"| Fees={eq['fees']:.4f} | Active executors={eq['active_executors']}"
+                )
+
             # Log progress every 1000 candles
-            if idx % 1000 == 0:
+            if idx % 1000 == 0 and not debug:
                 logger.info(f"Processed {idx}/{len(self.candles)} candles")
+
+            cycle += 1
 
     def _record_fills(self, fills: List):
         """
