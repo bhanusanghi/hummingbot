@@ -1,0 +1,16 @@
+#!/bin/zsh
+# Hook to activate hummingbot conda environment
+# This runs before each command in Claude Code
+
+# Initialize conda for zsh if not already done
+if ! command -v conda &> /dev/null; then
+    # Try to initialize conda
+    if [ -f "/opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh" ]; then
+        source "/opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh"
+    fi
+fi
+
+# Activate hummingbot environment if not already active
+if [ -z "$CONDA_DEFAULT_ENV" ] || [ "$CONDA_DEFAULT_ENV" != "hummingbot" ]; then
+    conda activate hummingbot 2>/dev/null
+fi

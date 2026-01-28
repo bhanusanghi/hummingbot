@@ -275,11 +275,10 @@ class MMGrid(ScriptStrategyBase):
             connector = self.connectors[self.config.exchange]
             # orders_to_cancel = self._get_active_orders_from_connector()
 
-            if True:
-                cancel_success = await connector.cancel_all_symbol(self.config.trading_pair)
-                if not cancel_success:
-                    self.logger().warning(f"Cancel all failed: Skipping new order placement this cycle.")
-                    return
+            cancel_success = await connector.cancel_all_symbol(self.config.trading_pair)
+            if not cancel_success:
+                self.logger().warning(f"Cancel all failed: Skipping new order placement this cycle.")
+                return
 
             # Then place new orders
             await self._async_place_orders(proposal)
@@ -418,7 +417,7 @@ class MMGrid(ScriptStrategyBase):
                 })
 
             # MID / EMA markers
-            if mid is not None:
+            if mid and mid > 0:
                 rows.append({
                     "price": float(mid),
                     "side": "MID",
@@ -426,7 +425,7 @@ class MMGrid(ScriptStrategyBase):
                     "age": "-",
                     "marker": True,
                 })
-            if ema is not None:
+            if ema and ema > 0:
                 rows.append({
                     "price": float(ema),
                     "side": "EMA",
@@ -434,7 +433,7 @@ class MMGrid(ScriptStrategyBase):
                     "age": "-",
                     "marker": True,
                 })
-            if entry is not None:
+            if entry and entry > 0:
                 rows.append({
                     "price": float(entry),
                     "side": "ENTRY",
@@ -442,7 +441,6 @@ class MMGrid(ScriptStrategyBase):
                     "age": "-",
                     "marker": True,
                 })
-
             # Orderbook sort: descending by price
             rows.sort(key=lambda r: r["price"], reverse=True)
 

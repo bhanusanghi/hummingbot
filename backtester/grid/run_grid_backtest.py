@@ -66,8 +66,8 @@ def create_sample_controller_config() -> MultiGridStrikeConfig:
     return MultiGridStrikeConfig(
         connector_name="orderly_perpetual",
         trading_pair="BTC-USD",
-        total_amount_quote=Decimal("1000"),  # Total capital allocation
-        leverage=20,
+        total_amount_quote=Decimal("10000"),  # Total capital allocation
+        leverage=100,
 
         # Define your grids
         grids=[
@@ -77,25 +77,25 @@ def create_sample_controller_config() -> MultiGridStrikeConfig:
                 end_price=Decimal("90000"),
                 limit_price=Decimal("84500"),
                 side=TradeType.BUY,
-                amount_quote_pct=Decimal("0.5"),  # 50% of total capital
+                amount_quote_pct=Decimal("1.0"),  # 100% of total capital
                 enabled=True,
             ),
         ],
 
         # Grid parameters
-        min_spread_between_orders=Decimal("0.001"),  # 0.1%
+        min_spread_between_orders=Decimal("0.0005"),  # 0.05%
         min_order_amount_quote=Decimal("200"),
         max_open_orders=10,
         max_orders_per_batch=4,
         order_frequency=1,  # seconds
-        activation_bounds=Decimal("0.05"),  # 2%
+        activation_bounds=Decimal("0.002"),  # 2%
         keep_position=True,
 
         # Risk management
         triple_barrier_config=TripleBarrierConfig(
-            take_profit=Decimal("0.02"),  # 2%
+            take_profit=Decimal("0.0005"),  # 2%
             stop_loss=Decimal("0.05"),  # 5%
-            time_limit=5 * 86400,  # 5 days
+            time_limit=432000,  # 1 hour
             open_order_type=OrderType.LIMIT_MAKER,
             take_profit_order_type=OrderType.LIMIT,
             stop_loss_order_type=OrderType.MARKET,
