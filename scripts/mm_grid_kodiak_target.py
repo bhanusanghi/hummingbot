@@ -18,7 +18,7 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.core.clock import Clock
 from datetime import datetime
 
-from scripts.backtester.data_types import TickData
+from backtester.data_types import TickData
 
 def _fmt(ts):
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")

@@ -29,7 +29,7 @@ from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 
-from scripts.backtester.data_types import (
+from backtester.data_types import (
     BacktestConfig,
     BacktestResult,
     Fill,

@@ -15,8 +15,8 @@ from decimal import Decimal
 
 import pandas as pd
 
-from scripts.backtester.mm_grid_backtester import MMGridBacktester
-from scripts.backtester.data_types import BacktestConfig
+from backtester.mm_grid_backtester import MMGridBacktester
+from backtester.data_types import BacktestConfig
 from scripts.mm_grid_kodiak_target import MMGrid, MMGridConfig
 
 
