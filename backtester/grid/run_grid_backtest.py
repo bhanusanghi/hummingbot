@@ -25,6 +25,7 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import Triple
 from controllers.generic.multi_grid_strike import GridConfig, MultiGridStrikeConfig
 from backtester.grid.data_types import GridBacktestConfig
 from backtester.grid.grid_backtester import GridControllerBacktester
+from backtester.grid.visualizer import GridBacktestVisualizer
 
 # Configure logging
 logging.basicConfig(
@@ -66,16 +67,25 @@ def create_sample_controller_config() -> MultiGridStrikeConfig:
     return MultiGridStrikeConfig(
         connector_name="orderly_perpetual",
         trading_pair="BTC-USD",
-        total_amount_quote=Decimal("10000"),  # Total capital allocation
+        total_amount_quote=Decimal("8000"),  # Total capital allocation
         leverage=100,
 
         # Define your grids
         grids=[
             GridConfig(
                 grid_id="buy_1",
-                start_price=Decimal("87000"),
-                end_price=Decimal("90000"),
-                limit_price=Decimal("84500"),
+                start_price=Decimal("85000"),
+                end_price=Decimal("80000"),
+                limit_price=Decimal("80000"),
+                side=TradeType.BUY,
+                amount_quote_pct=Decimal("1.0"),  # 100% of total capital
+                enabled=True,
+            ),
+            GridConfig(
+                grid_id="sell_1",
+                start_price=Decimal("89000"),
+                end_price=Decimal("95000"),
+                limit_price=Decimal("80000"),
                 side=TradeType.BUY,
                 amount_quote_pct=Decimal("1.0"),  # 100% of total capital
                 enabled=True,
@@ -87,14 +97,14 @@ def create_sample_controller_config() -> MultiGridStrikeConfig:
         min_order_amount_quote=Decimal("200"),
         max_open_orders=10,
         max_orders_per_batch=4,
-        order_frequency=1,  # seconds
-        activation_bounds=Decimal("0.002"),  # 2%
+        order_frequency=3,  # seconds
+        activation_bounds=Decimal("0.02"),
         keep_position=True,
 
         # Risk management
         triple_barrier_config=TripleBarrierConfig(
             take_profit=Decimal("0.0005"),  # 2%
-            stop_loss=Decimal("0.05"),  # 5%
+            stop_loss=Decimal("0.1"),  # 5%
             time_limit=432000,  # 1 hour
             open_order_type=OrderType.LIMIT_MAKER,
             take_profit_order_type=OrderType.LIMIT,
@@ -117,12 +127,12 @@ def create_backtest_config() -> GridBacktestConfig:
         backtest_resolution=1,  # 1 second resolution
 
         # Time range
-        start_timestamp=parse_datetime("2026-01-27 18:00:00"),
-        end_timestamp=parse_datetime("2026-01-27 20:00:00"),
+        start_timestamp=parse_datetime("2026-01-27 20:00:00"),
+        end_timestamp=parse_datetime("2026-01-28 13:00:00"),
 
         # Market simulation
-        spread_bps=Decimal("4"),  # 0.05% spread
-        trade_fee_bps=Decimal("4"),  # 0.04% trading fee
+        spread_bps=Decimal("2"),  # 0.02% spread
+        trade_fee_bps=Decimal("0.5"),  # 0.005% trading fee
 
         # Order book simulation
         orderbook_levels=10,
@@ -199,6 +209,8 @@ async def main():
     # Create configurations
     controller_config = create_sample_controller_config()
     backtest_config = create_backtest_config()
+    print("start_timestamp: ", backtest_config.start_timestamp)
+    print("end_timestamp: ", backtest_config.end_timestamp)
 
     # Create backtester (debug_cycles=10 logs first 10 candles in detail)
     backtester = GridControllerBacktester(controller_config, backtest_config, debug_cycles=10)
@@ -213,6 +225,12 @@ async def main():
 
     # Print results
     print_results(result)
+
+    # Generate visualizations
+    logger.info("Generating visualizations...")
+    visualizer = GridBacktestVisualizer(result, backtester.candles)
+    visualizer.save_html("grid_backtest_charts.html")
+    visualizer.show_all()
 
     logger.info("Backtest complete!")
 
